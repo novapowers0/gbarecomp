@@ -681,6 +681,29 @@ bool load_config(const std::string& path, Config& out) {
                 "%s[identity].sha1 is required\n", kAbortHeader);
             return false;
         }
+        // Optional [[identity]] alternative hashes: sha1_alt = ["...", ...]
+        // or a single sha1_alt = "..." string.
+        if (auto alt = t["sha1_alt"]) {
+            if (auto arr = alt.as_array()) {
+                for (std::size_t i = 0; i < arr->size(); ++i) {
+                    if (auto s = (*arr)[i].value<std::string>()) {
+                        out.identity.sha1_alts.push_back(hex_lower(*s));
+                    } else {
+                        std::fprintf(stderr,
+                            "%s[identity].sha1_alt entry %zu must be a string\n",
+                            kAbortHeader, i);
+                        return false;
+                    }
+                }
+            } else if (auto s = alt.value<std::string>()) {
+                out.identity.sha1_alts.push_back(hex_lower(*s));
+            } else {
+                std::fprintf(stderr,
+                    "%s[identity].sha1_alt must be a string or array\n",
+                    kAbortHeader);
+                return false;
+            }
+        }
     }
 
     // [[extra_func]]
@@ -745,17 +768,27 @@ bool verify_identity(const Config& cfg,
         return false;
     }
     auto digest = gba::sha1(binary, binary_len);
-    std::string got = digest.hex();
-    std::string want = hex_lower(cfg.identity.sha1);
-    if (got != want) {
-        std::fprintf(stderr,
-            "%sSHA-1 mismatch:\n"
-            "  config declares: %s\n"
-            "  binary hashes:   %s\n"
-            "Either the binary is the wrong revision or the TOML\n"
-            "was authored against a different binary.\n",
-            kAbortHeader, want.c_str(), got.c_str());
-        return false;
+    std::string got = hex_lower(digest.hex());
+    if (got != hex_lower(cfg.identity.sha1)) {
+        bool alt_match = false;
+        for (const auto& alt : cfg.identity.sha1_alts) {
+            if (got == hex_lower(alt)) { alt_match = true; break; }
+        }
+        if (!alt_match) {
+            std::fprintf(stderr,
+                "%sSHA-1 mismatch:\n"
+                "  config declares: %s",
+                kAbortHeader, hex_lower(cfg.identity.sha1).c_str());
+            for (const auto& alt : cfg.identity.sha1_alts) {
+                std::fprintf(stderr, " / %s", hex_lower(alt).c_str());
+            }
+            std::fprintf(stderr,
+                "\n  binary hashes:   %s\n"
+                "Either the binary is the wrong revision or the TOML\n"
+                "was authored against a different binary.\n",
+                got.c_str());
+            return false;
+        }
     }
     return true;
 }
@@ -786,8 +819,12 @@ void print_config_summary(const Config& cfg) {
         std::printf("  codegen shards:         %u\n",
                     cfg.program.codegen_shards);
     }
-    std::printf("  identity sha1:         %s (verified)\n",
-                hex_lower(cfg.identity.sha1).c_str());
+std::printf("  identity sha1:         %s (verified)",
+            hex_lower(cfg.identity.sha1).c_str());
+    for (const auto& alt : cfg.identity.sha1_alts) {
+        std::printf(" / %s", hex_lower(alt).c_str());
+    }
+    std::printf("\n");
     std::printf("  extra_func entries:    %zu\n", cfg.extra_funcs.size());
     std::printf("  resume_range entries:  %zu\n", cfg.resume_ranges.size());
     std::printf("  thumb immediate hooks: %zu\n",

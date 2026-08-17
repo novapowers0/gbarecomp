@@ -104,9 +104,10 @@ int main() {
     };
 
     std::string error;
+    const std::vector<std::string> rom_sha1s{sha1};
     if (!write_state(true) ||
         !gbarecomp::mod_runtime_initialize(
-            mods, "test-game", sha1, &error) ||
+            mods, "test-game", rom_sha1s, &error) ||
         !gbarecomp::mod_runtime_commit(rom_path, &error)) {
         return fail("enabled plan failed: " + error);
     }
@@ -116,7 +117,7 @@ int main() {
 
     if (!write_state(false) ||
         !gbarecomp::mod_runtime_initialize(
-            mods, "test-game", sha1, &error) ||
+            mods, "test-game", rom_sha1s, &error) ||
         !gbarecomp::mod_runtime_commit(rom_path, &error)) {
         return fail("disabled plan failed: " + error);
     }

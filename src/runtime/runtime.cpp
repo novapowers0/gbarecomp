@@ -138,8 +138,14 @@ struct Args {
     // warning dialog.
     std::uint32_t bios_crc32 = 0;
     std::string rom;
+    // All accepted ROM SHA-1s (40-hex lowercase). The cartridge identity gate
+    // accepts any entry, so a release can support several dumps of the same
+    // retail game. rom_sha1 is the "primary" only for display / snapshot
+    // labeling; acceptance is membership in rom_sha1_accept.
     std::string rom_sha1;
+    std::vector<std::string> rom_sha1_accept;
     std::uint32_t rom_crc32 = 0;  // 0 = no CRC check (per-game TOML fills)
+    std::vector<std::uint32_t> rom_crc32_accept;
     std::string save_path;
     std::optional<gba::SaveType> save_type;
     std::size_t save_size = 0;
@@ -167,6 +173,9 @@ struct Args {
     // --fullscreen=<0|1|2> selects explicitly.
     int fullscreen = 0;
     int  volume = 100;            // --volume 0..100: pushed-sample gain
+    // --audio-freq <hz>: host audio device rate. 0 = engine default (65536).
+    // The GBA mixer still runs at its native rate; the RAB resamples to this.
+    int  audio_freq = 0;
     bool linear_filter = false;   // --linear-filter 1: linear texture scaling
     bool sharp_filter = false;    // --sharp-filter 1: integer prescale + linear finish
     bool affine_filter = false;   // --affine-filter 1: game-authorized smoothing
@@ -344,6 +353,27 @@ std::string lower_ascii(std::string s) {
     return s;
 }
 
+// Register an accepted ROM SHA-1 (40-hex). Empty inputs and duplicates are
+// ignored so primary + alternatives can be gathered from multiple sources
+// (builtin defaults, TOML, CLI) without colliding.
+void accept_rom_sha1(Args* args, const std::string& hex) {
+    std::string h = lower_ascii(hex);
+    if (h.size() != 40) return;
+    for (const auto& known : args->rom_sha1_accept) {
+        if (known == h) return;
+    }
+    args->rom_sha1_accept.push_back(std::move(h));
+}
+
+// Register an accepted ROM CRC32 (0 = no check is the caller's default).
+void accept_rom_crc32(Args* args, std::uint32_t crc) {
+    if (crc == 0) return;
+    for (std::uint32_t known : args->rom_crc32_accept) {
+        if (known == crc) return;
+    }
+    args->rom_crc32_accept.push_back(crc);
+}
+
 std::string strip_comment(std::string_view line) {
     bool quoted = false;
     for (std::size_t i = 0; i < line.size(); ++i) {
@@ -359,6 +389,36 @@ std::string unquote(std::string v) {
         return v.substr(1, v.size() - 2);
     }
     return v;
+}
+
+// Parse a TOML inline array of strings ("[\"a\", \"b\"]") into individual
+// values. Plain strings (a single "hash") also work. Returns false on
+// structurally malformed input.
+bool parse_string_list(std::string v, std::vector<std::string>& out) {
+    v = trim(v);
+    if (v.size() >= 2 && v.front() == '[' && v.back() == ']') {
+        std::string inner = trim(v.substr(1, v.size() - 2));
+        if (inner.empty()) return true;
+        std::size_t pos = 0;
+        while (pos < inner.size()) {
+            std::size_t start = inner.find('"', pos);
+            if (start == std::string::npos) return false;
+            std::size_t end = inner.find('"', start + 1);
+            if (end == std::string::npos) return false;
+            out.push_back(inner.substr(start + 1, end - start - 1));
+            pos = end + 1;
+            std::size_t comma = inner.find(',', pos);
+            if (comma == std::string::npos) {
+                if (trim(inner.substr(pos)) != "") return false;
+                break;
+            }
+            if (trim(inner.substr(pos, comma - pos)) != "") return false;
+            pos = comma + 1;
+        }
+        return true;
+    }
+    if (!trim(v).empty()) out.push_back(unquote(v));
+    return true;
 }
 
 bool parse_int(std::string_view text, int* out) {
@@ -657,8 +717,26 @@ bool apply_toml_file(const std::filesystem::path& path, Args* args,
             args->rom = resolve_config_path(base, val);
         } else if (section == "rom" && key == "sha1") {
             args->rom_sha1 = lower_ascii(val);
+            accept_rom_sha1(args, val);
+        } else if (section == "rom" && key == "sha1_alt") {
+            std::vector<std::string> alts;
+            if (!parse_string_list(val, alts)) {
+                if (err) *err = "invalid [rom].sha1_alt array in " +
+                                path.string();
+                return false;
+            }
+            for (const auto& alt : alts) accept_rom_sha1(args, alt);
         } else if (section == "rom" && key == "crc32") {
             args->rom_crc32 = parse_hex_u32(val);
+            accept_rom_crc32(args, args->rom_crc32);
+        } else if (section == "rom" && key == "crc32_alt") {
+            std::vector<std::string> alts;
+            if (!parse_string_list(val, alts)) {
+                if (err) *err = "invalid [rom].crc32_alt array in " +
+                                path.string();
+                return false;
+            }
+            for (const auto& alt : alts) accept_rom_crc32(args, parse_hex_u32(alt));
         } else if (section == "save" && key == "path" && !val.empty()) {
             args->save_path = resolve_config_path(base, val);
         } else if (section == "save" && key == "type" && !val.empty()) {
@@ -717,13 +795,15 @@ void find_config_arg(int argc, char** argv, Args* args) {
             continue;
         }
         if ((s == "--bios" || s == "--rom" || s == "--bios-sha1" ||
-             s == "--rom-sha1" || s == "--steps" || s == "--frames" ||
+             s == "--rom-sha1" || s == "--rom-sha1-alt" ||
+             s == "--steps" || s == "--frames" ||
              s == "--scale" || s == "--tcp" || s == "--dump-bmp" ||
              s == "--dump-png" || s == "--load-state" ||
              s == "--view-width" || s == "--widescreen" ||
              s == "--save" || s == "--save-path" ||
              s == "--gyro-sensitivity" || s == "--sharp-filter" ||
-             s == "--affine-filter") &&
+             s == "--affine-filter" || s == "--audio-freq" ||
+             s == "--audio-shadow") &&
             i + 1 < argc) {
             ++i;
             continue;
@@ -811,6 +891,13 @@ bool parse_cli(int argc, char** argv, Args* args, std::string* err) {
             const char* v = need_value("--rom-sha1");
             if (!v) return false;
             args->rom_sha1 = lower_ascii(v);
+            accept_rom_sha1(args, v);
+            continue;
+        }
+        if (s == "--rom-sha1-alt") {
+            const char* v = need_value("--rom-sha1-alt");
+            if (!v) return false;
+            accept_rom_sha1(args, v);
             continue;
         }
         if (s == "--steps") {
@@ -928,6 +1015,23 @@ bool parse_cli(int argc, char** argv, Args* args, std::string* err) {
                 if (err) *err = "invalid --volume value (expected 0..100)";
                 return false;
             }
+            continue;
+        }
+        if (s == "--audio-freq") {
+            const char* v = need_value("--audio-freq");
+            if (!v) return false;
+            if (!parse_int(v, &args->audio_freq) ||
+                (args->audio_freq != 0 &&
+                 (args->audio_freq < 8000 || args->audio_freq > 192000))) {
+                if (err) *err = "invalid --audio-freq value (expected 8000..192000 or 0)";
+                return false;
+            }
+            continue;
+        }
+        if (s == "--audio-shadow") {
+            const char* v = need_value("--audio-shadow");
+            if (!v) return false;
+            args->audio_shadow = (v[0] == '1' || v[0] == 't' || v[0] == 'T');
             continue;
         }
         if (s == "--linear-filter") {
@@ -1100,9 +1204,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     }
     if (opts.builtin_rom_sha1 && *opts.builtin_rom_sha1) {
         args.rom_sha1 = lower_ascii(opts.builtin_rom_sha1);
+        accept_rom_sha1(&args, opts.builtin_rom_sha1);
+    }
+    for (std::size_t i = 0; i < opts.num_builtin_rom_sha1_alts; ++i) {
+        if (opts.builtin_rom_sha1_alts && opts.builtin_rom_sha1_alts[i]) {
+            accept_rom_sha1(&args, opts.builtin_rom_sha1_alts[i]);
+        }
     }
     if (opts.builtin_rom_crc32 != 0) {
         args.rom_crc32 = opts.builtin_rom_crc32;
+        accept_rom_crc32(&args, opts.builtin_rom_crc32);
     }
 
     find_config_arg(argc, argv, &args);
@@ -1155,7 +1266,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             executable.has_parent_path() ? executable.parent_path()
                                          : std::filesystem::path(".");
         if (!mod_runtime_initialize(executable_dir / "mods",
-                                    opts.mod_game_id, args.rom_sha1, &err)) {
+                                    opts.mod_game_id, args.rom_sha1_accept,
+                                    &err)) {
             std::fprintf(stderr,
                          "[gbarecomp:runtime] mods unavailable: %s\n",
                          err.c_str());
@@ -1194,9 +1306,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     }
 
     // Resolve ROM the same way. The per-game TOML supplies the
-    // expected hash + (optionally) CRC32 — both come pre-filled via
+    // expected hash(es) + (optionally) CRC32 — all come pre-filled via
     // load_config.
-    if (args.rom_sha1.empty()) {
+    if (args.rom_sha1_accept.empty()) {
         std::fprintf(stderr,
                      "[gbarecomp:runtime] missing expected ROM SHA-1; "
                      "refusing to launch (per-game TOML must set "
@@ -1204,6 +1316,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         return 1;
     }
     {
+        // The asset picker expects C-string arrays. Translate the accepted
+        // hash vectors into parallel const char* arrays that outlive the call.
+        std::vector<const char*> rom_sha1_alts_c;
+        rom_sha1_alts_c.reserve(args.rom_sha1_accept.size());
+        for (const auto& h : args.rom_sha1_accept) rom_sha1_alts_c.push_back(h.c_str());
         AssetSpec spec;
         spec.display_name   = args.game_short_name.empty()
                                 ? "game ROM" : args.game_short_name.c_str();
@@ -1212,8 +1329,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         spec.dialog_title   = "Select the game ROM (.gba)";
         spec.cache_filename = "rom.cfg";
         spec.expected_size  = 0;  // GBA ROMs vary in size; SHA-1 covers it
-        spec.expected_sha1  = args.rom_sha1.c_str();
+        spec.expected_sha1  = args.rom_sha1.empty()
+                                ? args.rom_sha1_accept[0].c_str()
+                                : args.rom_sha1.c_str();
+        spec.expected_sha1_alts  = rom_sha1_alts_c.empty()
+                                ? nullptr : rom_sha1_alts_c.data();
+        spec.num_expected_sha1_alts = args.rom_sha1_accept.size();
         spec.expected_crc32 = args.rom_crc32;
+        spec.expected_crc32_alts  = args.rom_crc32_accept.empty()
+                                ? nullptr : args.rom_crc32_accept.data();
+        spec.num_expected_crc32_alts = args.rom_crc32_accept.size();
         auto r = resolve_asset(args.rom, spec, argv[0]);
         if (!r.ok) {
             std::fprintf(stderr,
@@ -1259,10 +1384,17 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         return 1;
     }
     std::string rom_sha1 = lower_ascii(gba::sha1(rom.data(), rom.size()).hex());
-    if (rom_sha1 != lower_ascii(args.rom_sha1)) {
+    const bool rom_sha1_ok =
+        std::find(args.rom_sha1_accept.begin(), args.rom_sha1_accept.end(),
+                  rom_sha1) != args.rom_sha1_accept.end();
+    if (!rom_sha1_ok) {
         std::fprintf(stderr,
-                     "[gbarecomp:runtime] ROM SHA-1 mismatch: got %s expected %s\n",
-                     rom_sha1.c_str(), args.rom_sha1.c_str());
+                     "[gbarecomp:runtime] ROM SHA-1 mismatch: got %s expected one of:",
+                     rom_sha1.c_str());
+        for (const auto& want : args.rom_sha1_accept) {
+            std::fprintf(stderr, " %s", want.c_str());
+        }
+        std::fprintf(stderr, "\n");
         return 1;
     }
 
@@ -2344,7 +2476,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                       runtime_title,
                       args.screen.empty() ? nullptr : args.screen.c_str(),
                       args.linear_filter, args.sharp_filter,
-                      resize_view_enabled)) {
+                      resize_view_enabled, args.audio_freq)) {
             gbarecomp::overlay_loader_shutdown();
             runtime_shutdown();
             return 1;

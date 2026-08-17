@@ -24,6 +24,14 @@ namespace gbarecomp {
 struct RunOptions {
     const char*   builtin_game_name = nullptr;
     const char*   builtin_rom_sha1  = nullptr;
+    // Additional accepted ROM identities. SHA-1 is the cartridge gate; the
+    // launcher/runtime accept the primary plus every alternative here, so a
+    // release can support several dumps of the same retail game (e.g. a
+    // No-Intro dump and the GoodTools/RetroAchievements dump that differ only
+    // in header bytes). CRC32 is informational only (dump-specific), matching
+    // the launcher's known_sha1_hex semantics.
+    const char* const* builtin_rom_sha1_alts = nullptr;
+    std::size_t num_builtin_rom_sha1_alts = 0;
     std::uint32_t builtin_rom_crc32 = 0;
 
     // Non-null opts this game into the data-only .gbamod package catalog.

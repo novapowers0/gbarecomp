@@ -38,6 +38,15 @@
 
 #include "runtime.h"
 #include "../gba/gba_bios.h"
+#include "../gba/sha1.h"
+// The Spanish box art (cover_embedded.h) is a copyrighted JPEG embedded as a
+// byte array. It is generated locally from a user-provided cover.jpg and is
+// NOT shipped in the source tree. When absent, the launcher still works — it
+// just uses the default box art for the Spanish dump (see below).
+#if __has_include("cover_embedded.h")
+#include "cover_embedded.h"
+#define GBARECOMP_HAS_EMBEDDED_SPANISH_COVER 1
+#endif
 #if defined(GBARECOMP_ENABLE_MODS)
 #include "mod_runtime.h"
 #endif
@@ -324,6 +333,9 @@ struct SeamConfig {
     int  affine_filter = -1;
     int  screen_kind = 0;      // kScreenTokens index
     int  volume = 100;
+    int  audio_freq = 0;       // host audio device rate; 0 = engine default
+    int  audio_shadow = 0;     // MP2K enhancement mixer ([audio].shadow)
+    int  language_index = 0;   // EN/ES boot-dump selection (GameInfo.languages)
     int  skip_launcher = 0;
     int  widescreen = 0;       // legacy fixed-width toggle
     int  aspect_index = 0;     // games with a launcher_aspect vocabulary only
@@ -364,6 +376,9 @@ inline void seam_config_load(const std::string& path, SeamConfig* c) {
         else if (key == "affine_filter") c->affine_filter = std::atoi(val.c_str());
         else if (key == "screen")        c->screen_kind = screen_token_to_index(val);
         else if (key == "volume")        c->volume = std::atoi(val.c_str());
+        else if (key == "audio_freq")    c->audio_freq = std::atoi(val.c_str());
+        else if (key == "audio_shadow")  c->audio_shadow = std::atoi(val.c_str());
+        else if (key == "language_index") c->language_index = std::atoi(val.c_str());
         else if (key == "skip_launcher") c->skip_launcher = std::atoi(val.c_str());
         else if (key == "widescreen")    c->widescreen = std::atoi(val.c_str());
         else if (key == "aspect_index")  c->aspect_index = std::atoi(val.c_str());
@@ -420,11 +435,65 @@ inline void seam_config_save(const std::string& path, const SeamConfig& c) {
     f << "affine_filter = " << c.affine_filter << "\n";
     f << "screen = " << kScreenTokens[c.screen_kind] << "\n";
     f << "volume = " << c.volume << "\n";
+    f << "audio_freq = " << c.audio_freq << "\n";
+    f << "audio_shadow = " << c.audio_shadow << "\n";
+    f << "language_index = " << c.language_index << "\n";
     f << "skip_launcher = " << c.skip_launcher << "\n";
     f << "widescreen = " << c.widescreen << "\n";
     f << "aspect_index = " << c.aspect_index << "\n";
     f << "adaptive_view = " << c.adaptive_view << "\n";
     f << "gyro_sensitivity = " << c.gyro_sensitivity << "\n";
+}
+
+// ---- multi-dump discovery ---------------------------------------------------
+// The launcher can offer one boot ROM per language (EN/ES). Each language maps
+// to a cart dump the game already accepts, so the identity gate still passes.
+// Scan the exe directory for the known dumps by real SHA-1 (extension-filtered
+// to keep the pass cheap; dumps are ~8-16 MB, everything else is skipped).
+
+inline bool iequals_ascii(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+// Returns one absolute path per known SHA-1 (empty = dump not found in `dir`).
+inline std::vector<std::string> seam_scan_cart_dumps(
+    const std::string& dir, const std::vector<std::string>& known_sha1s) {
+    std::vector<std::string> found(known_sha1s.size());
+    std::error_code ec;
+    std::filesystem::directory_iterator it(dir, ec), end;
+    for (; !ec && it != end; it.increment(ec)) {
+        const std::filesystem::directory_entry& entry = *it;
+        if (!entry.is_regular_file(ec)) { ec.clear(); continue; }
+        std::string ext = entry.path().extension().string();
+        if (!ext.empty()) {
+            for (char& c : ext) {
+                if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            }
+        }
+        if (ext != ".gba" && ext != ".bin" && ext != ".rom" && ext != ".agb")
+            continue;
+        const std::uintmax_t size = entry.file_size(ec);
+        if (ec || size == 0 || size > 64u * 1024u * 1024u) { ec.clear(); continue; }
+        std::ifstream f(entry.path(), std::ios::binary);
+        if (!f) continue;
+        std::vector<std::uint8_t> buf(static_cast<std::size_t>(size));
+        if (!f.read(reinterpret_cast<char*>(buf.data()),
+                    static_cast<std::streamsize>(buf.size())))
+            continue;
+        const std::string hex = gba::sha1(buf.data(), buf.size()).hex();
+        for (std::size_t i = 0; i < known_sha1s.size(); ++i) {
+            if (found[i].empty() && iequals_ascii(hex, known_sha1s[i]))
+                found[i] = entry.path().string();
+        }
+    }
+    return found;
 }
 
 // ---- config.ini [Solar] ------------------------------------------------------
@@ -532,6 +601,12 @@ inline void seam_append_setting_args(std::vector<std::string>& args,
     args.push_back(std::to_string(c.scale));
     args.push_back("--volume");
     args.push_back(std::to_string(c.volume));
+    if (c.audio_freq > 0) {
+        args.push_back("--audio-freq");
+        args.push_back(std::to_string(c.audio_freq));
+    }
+    args.push_back("--audio-shadow");
+    args.push_back(c.audio_shadow ? "1" : "0");
     args.push_back("--linear-filter");
     args.push_back(c.linear_filter ? "1" : "0");
     if (opts.launcher_expose_sharp_filter) {
@@ -640,10 +715,18 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     const RecompLauncherCModProvider* mod_provider = nullptr;
     if (opts.mod_game_id && *opts.mod_game_id &&
         opts.builtin_rom_sha1 && *opts.builtin_rom_sha1) {
+        std::vector<std::string> mod_rom_sha1s;
+        mod_rom_sha1s.push_back(opts.builtin_rom_sha1);
+        for (std::size_t i = 0; i < opts.num_builtin_rom_sha1_alts; ++i) {
+            if (opts.builtin_rom_sha1_alts && opts.builtin_rom_sha1_alts[i] &&
+                opts.builtin_rom_sha1_alts[i][0]) {
+                mod_rom_sha1s.push_back(opts.builtin_rom_sha1_alts[i]);
+            }
+        }
         std::string mod_error;
         if (gbarecomp::mod_runtime_initialize(
                 std::filesystem::path(dir) / "mods",
-                opts.mod_game_id, opts.builtin_rom_sha1, &mod_error)) {
+                opts.mod_game_id, mod_rom_sha1s, &mod_error)) {
             mod_provider = gbarecomp::mod_runtime_launcher_provider();
         } else {
             std::fprintf(stderr, "[gbarecomp:launcher] mods unavailable: %s\n",
@@ -730,7 +813,12 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     ls.widescreen    = cfg.widescreen;
     ls.adaptive_view = cfg.adaptive_view;
     ls.enable_audio  = 1;
-    ls.audio_freq    = 32768;             // GBA mixer base rate (display only)
+    // Seed the sample-rate cycle from the persisted choice (0 => the UI's
+    // default), then persist the committed value back to config.ini and hand
+    // it to the runtime as --audio-freq so the user's selection is honored.
+    ls.audio_freq    = cfg.audio_freq > 0 ? cfg.audio_freq : 32768;
+    ls.audio_shadow  = cfg.audio_shadow != 0;
+    ls.language_index = cfg.language_index;
     ls.volume        = cfg.volume;
     ls.player_src[0] = 1;                 // keyboard (gbarecomp host input)
     ls.skip_launcher = cfg.skip_launcher;
@@ -749,14 +837,23 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     gi.name = opts.builtin_game_name ? opts.builtin_game_name : "GBA cartridge";
     gi.region = opts.launcher_region;
     // SHA-1 is gbarecomp's real ROM identity gate — hand the launcher the
-    // SAME fingerprint so its "verified" check agrees with the runtime (a
+    // SAME fingerprints so its "verified" check agrees with the runtime (a
     // CRC32 is dump-specific and would reject other valid dumps). CRC32, when
-    // present, stays informational only.
-    const char* sha1_one[1];
+    // present, stays informational only. The accepted set covers the primary
+    // plus every declared alternative dump.
+    std::vector<const char*> known_sha1;
     if (opts.builtin_rom_sha1 && opts.builtin_rom_sha1[0]) {
-        sha1_one[0] = opts.builtin_rom_sha1;
-        gi.known_sha1_hex = sha1_one;
-        gi.num_known_sha1 = 1;
+        known_sha1.push_back(opts.builtin_rom_sha1);
+    }
+    for (std::size_t i = 0; i < opts.num_builtin_rom_sha1_alts; ++i) {
+        if (opts.builtin_rom_sha1_alts && opts.builtin_rom_sha1_alts[i] &&
+            opts.builtin_rom_sha1_alts[i][0]) {
+            known_sha1.push_back(opts.builtin_rom_sha1_alts[i]);
+        }
+    }
+    if (!known_sha1.empty()) {
+        gi.known_sha1_hex = known_sha1.data();
+        gi.num_known_sha1 = known_sha1.size();
     }
     gi.widescreen_supported = opts.launcher_expose_widescreen &&
         opts.widescreen_view_width > 240 ? 1 : 0;
@@ -767,6 +864,115 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     gi.keybinds_path = keybinds_path.c_str();
     gi.boxart_path = opts.launcher_boxart;   // NULL => default assets/img/boxart.tga
     gi.bios_verify = &gbarecomp_seam::verify_retail_gba_bios;
+    gi.has_audio_shadow = 1;   // Audio panel: MP2K enhancement-mixer checkbox
+
+    // ---- multi-dump presentation + EN/ES boot selection ---------------------
+    // The Spanish translation dump is the same retail cart (BG3E) with a
+    // different text region, so the identical generated image boots it. When
+    // that dump is among the accepted SHA-1s, offer a per-dump region label
+    // ("USA + Mod SPA"), an alternative cover (cover.jpg beside the exe), and
+    // an EN/ES language selector whose segments mount the matching cart dump.
+    // The vectors below only live for this preboot call, and the model only
+    // reads them while the launcher window is open — safe borrowed storage.
+    const char* const kSpanishSha1 =
+        "ee667f656f6c3a128b9d59c657b3686e58b23eb5";
+    int spanish_index = -1;
+    for (std::size_t i = 0; i < known_sha1.size(); ++i) {
+        if (known_sha1[i] && std::strcmp(known_sha1[i], kSpanishSha1) == 0) {
+            spanish_index = static_cast<int>(i);
+            break;
+        }
+    }
+    std::vector<std::string> dump_paths;
+    std::vector<const char*> known_regions;
+    std::vector<const char*> known_boxarts;
+    std::vector<const char*> language_labels;
+    std::vector<const char*> language_paths;
+    std::vector<int> language_sha1;
+    std::string usa_path;
+    std::string spa_path;
+    std::string spanish_cover_path;   // persists for the launcher window — must
+                                      // NOT be a temporary .string().c_str()
+    if (spanish_index >= 0) {
+        std::vector<std::string> known_sha1_str;
+        known_sha1_str.reserve(known_sha1.size());
+        for (const char* s : known_sha1)
+            known_sha1_str.emplace_back(s ? s : "");
+        dump_paths = seam_scan_cart_dumps(dir, known_sha1_str);
+        if (!dump_paths.empty()) usa_path = dump_paths[0];
+        for (std::size_t i = 0; i < dump_paths.size(); ++i) {
+            if (static_cast<int>(i) == spanish_index) continue;
+            if (!dump_paths[i].empty() && usa_path.empty())
+                usa_path = dump_paths[i];
+        }
+        if (static_cast<std::size_t>(spanish_index) < dump_paths.size())
+            spa_path = dump_paths[spanish_index];
+
+        // The Spanish translation is a code-identical dump of the same cart,
+        // so when it is DETECTED (regardless of which language is selected to
+        // boot) this build is the "USA + Mod SPA" variant: show that label on
+        // every known dump rather than only when the Spanish file is mounted.
+        known_regions.assign(known_sha1.size(), "USA + Mod SPA");
+        known_boxarts.assign(known_sha1.size(), nullptr);
+        // Spanish box art is EMBEDDED in the executable (cover_embedded.h), not
+        // read from a loose cover.jpg in the folder, so the shipped exe carries
+        // both covers with no extra file to keep beside it. cover_embedded.h is
+        // generated locally from a user-provided cover.jpg and is NOT shipped in
+        // the source tree (it embeds copyrighted art). In a source checkout
+        // without it, the Spanish dump simply falls through to the default box
+        // art below.
+#ifdef GBARECOMP_HAS_EMBEDDED_SPANISH_COVER
+        const std::filesystem::path cover_out =
+            std::filesystem::path(dir) / "assets" / "img" / "boxart_spanish.jpg";
+        std::error_code ec;
+        std::filesystem::create_directories(cover_out.parent_path(), ec);
+        std::ofstream cf(cover_out, std::ios::binary | std::ios::trunc);
+        if (cf) {
+            cf.write(reinterpret_cast<const char*>(
+                         gbarecomp_seam::kSpanishCoverJpg),
+                     static_cast<std::streamsize>(
+                         gbarecomp_seam::kSpanishCoverJpgSize));
+            cf.close();
+        }
+        if (cf.good() || std::filesystem::file_size(cover_out, ec) ==
+                            gbarecomp_seam::kSpanishCoverJpgSize) {
+            spanish_cover_path = cover_out.string();   // stable storage
+            known_boxarts[spanish_index] = spanish_cover_path.c_str();
+        }
+#endif
+        // Non-Spanish dumps get the default boxart so the model resets
+        // boxart_path (and the launcher reloads the texture) when the user
+        // switches back to EN. Without this, the Spanish cover persists
+        // because model_set_rom only overwrites boxart_path when the
+        // per-dump entry is non-null.
+        for (std::size_t i = 0; i < known_boxarts.size(); ++i) {
+            if (static_cast<int>(i) != spanish_index && !known_boxarts[i])
+                known_boxarts[i] = "assets/img/boxart.tga";
+        }
+
+        if (!spa_path.empty()) {
+            language_labels.push_back("EN");
+            language_paths.push_back(
+                !usa_path.empty() ? usa_path.c_str() : spa_path.c_str());
+            language_sha1.push_back(0);
+            language_labels.push_back("ES");
+            language_paths.push_back(spa_path.c_str());
+            language_sha1.push_back(spanish_index);
+        } else {
+            language_labels.push_back("EN");
+            language_paths.push_back(usa_path.c_str());
+            language_sha1.push_back(0);
+        }
+    }
+    if (!known_regions.empty()) {
+        gi.known_rom_regions      = known_regions.data();
+        gi.known_rom_boxarts      = known_boxarts.data();
+        gi.language_labels        = language_labels.data();
+        gi.num_languages          = static_cast<int>(language_labels.size());
+        gi.language_rom_paths     = language_paths.data();
+        gi.num_language_rom_paths = static_cast<int>(language_paths.size());
+        gi.language_rom_sha1_index = language_sha1.data();
+    }
     gbarecomp_seam::set_has_gyro_controls(gi, opts.launcher_expose_gyro);
     gbarecomp_seam::set_presentation_filter_caps(
         gi, opts.launcher_expose_sharp_filter,
@@ -819,6 +1025,9 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     cfg.screen_kind   = (ls.screen_kind >= 0 && ls.screen_kind <= 4)
                           ? ls.screen_kind : 0;
     cfg.volume        = ls.volume;
+    cfg.audio_freq    = ls.audio_freq > 0 ? ls.audio_freq : 0;
+    cfg.audio_shadow  = ls.audio_shadow != 0 ? 1 : 0;
+    cfg.language_index = ls.language_index >= 0 ? ls.language_index : 0;
     cfg.skip_launcher = ls.skip_launcher ? 1 : 0;
     cfg.widescreen    = ls.widescreen ? 1 : 0;
     cfg.adaptive_view = ls.adaptive_view ? 1 : 0;
@@ -837,13 +1046,24 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     if (solar_in_launcher && pull_solar_settings(ls, &solar))
         seam_solar_save(config_path, solar);
 
-    if (picked_rom[0]) {
+    // Boot the cart dump the committed language maps to. The model already
+    // mounted it when the user toggled EN/ES (so the region + cover matched
+    // live), but the picked path is authoritative here — belt and suspenders
+    // for hosts that seed the language without toggling.
+    const char* boot_rom = picked_rom;
+    if (ls.language_index >= 0 &&
+        ls.language_index < static_cast<int>(language_paths.size()) &&
+        language_paths[ls.language_index] &&
+        language_paths[ls.language_index][0]) {
+        boot_rom = language_paths[ls.language_index];
+    }
+    if (boot_rom && boot_rom[0]) {
         args.push_back("--rom");
-        args.push_back(picked_rom);
+        args.push_back(boot_rom);
         // Persist the pick NOW (not only after a successful boot) so the next
         // launch prefills instead of re-prompting — the whole point of the
         // launcher remembering. Mirrors the runtime asset picker's cache.
-        write_single_line(rom_cfg, picked_rom);
+        write_single_line(rom_cfg, boot_rom);
     }
     if (ls.bios_path[0]) {
         args.push_back("--bios");

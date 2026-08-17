@@ -70,7 +70,8 @@ struct Feature {
 
 struct Target {
     std::string game_id;
-    std::string rom_sha1;
+    // Accepted ROM SHA-1s for this game (primary + alternative dumps).
+    std::vector<std::string> rom_sha1s;
 };
 
 struct Package {
@@ -137,7 +138,8 @@ std::vector<GBAModActivationCallback>& reset_callbacks() {
 struct Runtime {
     fs::path root;
     std::string game_id;
-    std::string rom_sha1;
+    // Every accepted ROM SHA-1 (primary + alternative dumps).
+    std::vector<std::string> rom_sha1s;
     std::map<std::string, std::map<std::string, Package>> packages;
     std::map<std::string, PackageSelection> selections;
     Validation validation;
@@ -203,6 +205,48 @@ bool parse_string(const std::string& text, std::string& out) {
             case 'r': out.push_back('\r'); break;
             case 't': out.push_back('\t'); break;
             default: return false;
+        }
+    }
+    return true;
+}
+
+// Parse a TOML inline array of strings ("[\"a\", \"b\"]") into individual
+// values. Plain strings (a single "hash") also work. Returns false on
+// structurally malformed input.
+bool parse_string_list(std::string v, std::vector<std::string>& out) {
+    v = trim(v);
+    if (v.size() >= 2 && v.front() == '[' && v.back() == ']') {
+        std::string inner = trim(v.substr(1, v.size() - 2));
+        if (inner.empty()) return true;
+        std::size_t pos = 0;
+        while (pos < inner.size()) {
+            std::size_t start = inner.find('"', pos);
+            if (start == std::string::npos) return false;
+            std::size_t end = inner.find('"', start + 1);
+            if (end == std::string::npos) return false;
+            out.push_back(inner.substr(start + 1, end - start - 1));
+            pos = end + 1;
+            std::size_t comma = inner.find(',', pos);
+            if (comma == std::string::npos) {
+                if (trim(inner.substr(pos)) != "") return false;
+                break;
+            }
+            if (trim(inner.substr(pos, comma - pos)) != "") return false;
+            pos = comma + 1;
+        }
+        return true;
+    }
+    if (!trim(v).empty()) {
+        std::string s;
+        if (parse_string(v, s)) {
+            out.push_back(s);
+        } else {
+            std::string plain = trim(v);
+            if (plain.size() >= 2 && plain.front() == '"' &&
+                plain.back() == '"') {
+                return false;
+            }
+            out.push_back(plain);
         }
     }
     return true;
@@ -318,6 +362,7 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
     Choice* choice = nullptr;
     std::string plugin_feature;
     std::string plugin_id;
+    std::vector<std::string> target_rom_sha1;
 
     auto finish_plugin = [&]() -> bool {
         if (plugin_feature.empty() && plugin_id.empty()) return true;
@@ -338,6 +383,17 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
         return true;
     };
 
+    // Resolve the currently-buffered [[target]] rom_sha1(s) (single string or
+    // inline array) into the target's accepted-hash list.
+    auto finish_target = [&]() -> bool {
+        if (!target) return true;
+        for (const auto& hash : target_rom_sha1) {
+            if (valid_sha1(hash)) target->rom_sha1s.push_back(hash);
+        }
+        target_rom_sha1.clear();
+        return true;
+    };
+
     std::string raw;
     size_t line_number = 0;
     while (std::getline(file, raw)) {
@@ -348,6 +404,7 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
             line.size() >= 4 &&
             line.substr(line.size() - 2) == "]]") {
             if (section == Section::Plugin && !finish_plugin()) return false;
+            if (section == Section::Target && !finish_target()) return false;
             const std::string name = trim(line.substr(2, line.size() - 4));
             target = nullptr;
             feature = nullptr;
@@ -425,7 +482,8 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
             case Section::Target:
                 if (!target) parsed = false;
                 else if (key == "game_id") parsed = string_field(target->game_id);
-                else if (key == "rom_sha1") parsed = string_field(target->rom_sha1);
+                else if (key == "rom_sha1")
+                    parsed = parse_string_list(value, target_rom_sha1);
                 else known = false;
                 break;
             case Section::Feature:
@@ -495,6 +553,7 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
         }
     }
     if (section == Section::Plugin && !finish_plugin()) return false;
+    if (section == Section::Target && !finish_target()) return false;
 
     if (out.format_version != 1 || !valid_id(out.id) ||
         out.version.empty() || out.name.empty() || out.targets.empty() ||
@@ -504,7 +563,10 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
     }
     std::set<std::string> feature_ids;
     for (const Target& item : out.targets) {
-        if (item.game_id.empty() || !valid_sha1(item.rom_sha1)) {
+        bool has_hash = !item.rom_sha1s.empty() &&
+            std::all_of(item.rom_sha1s.begin(), item.rom_sha1s.end(),
+                        [](const std::string& h) { return valid_sha1(h); });
+        if (item.game_id.empty() || !has_hash) {
             set_error(error, "manifest has an invalid target");
             return false;
         }
@@ -582,8 +644,13 @@ bool target_matches(const Package& package, const Runtime& runtime) {
     return std::any_of(
         package.targets.begin(), package.targets.end(),
         [&](const Target& target) {
-            return target.game_id == runtime.game_id &&
-                   target.rom_sha1 == runtime.rom_sha1;
+            if (target.game_id != runtime.game_id) return false;
+            for (const auto& rom_sha1 : target.rom_sha1s) {
+                for (const auto& accepted : runtime.rom_sha1s) {
+                    if (rom_sha1 == accepted) return true;
+                }
+            }
+            return false;
         });
 }
 
@@ -1696,14 +1763,16 @@ RecompLauncherCModProvider provider = {
 
 bool mod_runtime_initialize(const fs::path& root,
                             const std::string& game_id,
-                            const std::string& rom_sha1,
+                            const std::vector<std::string>& rom_sha1s,
                             std::string* error) {
     Runtime& runtime = state();
     runtime = {};
     runtime.root = root;
     runtime.game_id = game_id;
-    runtime.rom_sha1 = rom_sha1;
-    if (game_id.empty() || !valid_sha1(rom_sha1)) {
+    runtime.rom_sha1s = rom_sha1s;
+    if (game_id.empty() || rom_sha1s.empty() ||
+        !std::all_of(rom_sha1s.begin(), rom_sha1s.end(),
+                     [](const std::string& h) { return valid_sha1(h); })) {
         set_error(error, "invalid GBA mod target identity");
         return false;
     }
@@ -1727,7 +1796,10 @@ bool mod_runtime_commit(const fs::path& rom_path, std::string* error) {
             set_error(error, runtime.error);
             return false;
         }
-        if (digest != runtime.rom_sha1) {
+        const bool accepted = std::find(runtime.rom_sha1s.begin(),
+                                        runtime.rom_sha1s.end(),
+                                        digest) != runtime.rom_sha1s.end();
+        if (!accepted) {
             runtime.error =
                 "The selected ROM does not match this mod catalog target.";
             set_error(error, runtime.error);
@@ -1802,10 +1874,12 @@ extern "C" int gba_mod_adaptive_view_enabled(void) {
 extern "C" int gba_mod_runtime_initialize_c(
     const char* root, const char* game_id, const char* rom_sha1) {
     std::string error;
+    std::vector<std::string> rom_sha1s;
+    if (rom_sha1 && *rom_sha1) rom_sha1s.push_back(rom_sha1);
     return gbarecomp::mod_runtime_initialize(
         root ? fs::path(root) : fs::path("mods"),
         game_id ? game_id : "",
-        rom_sha1 ? rom_sha1 : "", &error) ? 1 : 0;
+        rom_sha1s, &error) ? 1 : 0;
 }
 
 extern "C" int gba_mod_runtime_commit_c(const char* rom_path) {

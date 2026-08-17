@@ -61,6 +61,10 @@ struct ConfigProgram {
 struct ConfigIdentity {
     std::string sha1;       // required
     std::string md5;        // optional, empty if not declared
+    // Additional accepted SHA-1s for dumps of the same game that differ only
+    // in header bytes. The binary matches if its SHA-1 equals identity.sha1
+    // or any of these.
+    std::vector<std::string> sha1_alts;
 };
 
 struct ConfigExtraFunc {

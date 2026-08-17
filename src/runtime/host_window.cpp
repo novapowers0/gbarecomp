@@ -998,7 +998,7 @@ bool HostWindow::is_available() { return true; }
 
 bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
                       const char* screen, bool linear_filter, bool sharp_filter,
-                      bool resize_driven_view) {
+                      bool resize_driven_view, int audio_freq) {
     if (open_) return true;
     if (scale < 1) scale = 1;
     if (base_w < 1) base_w = 240;
@@ -1192,17 +1192,18 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     open_first_game_controller(b);
     open_device_gyro(b);
 
-    // Open the audio device at 65536 Hz mono 16-bit signed. The
-    // running BIOS sets SOUNDBIAS resolution=1 which raises the
-    // mixer's effective sample rate from 32768 to 65536; opening
-    // the device at 32768 (the power-on default) caused SDL to play
-    // back at half speed, hit the 250 ms queue cap, and flush —
-    // audible as muffled / watery chime artifacts. SDL2 resamples
-    // internally if the host hardware doesn't natively support
-    // 65536, so this rate is portable. Failure is non-fatal —
-    // silent video still works.
+    // Open the audio device. The GBA mixer natively runs at 65536 Hz after
+    // the BIOS sets SOUNDBIAS resolution=1, so that is the engine default;
+    // opening the device at 32768 (the power-on default) made SDL play at
+    // half speed, hit the 250 ms queue cap, and flush — audible as muffled /
+    // watery chime artifacts. A caller-provided --audio-freq (e.g. the
+    // launcher's 32000/44100/48000 sample-rate choice) overrides it; the RAB
+    // resamples the mixer's native stream to that rate. SDL2 resamples
+    // internally if the host hardware doesn't natively support the rate, so
+    // this is portable. Failure is non-fatal — silent video still works.
+    const int want_freq = audio_freq > 0 ? audio_freq : 65536;
     SDL_AudioSpec want{};
-    want.freq     = 65536;
+    want.freq     = want_freq;
     want.format   = AUDIO_S16SYS;
     want.channels = 1;
     want.samples  = 1024;  // ~15 ms callback quantum at 65 kHz
@@ -2051,7 +2052,7 @@ bool HostWindow::is_available() { return false; }
 bool HostWindow::open(int /*scale*/, int /*base_w*/, int /*base_h*/,
                       const char* /*title*/, const char* /*screen*/,
                       bool /*linear_filter*/, bool /*sharp_filter*/,
-                      bool /*resize_driven_view*/) {
+                      bool /*resize_driven_view*/, int /*audio_freq*/) {
     std::fprintf(stderr,
                  "host_window: built without SDL2; --window unavailable\n");
     return false;

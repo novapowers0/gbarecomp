@@ -44,13 +44,44 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <string>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
+// Fatal-abort diagnostics: the abort sites below print to stderr, which a
+// GUI-subsystem build never shows. Mirror the most useful line (the missed PC
+// for a dispatch gap, or the op for a codegen gap) into crash.log next to the
+// executable so a player-box crash is diagnosable from the artifact alone.
+void crash_log(const char* line) {
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    const DWORD n = GetModuleFileNameA(nullptr, buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return;
+    char* slash = nullptr;
+    for (char* p = buf; *p; ++p) {
+        if (*p == '\\' || *p == '/') slash = p;
+    }
+    if (!slash) return;
+    *slash = '\0';
+    const std::string path = std::string(buf) + "\\crash.log";
+    if (FILE* f = std::fopen(path.c_str(), "a")) {
+        std::fprintf(f, "%s\n", line);
+        std::fclose(f);
+    }
+#else
+    (void)line;
+#endif
+}
+
 // ── Self-heal coverage bookkeeping ─────────────────────────────────
-// Per-missed-PC record. `thumb` is the instruction-set state at the
-// miss; `count` is how many times the bridge ran for this PC.
 struct MissRec {
     bool          thumb = false;
     std::uint64_t count = 0;
@@ -66,6 +97,35 @@ struct MissRec {
 std::map<std::uint32_t, MissRec> g_misses;        // keyed by PC & ~1
 std::uint64_t                    g_interp_insns = 0;
 bool                             g_miss_notice_logged = false;
+
+// Dump every bridged dispatch miss from this session (PC + instruction-set +
+// bridge-hit count) to crash.log. The abort sites above only print the PC that
+// tripped; the full list shows the coverage gap in context.
+void crash_log_misses() {
+    if (g_misses.empty()) return;
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    const DWORD n = GetModuleFileNameA(nullptr, buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return;
+    char* slash = nullptr;
+    for (char* p = buf; *p; ++p) {
+        if (*p == '\\' || *p == '/') slash = p;
+    }
+    if (!slash) return;
+    *slash = '\0';
+    const std::string path = std::string(buf) + "\\crash.log";
+    if (FILE* f = std::fopen(path.c_str(), "a")) {
+        std::fprintf(f, "SESSION_MISSES (%u distinct PCs):\n",
+                     static_cast<unsigned>(g_misses.size()));
+        for (const auto& kv : g_misses) {
+            std::fprintf(f, "  pc=0x%08X (%s) count=%llu\n", kv.first,
+                         kv.second.thumb ? "thumb" : "arm",
+                         static_cast<unsigned long long>(kv.second.count));
+        }
+        std::fclose(f);
+    }
+#endif
+}
 
 bool self_heal_verbose() {
     const char* value = std::getenv("GBARECOMP_SELFHEAL_VERBOSE");
@@ -640,6 +700,13 @@ extern "C" int runtime_bridge_interpret(uint32_t entry_pc, bool entry_thumb,
                 return 0;
             }
             gbarecomp::store_interp_into_arm_cpu(cpu, g_cpu);
+            char runaway[256];
+            std::snprintf(runaway, sizeof(runaway),
+                "BRIDGE_RUNAWAY entry=0x%08X stop=0x%08X current_pc=0x%08X "
+                "iterations=%llu\n", entry_pc, stop_pc, cpu.R[15],
+                static_cast<unsigned long long>(kBridgeIterationCap));
+            crash_log(runaway);
+            crash_log_misses();
             std::fprintf(stderr,
                 "runtime_arm: SELF-HEAL bridge for 0x%08X exceeded %llu "
                 "instructions without returning to stop_pc=0x%08X (current "
@@ -869,6 +936,11 @@ extern "C" void runtime_dispatch_miss(uint32_t target_pc) {
     const bool strict_static =
         strict_env && strict_env[0] != '\0' && strict_env[0] != '0';
     if (strict_static) {
+        char strict_line[160];
+        std::snprintf(strict_line, sizeof(strict_line),
+            "STRICT_STATIC_MISS pc=0x%08X (%s)", entry_pc,
+            entry_thumb ? "thumb" : "arm");
+        crash_log(strict_line);
         std::fprintf(stderr,
             "runtime_arm: STRICT_STATIC dispatch miss for pc=0x%08X (%s) — "
             "interpreter and overlay fallback are disabled. Add reviewed "
@@ -888,6 +960,11 @@ extern "C" void runtime_dispatch_miss(uint32_t target_pc) {
 
 extern "C" void runtime_unimplemented_op(const char* op_name,
                                           uint32_t pc) {
+    char op_line[192];
+    std::snprintf(op_line, sizeof(op_line),
+        "UNIMPLEMENTED_OP %s at pc=0x%08X",
+        op_name ? op_name : "(null)", pc);
+    crash_log(op_line);
     std::fprintf(stderr,
                  "runtime_arm: unimplemented op %s at pc=0x%08X "
                  "(a CODEGEN gap, not a dispatch miss — NOT self-healed). "

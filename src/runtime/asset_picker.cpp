@@ -149,9 +149,26 @@ AssetResult load_and_validate(const std::string& path,
     r.sha1_hex = gba::sha1(r.bytes.data(), r.bytes.size()).hex();
     r.crc32 = gba::crc32(r.bytes.data(), r.bytes.size());
 
-    const bool sha_ok = sha1_eq_lower(r.sha1_hex, spec.expected_sha1);
-    const bool crc_ok = (spec.expected_crc32 == 0) ||
-                        (spec.expected_crc32 == r.crc32);
+    const bool sha_ok = [&]() -> bool {
+        if (sha1_eq_lower(r.sha1_hex, spec.expected_sha1)) return true;
+        for (std::size_t k = 0; k < spec.num_expected_sha1_alts; ++k) {
+            if (sha1_eq_lower(r.sha1_hex, spec.expected_sha1_alts[k]))
+                return true;
+        }
+        return false;
+    }();
+    const bool has_crc_expectation =
+        spec.expected_crc32 != 0 || spec.num_expected_crc32_alts > 0;
+    const bool crc_ok = [&]() -> bool {
+        if (!has_crc_expectation) return true;
+        if (spec.expected_crc32 != 0 && spec.expected_crc32 == r.crc32)
+            return true;
+        for (std::size_t k = 0; k < spec.num_expected_crc32_alts; ++k) {
+            if (spec.expected_crc32_alts[k] != 0 &&
+                spec.expected_crc32_alts[k] == r.crc32) return true;
+        }
+        return false;
+    }();
 
     if (!sha_ok || !crc_ok) {
         std::ostringstream w;
@@ -159,10 +176,16 @@ AssetResult load_and_validate(const std::string& path,
         w << "  SHA-1 got " << r.sha1_hex;
         if (spec.expected_sha1 && *spec.expected_sha1) {
             w << "\n        expected " << spec.expected_sha1;
+            for (std::size_t k = 0; k < spec.num_expected_sha1_alts; ++k) {
+                w << "\n                 " << spec.expected_sha1_alts[k];
+            }
         }
         w << "\n  CRC32 got " << hex32(r.crc32);
-        if (spec.expected_crc32 != 0) {
+        if (has_crc_expectation) {
             w << "\n        expected " << hex32(spec.expected_crc32);
+            for (std::size_t k = 0; k < spec.num_expected_crc32_alts; ++k) {
+                w << "\n                 " << hex32(spec.expected_crc32_alts[k]);
+            }
         }
         w << "\n\nThis is not the recompiled-against image. Behavior "
              "is undefined; proceeding anyway.";

@@ -32,8 +32,16 @@ struct AssetSpec {
     std::size_t expected_size = 0;
     // Expected SHA-1, 40-char lowercase hex. nullptr or "" = no check.
     const char* expected_sha1 = nullptr;
+    // Additional accepted SHA-1s (parallel to expected_sha1). Any match
+    // satisfies the check, so several dumps of the same retail game can be
+    // allowed.
+    const char* const* expected_sha1_alts = nullptr;
+    std::size_t num_expected_sha1_alts = 0;
     // Expected CRC32 (IEEE 802.3). 0 = no check.
     std::uint32_t expected_crc32 = 0;
+    // Additional accepted CRC32s. Any match satisfies the check.
+    const std::uint32_t* expected_crc32_alts = nullptr;
+    std::size_t num_expected_crc32_alts = 0;
 };
 
 struct AssetResult {

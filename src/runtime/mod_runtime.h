@@ -5,15 +5,18 @@
 #ifdef __cplusplus
 #include <filesystem>
 #include <string>
+#include <vector>
 
 struct RecompLauncherCModProvider;
 
 namespace gbarecomp {
 
 // Load the package catalog rooted at <exe>/mods for one verified game.
+// rom_sha1s lists every accepted ROM SHA-1 for the game (the primary plus any
+// alternative dumps); a manifest target matches when its hash is in the set.
 bool mod_runtime_initialize(const std::filesystem::path& root,
                             const std::string& game_id,
-                            const std::string& rom_sha1,
+                            const std::vector<std::string>& rom_sha1s,
                             std::string* error = nullptr);
 
 // Validate and persist the staged feature selections for the selected ROM.
