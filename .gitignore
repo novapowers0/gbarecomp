@@ -81,3 +81,7 @@ recomp_coverage*.json
 recomp_master_misses*.toml.frag
 hang_trace.csv
 recomp_cache/
+
+# Spanish box art embedded as a byte array (copyrighted artwork).
+# Generated locally from a user-provided cover.jpg; never commit.
+src/runtime/cover_embedded.h
