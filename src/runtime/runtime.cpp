@@ -270,6 +270,8 @@ struct RuntimeUiContext {
     int fast_forward_multiplier = 4;
     // Game-supplied handlers for keys the engine does not own.
     const RunOptions* opts = nullptr;
+    // Optional cheat engine owned by run_game; its rows use keys "cheat.<n>".
+    CheatEngine* cheats = nullptr;
 };
 
 int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
@@ -295,6 +297,11 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
              c->gyro_sensitivity)
         *out = static_cast<int>(std::lround(*c->gyro_sensitivity * 100.0f));
 #endif
+    else if (c->cheats && std::strncmp(item->key, "cheat.", 6) == 0) {
+        const long ci = std::strtol(item->key + 6, nullptr, 10);
+        *out = (ci >= 0 &&
+                c->cheats->enabled(static_cast<std::size_t>(ci))) ? 1 : 0;
+    }
     else if (c->opts && c->opts->ui_get) return c->opts->ui_get(item->key, out);
     else return 0;
     return 1;
@@ -333,6 +340,11 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
         *c->gyro_sensitivity =
             std::clamp(static_cast<float>(value) / 100.0f, 0.25f, 4.0f);
 #endif
+    else if (c->cheats && std::strncmp(item->key, "cheat.", 6) == 0) {
+        const long ci = std::strtol(item->key + 6, nullptr, 10);
+        if (ci >= 0) c->cheats->set_enabled(static_cast<std::size_t>(ci),
+                                            value != 0);
+    }
     else if (c->opts && c->opts->ui_set) return c->opts->ui_set(item->key, value);
     else return 0;
     return 1;
@@ -1361,6 +1373,29 @@ void write_session_diagnostics(const RunOptions& opts, const char* reason,
     std::fflush(stderr);
 }
 
+// Cheat presets write to guest RAM through the same bus the game uses, so a
+// cheat observes the normal memory map (regions, mirrors, IO side effects).
+CheatMemory make_bus_cheat_memory(gba::GbaBus& bus) {
+    CheatMemory m;
+    m.ctx = &bus;
+    m.read8 = [](void* c, uint32_t a) {
+        return static_cast<gba::GbaBus*>(c)->read8(a);
+    };
+    m.read16 = [](void* c, uint32_t a) {
+        return static_cast<gba::GbaBus*>(c)->read16(a);
+    };
+    m.write8 = [](void* c, uint32_t a, uint8_t v) {
+        static_cast<gba::GbaBus*>(c)->write8(a, v);
+    };
+    m.write16 = [](void* c, uint32_t a, uint16_t v) {
+        static_cast<gba::GbaBus*>(c)->write16(a, v);
+    };
+    m.write32 = [](void* c, uint32_t a, uint32_t v) {
+        static_cast<gba::GbaBus*>(c)->write32(a, v);
+    };
+    return m;
+}
+
 }  // namespace
 
 // Opt-in view-area expansion master switch + parameters (the runner owns
@@ -1681,6 +1716,27 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     bus.set_bios(&bios);
     bus.request_audio_shadow(args.audio_shadow);  // [audio].shadow default; env can override
 
+    // Optional cheat presets (CodeBreaker Advance): parsed once here, then the
+    // enabled ones are re-applied once per guest frame in the main loop.
+    CheatEngine cheat_engine;
+    for (std::size_t ci = 0; ci < opts.cheat_preset_count; ++ci) {
+        if (opts.cheat_presets) cheat_engine.add_preset(opts.cheat_presets[ci]);
+    }
+    const bool cheats_active =
+        opts.expose_cheats && cheat_engine.preset_count() > 0;
+    const CheatMemory cheat_mem = make_bus_cheat_memory(bus);
+    uint64_t cheat_last_frame = ~static_cast<uint64_t>(0);
+    // Re-assert enabled cheats once per guest frame. Called from both stepping
+    // paths (the windowed/headless main loop and the TCP free-run step_frame).
+    auto apply_cheats = [&]() {
+        if (!cheats_active || !cheat_engine.any_enabled()) return;
+        const uint64_t cf = ppu.frame_count();
+        if (cf != cheat_last_frame) {
+            cheat_last_frame = cf;
+            cheat_engine.apply(cheat_mem);
+        }
+    };
+
     // BIOS backend select: LLE (recompiled BIOS, the default + oracle) vs HLE
     // (SWIs serviced in-runtime, unimplemented ones falling back to LLE).
     // Config default from [bios].hle / --bios-hle; GBARECOMP_BIOS_HLE overrides
@@ -1792,6 +1848,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 #if defined(GBARECOMP_RUNTIME_UI)
     RuntimeUiContext runtime_ui_context;
     runtime_ui_context.opts = &opts;
+    runtime_ui_context.cheats = &cheat_engine;
     runtime_ui_context.view_mode = resize_view_enabled
         ? RECOMP_RUNTIME_UI_VIEW_ADAPTIVE
         : args.view_width > 240 ? RECOMP_RUNTIME_UI_VIEW_FIXED_16_9
@@ -1800,6 +1857,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // this array, so it must outlive the menu — hence function scope here
     // rather than inside the construction block below.
     std::vector<RecompRuntimeUiItem> runtime_ui_extras;
+    // Stable key strings for the Cheats rows (recomp-ui keeps the pointers).
+    std::vector<std::string> cheat_menu_keys;
+    cheat_menu_keys.reserve(opts.cheat_preset_count);
 #endif
     if (args.resize_view && !args.quiet) {
         std::fprintf(stderr,
@@ -2315,6 +2375,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // VBlank-start events; stopping on its increment puts the recomp at the
     // same PPU phase as both oracles. See runtime_bus_bridge.cpp.
     auto step_frame = [&]() -> bool {
+        apply_cheats();
         uint64_t start_vbl = g_runtime_vblank_starts;
         constexpr uint64_t kMaxDispatchesPerFrame = 2'000'000ull;
         for (uint64_t i = 0; i < kMaxDispatchesPerFrame; ++i) {
@@ -2567,6 +2628,107 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // commands first, then the game's own extension.
     auto tcp_extension = [&](const std::string& request, std::string& reply) -> bool {
         if (touch_tcp_command(request, reply)) return true;
+        // Engine cheat / memory commands (game-agnostic). Numeric fields accept
+        // decimal or 0x-prefixed hex.
+        {
+            auto jnum = [](const std::string& s, const char* key,
+                           uint64_t* out) -> bool {
+                const std::string pat = std::string("\"") + key + "\"";
+                std::size_t p = s.find(pat);
+                if (p == std::string::npos) return false;
+                p = s.find(':', p + pat.size());
+                if (p == std::string::npos) return false;
+                ++p;
+                while (p < s.size() &&
+                       std::isspace(static_cast<unsigned char>(s[p]))) ++p;
+                bool hex = false;
+                if (p + 1 < s.size() && s[p] == '0' &&
+                    (s[p + 1] == 'x' || s[p + 1] == 'X')) {
+                    hex = true;
+                    p += 2;
+                }
+                uint64_t v = 0;
+                bool any = false;
+                for (; p < s.size(); ++p) {
+                    const char c = s[p];
+                    int d;
+                    if (c >= '0' && c <= '9') d = c - '0';
+                    else if (hex && c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                    else if (hex && c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                    else break;
+                    v = v * (hex ? 16u : 10u) + static_cast<uint64_t>(d);
+                    any = true;
+                }
+                if (!any) return false;
+                *out = v;
+                return true;
+            };
+            if (request.find("\"cheat_list\"") != std::string::npos) {
+                std::string body = "{\"ok\":true,\"count\":" +
+                    std::to_string(cheat_engine.preset_count()) +
+                    ",\"cheats\":[";
+                for (std::size_t k = 0; k < cheat_engine.preset_count(); ++k) {
+                    if (k) body += ",";
+                    body += "{\"index\":" + std::to_string(k) +
+                            ",\"name\":\"" + cheat_engine.preset_name(k) +
+                            "\",\"enabled\":" +
+                            (cheat_engine.enabled(k) ? "1" : "0") + "}";
+                }
+                body += "]}";
+                reply = std::move(body);
+                return true;
+            }
+            if (request.find("\"cheat_set\"") != std::string::npos) {
+                uint64_t idx = 0, en = 0;
+                if (!jnum(request, "index", &idx)) {
+                    reply = "{\"ok\":false,\"error\":\"index\"}";
+                    return true;
+                }
+                jnum(request, "enabled", &en);
+                cheat_engine.set_enabled(static_cast<std::size_t>(idx), en != 0);
+                reply = "{\"ok\":true}";
+                return true;
+            }
+            if (request.find("\"peek\"") != std::string::npos) {
+                uint64_t addr = 0, len = 1;
+                if (!jnum(request, "addr", &addr)) {
+                    reply = "{\"ok\":false,\"error\":\"addr\"}";
+                    return true;
+                }
+                if (!jnum(request, "len", &len) || len == 0) len = 1;
+                if (len > 256) len = 256;
+                std::string body = "{\"ok\":true,\"addr\":" +
+                    std::to_string(addr) + ",\"bytes\":[";
+                for (uint64_t k = 0; k < len; ++k) {
+                    if (k) body += ",";
+                    body += std::to_string(
+                        bus.read8(static_cast<uint32_t>(addr + k)));
+                }
+                body += "]}";
+                reply = std::move(body);
+                return true;
+            }
+            if (request.find("\"poke\"") != std::string::npos) {
+                uint64_t addr = 0, value = 0, size = 16;
+                if (!jnum(request, "addr", &addr) ||
+                    !jnum(request, "value", &value)) {
+                    reply = "{\"ok\":false,\"error\":\"addr/value\"}";
+                    return true;
+                }
+                jnum(request, "size", &size);
+                if (size == 8)
+                    bus.write8(static_cast<uint32_t>(addr),
+                               static_cast<uint8_t>(value));
+                else if (size == 32)
+                    bus.write32(static_cast<uint32_t>(addr),
+                                static_cast<uint32_t>(value));
+                else
+                    bus.write16(static_cast<uint32_t>(addr),
+                                static_cast<uint16_t>(value));
+                reply = "{\"ok\":true}";
+                return true;
+            }
+        }
         if (!opts.tcp_command) return false;
         std::string streamed;
         auto write = [](void* ctx, const char* data, std::size_t len) {
@@ -3229,6 +3391,19 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     "Return to an earlier point kept in temporary memory.";
                 rewind_item.type        = RECOMP_RUNTIME_UI_ACTION;
                 runtime_ui_extras.push_back(rewind_item);
+            }
+        }
+
+        if (cheats_active) {
+            for (std::size_t ci = 0; ci < cheat_engine.preset_count(); ++ci) {
+                cheat_menu_keys.push_back("cheat." + std::to_string(ci));
+                RecompRuntimeUiItem cheat_item{};
+                cheat_item.key         = cheat_menu_keys.back().c_str();
+                cheat_item.section     = "Cheats";
+                cheat_item.label       = cheat_engine.preset_name(ci);
+                cheat_item.description = cheat_engine.preset_description(ci);
+                cheat_item.type        = RECOMP_RUNTIME_UI_BOOL;
+                runtime_ui_extras.push_back(cheat_item);
             }
         }
 
@@ -4288,6 +4463,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         // re-present, ~100 Hz idle). Applies to windowed play only.
         service_host_pause();
         if (host_quit) break;
+        apply_cheats();
         if (!step_once()) break;
         if (input_replay_requested) {
             apply_input_replay();

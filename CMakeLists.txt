@@ -377,6 +377,7 @@ add_library(gbarecomp_runtime STATIC
     src/runtime/multiplayer_session.cpp
     src/runtime/multiplayer_slice.cpp
     src/runtime/runtime.cpp
+    src/runtime/cheat_engine.cpp
     src/runtime/save_config.cpp
     src/runtime/bios_hle.cpp
     src/runtime/generated_dispatch.cpp

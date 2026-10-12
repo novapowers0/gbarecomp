@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "cheat_engine.h"
+
 namespace gbarecomp {
 struct GbaNetplayLaunch;
 
@@ -141,6 +143,16 @@ struct RunOptions {
     // resume_suspend_state_on_launch). 0 disables it, and headless runs never
     // touch the suspend files.
     std::uint8_t autosave_interval_seconds = 0;
+
+    // Optional CodeBreaker Advance cheat presets (cheat_engine.h). When
+    // expose_cheats is set, the runtime appends a "Cheats" section to the
+    // in-game menu with one toggle per preset and re-applies the enabled
+    // presets once per guest frame. Every preset starts disabled, so native
+    // rendering, savestates and frame hashes are unaffected until the player
+    // turns one on.
+    bool expose_cheats = false;
+    const CheatPreset* cheat_presets = nullptr;
+    std::size_t cheat_preset_count = 0;
 
     // Optional game-owned content initializer. Called exactly once, after the
     // first non-native view has been authorized and applied. For a fixed view
