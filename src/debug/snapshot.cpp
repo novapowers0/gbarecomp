@@ -10,13 +10,17 @@
 //
 // Each subsystem owns its payload via serialize()/deserialize(); this
 // file only frames them and enforces the header gate. Sections are
-// keyed by a FourCC tag and looked up by tag on load, so reordering or
-// an unknown trailing section degrades gracefully (the version gate is
-// the hard guarantee that layouts match).
+// keyed by a FourCC tag and looked up by tag on load. The declared section
+// table must consume the complete container; unframed trailing bytes are
+// rejected before any live subsystem is restored.
 
 #include "snapshot.h"
+#include "mod_state.h"
+#include "file_replace.h"
 
+#include <filesystem>
 #include <fstream>
+#include <cstdlib>
 #include <unordered_map>
 #include <vector>
 
@@ -29,6 +33,7 @@ namespace gbarecomp::debug {
 namespace {
 
 constexpr char kMagic[4] = {'G', 'B', 'A', 'S'};
+constexpr uint32_t kLegacySnapshotVersion = 1;
 
 // FourCC section tags.
 constexpr uint32_t fourcc(char a, char b, char c, char d) {
@@ -44,6 +49,7 @@ constexpr uint32_t TAG_AUDIO = fourcc('A', 'U', 'D', '0');
 constexpr uint32_t TAG_SAVE  = fourcc('S', 'A', 'V', '0');
 constexpr uint32_t TAG_PPU   = fourcc('P', 'P', 'U', '0');
 constexpr uint32_t TAG_META  = fourcc('M', 'E', 'T', 'A');
+constexpr uint32_t TAG_MODS  = fourcc('M', 'O', 'D', 'S');
 
 constexpr std::size_t kRomSha1Len = 40;
 
@@ -101,7 +107,12 @@ void deserialize_meta(SnapshotReader& r, const SnapshotContext& ctx) {
 
 }  // namespace
 
-bool save_state(const char* path, const SnapshotContext& ctx, std::string* err) {
+bool save_state_bytes(std::vector<uint8_t>* out, const SnapshotContext& ctx,
+                      std::string* err) {
+    if (!out) {
+        if (err) *err = "snapshot: output buffer not provided";
+        return false;
+    }
     if (!ctx.bus || !ctx.ppu) {
         if (err) *err = "snapshot: bus/ppu not wired";
         return false;
@@ -110,11 +121,19 @@ bool save_state(const char* path, const SnapshotContext& ctx, std::string* err) 
     char sha1[kRomSha1Len];
     fill_rom_sha1(sha1, ctx.rom_sha1);
 
+    // Version 2 deliberately remains the container version.  MODS is a tagged
+    // optional section: v2 files written before mod-state existed still load
+    // for an empty catalog, while any active catalog requires its exact MODS
+    // identity on load.
+    SnapshotWriter mods;
+    const bool has_mod_state = ctx.mod_state && ctx.mod_state->size() != 0;
+    if (has_mod_state && !ctx.mod_state->serialize(mods, err)) return false;
+
     SnapshotWriter w;
     w.bytes(kMagic, 4);
     w.u32(kSnapshotVersion);
     w.bytes(sha1, kRomSha1Len);
-    w.u32(7);  // section_count
+    w.u32(has_mod_state ? 8 : 7);  // section_count
 
     add_section(w, TAG_CPU,   [&](SnapshotWriter& s) { serialize_cpu(s); });
     add_section(w, TAG_BUS,   [&](SnapshotWriter& s) { ctx.bus->serialize(s); });
@@ -123,47 +142,61 @@ bool save_state(const char* path, const SnapshotContext& ctx, std::string* err) 
     add_section(w, TAG_SAVE,  [&](SnapshotWriter& s) { ctx.bus->save().serialize(s); });
     add_section(w, TAG_PPU,   [&](SnapshotWriter& s) { ctx.ppu->serialize(s); });
     add_section(w, TAG_META,  [&](SnapshotWriter& s) { serialize_meta(s, ctx); });
-
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (!f) {
-        if (err) *err = std::string("snapshot: cannot open for write: ") + path;
-        return false;
+    if (has_mod_state) {
+        w.u32(TAG_MODS);
+        w.u32(static_cast<uint32_t>(mods.size()));
+        w.bytes(mods.buffer().data(), mods.size());
     }
-    f.write(reinterpret_cast<const char*>(w.buffer().data()),
-            static_cast<std::streamsize>(w.size()));
-    if (!f) {
-        if (err) *err = std::string("snapshot: write failed: ") + path;
+
+    *out = w.take_buffer();
+    return true;
+}
+
+bool save_state(const char* path, const SnapshotContext& ctx, std::string* err) {
+    std::vector<uint8_t> blob;
+    if (!save_state_bytes(&blob, ctx, err)) return false;
+
+    // Atomic write, same scheme as the runtime battery flush: a crash mid-write
+    // loses only the sibling temp file, never the previous slot contents, and a
+    // browser storage sync can never persist a half-written state.
+    const std::string tmp = std::string(path) + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            if (err) *err = "snapshot: cannot open for write: " + tmp;
+            return false;
+        }
+        f.write(reinterpret_cast<const char*>(blob.data()),
+                static_cast<std::streamsize>(blob.size()));
+        f.close();
+        if (!f) {
+            if (err) *err = "snapshot: write failed: " + tmp;
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }
+    if (!replace_file_preserving(tmp, path, err)) {
+        if (err) *err = "snapshot: " + *err;
         return false;
     }
     return true;
 }
 
-bool load_state(const char* path, const SnapshotContext& ctx, std::string* err) {
+
+bool load_state_bytes(const uint8_t* data, std::size_t size,
+                      const SnapshotContext& ctx, std::string* err) {
     if (!ctx.bus || !ctx.ppu) {
         if (err) *err = "snapshot: bus/ppu not wired";
         return false;
     }
 
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) {
-        if (err) *err = std::string("snapshot: cannot open for read: ") + path;
-        return false;
-    }
-    std::streamoff size = f.tellg();
-    if (size <= 0) {
-        if (err) *err = std::string("snapshot: empty/unreadable: ") + path;
-        return false;
-    }
-    std::vector<uint8_t> blob(static_cast<std::size_t>(size));
-    f.seekg(0, std::ios::beg);
-    f.read(reinterpret_cast<char*>(blob.data()),
-           static_cast<std::streamsize>(blob.size()));
-    if (!f) {
-        if (err) *err = std::string("snapshot: read failed: ") + path;
+    if (!data || size == 0) {
+        if (err) *err = "snapshot: empty/unreadable memory state";
         return false;
     }
 
-    SnapshotReader head(blob.data(), blob.size());
+    SnapshotReader head(data, size);
     char magic[4];
     head.bytes(magic, 4);
     if (std::memcmp(magic, kMagic, 4) != 0) {
@@ -171,7 +204,7 @@ bool load_state(const char* path, const SnapshotContext& ctx, std::string* err) 
         return false;
     }
     uint32_t version = head.u32();
-    if (version != kSnapshotVersion) {
+    if (version != kSnapshotVersion && version != kLegacySnapshotVersion) {
         if (err) {
             *err = "snapshot: version mismatch (file v" +
                    std::to_string(version) + ", runtime v" +
@@ -196,25 +229,42 @@ bool load_state(const char* path, const SnapshotContext& ctx, std::string* err) 
         return false;
     }
 
+    // A section needs at least its tag and length.  Check that up front so a
+    // malicious count cannot make the structural parser walk past the file.
+    if (section_count > head.remaining() / 8u) {
+        if (err) *err = "snapshot: impossible section count";
+        return false;
+    }
+
     // Index sections by tag → (offset, len) within blob.
     struct Span { std::size_t off; std::size_t len; };
     std::unordered_map<uint32_t, Span> sections;
-    std::size_t cursor = blob.size() - head.remaining();
+    std::size_t cursor = size - head.remaining();
     for (uint32_t i = 0; i < section_count; ++i) {
-        SnapshotReader sr(blob.data() + cursor, blob.size() - cursor);
+        SnapshotReader sr(data + cursor, size - cursor);
         uint32_t tag = sr.u32();
         uint32_t len = sr.u32();
         if (!sr.ok()) {
             if (err) *err = "snapshot: truncated section header";
             return false;
         }
-        std::size_t payload_off = cursor + 8;
-        if (payload_off + len > blob.size()) {
+        const std::size_t payload_off = cursor + 8;
+        if (payload_off > size || len > size - payload_off) {
             if (err) *err = "snapshot: section overruns file";
+            return false;
+        }
+        if (sections.find(tag) != sections.end()) {
+            if (err) *err = "snapshot: duplicate section";
             return false;
         }
         sections[tag] = Span{payload_off, len};
         cursor = payload_off + len;
+    }
+
+    const bool legacy_v1 = version == kLegacySnapshotVersion;
+    if (cursor != size) {
+        if (err) *err = "snapshot: trailing container data";
+        return false;
     }
 
     // All gameplay-relevant sections must be present. META is advisory.
@@ -227,10 +277,52 @@ bool load_state(const char* path, const SnapshotContext& ctx, std::string* err) 
         }
     }
 
+    // v1 predates trusted native state.  Its only defined on-disk schema is
+    // the original seven sections written by the v1 serializer.  Do not infer
+    // MODS payloads or section lengths from arbitrary bytes: fully frame the
+    // known container first, then permit it solely for an empty catalog.
+    if (legacy_v1) {
+        const uint32_t legacy_required[] = {TAG_CPU, TAG_BUS, TAG_IO, TAG_AUDIO,
+                                            TAG_SAVE, TAG_PPU, TAG_META};
+        if (section_count != 7 || sections.size() != 7) {
+            if (err) *err = "snapshot: unsupported legacy v1 section catalog";
+            return false;
+        }
+        for (uint32_t tag : legacy_required) {
+            if (sections.find(tag) == sections.end()) {
+                if (err) *err = "snapshot: unsupported legacy v1 section catalog";
+                return false;
+            }
+        }
+    }
+
+    // MODS preflight happens after the immutable container/header checks, but
+    // before CPU, bus, device, or provider restoration.  Thus a provider
+    // catalog/schema mismatch cannot partially mutate guest state.
+    const bool active_mod_catalog = ctx.mod_state && ctx.mod_state->size() != 0;
+    auto mods_it = sections.find(TAG_MODS);
+    if (legacy_v1 && active_mod_catalog) {
+        if (err) *err = "snapshot: legacy v1 has no MODS migration for active mod catalog";
+        return false;
+    }
+    if (active_mod_catalog && mods_it == sections.end()) {
+        if (err) *err = "snapshot: missing MODS section for active mod catalog";
+        return false;
+    }
+    if (mods_it != sections.end()) {
+        SnapshotReader mods_reader(data + mods_it->second.off, mods_it->second.len);
+        ModStateRegistry empty_catalog;
+        const ModStateRegistry& catalog = ctx.mod_state ? *ctx.mod_state : empty_catalog;
+        if (!catalog.preflight(mods_reader, err)) {
+            if (err && err->empty()) *err = "snapshot: MODS preflight failed";
+            return false;
+        }
+    }
+
     auto reader_for = [&](uint32_t tag) -> SnapshotReader {
         auto it = sections.find(tag);
         const uint8_t* base = (it == sections.end())
-            ? nullptr : blob.data() + it->second.off;
+            ? nullptr : data + it->second.off;
         std::size_t len = (it == sections.end()) ? 0 : it->second.len;
         return SnapshotReader(base, len);
     };
@@ -238,6 +330,8 @@ bool load_state(const char* path, const SnapshotContext& ctx, std::string* err) 
     { SnapshotReader r = reader_for(TAG_CPU);   deserialize_cpu(r); }
     { SnapshotReader r = reader_for(TAG_BUS);   ctx.bus->deserialize(r); }
     { SnapshotReader r = reader_for(TAG_IO);    ctx.bus->io().deserialize(r); }
+    // WAITCNT arrived with the IO page; re-derive the bus wait-state table.
+    ctx.bus->refresh_waitstates();
     { SnapshotReader r = reader_for(TAG_AUDIO); ctx.bus->audio().deserialize(r); }
     { SnapshotReader r = reader_for(TAG_SAVE);  ctx.bus->save().deserialize(r); }
     { SnapshotReader r = reader_for(TAG_PPU);   ctx.ppu->deserialize(r); }
@@ -245,8 +339,37 @@ bool load_state(const char* path, const SnapshotContext& ctx, std::string* err) 
         SnapshotReader r = reader_for(TAG_META);
         deserialize_meta(r, ctx);
     }
+    if (mods_it != sections.end() && ctx.mod_state && ctx.mod_state->size() != 0) {
+        SnapshotReader mods_reader(data + mods_it->second.off, mods_it->second.len);
+        // A matching payload was already preflighted above.  Restore is a
+        // provider contract, not a recoverable error path: guest state is now
+        // live, so continuing after a provider violation would be unsafe.
+        if (!ctx.mod_state->restore(mods_reader, err)) std::abort();
+    }
 
     return true;
+}
+
+bool load_state(const char* path, const SnapshotContext& ctx, std::string* err) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        if (err) *err = std::string("snapshot: cannot open for read: ") + path;
+        return false;
+    }
+    const std::streamoff file_size = f.tellg();
+    if (file_size <= 0) {
+        if (err) *err = std::string("snapshot: empty/unreadable: ") + path;
+        return false;
+    }
+    std::vector<uint8_t> blob(static_cast<std::size_t>(file_size));
+    f.seekg(0, std::ios::beg);
+    f.read(reinterpret_cast<char*>(blob.data()),
+           static_cast<std::streamsize>(blob.size()));
+    if (!f) {
+        if (err) *err = std::string("snapshot: read failed: ") + path;
+        return false;
+    }
+    return load_state_bytes(blob.data(), blob.size(), ctx, err);
 }
 
 }  // namespace gbarecomp::debug

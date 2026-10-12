@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace gba {
@@ -31,9 +32,12 @@ class GbaPpu;
 
 namespace gbarecomp::debug {
 
-// Bump when any subsystem's serialized layout changes. load_state
-// refuses a blob whose version != kSnapshotVersion (savestates are
-// debug-loop artifacts; we don't migrate old formats).
+class ModStateRegistry;
+
+// New snapshots use v2.  The loader also recognizes the original v1
+// seven-section container only when no trusted native providers are registered;
+// it has no MODS identity to migrate or validate.  Other old layouts remain
+// rejected rather than guessed.
 constexpr uint32_t kSnapshotVersion = 2;
 
 // ── SnapshotWriter ─────────────────────────────────────────────────
@@ -53,6 +57,7 @@ public:
     }
 
     const std::vector<uint8_t>& buffer() const { return buf_; }
+    std::vector<uint8_t> take_buffer() { return std::move(buf_); }
     std::size_t size() const { return buf_.size(); }
 
 private:
@@ -119,14 +124,26 @@ struct SnapshotContext {
     uint64_t* taken          = nullptr;
     uint64_t* cycles_elapsed = nullptr;
     uint64_t* vblank_count   = nullptr;
+
+    // Optional trusted native state.  A non-empty catalog emits a MODS section
+    // and is preflighted before any guest state is touched during load.
+    const ModStateRegistry* mod_state = nullptr;
 };
 
 // Serialize the full machine state to `path`. MUST be called only at a
 // clean dispatch boundary. Returns false (with *err set) on I/O error.
 bool save_state(const char* path, const SnapshotContext& ctx, std::string* err);
 
+// In-memory variants used by bounded rewind histories. They use exactly the
+// same versioned, ROM-gated container as on-disk states, so there is only one
+// serializer to keep correct.
+bool save_state_bytes(std::vector<uint8_t>* out, const SnapshotContext& ctx,
+                      std::string* err);
+
 // Restore from `path`. Returns false (with *err set) on I/O error,
 // bad magic, version mismatch, ROM-hash mismatch, or truncation.
 bool load_state(const char* path, const SnapshotContext& ctx, std::string* err);
+bool load_state_bytes(const uint8_t* data, std::size_t size,
+                      const SnapshotContext& ctx, std::string* err);
 
 }  // namespace gbarecomp::debug

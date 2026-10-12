@@ -9,6 +9,17 @@
 // aspect-correct viewport; the faithful 240x160 path retains the historical
 // fixed SDL presentation. pump() drains the OS event queue, returns a quit flag
 // and a packed GBA KEYINPUT value (active-low, 1 = released).
+//
+// Browser builds (GBARECOMP_WEB_HOST) implement the same class in
+// host_window_web.cpp without SDL: present() publishes RGB888 into a shared
+// triple buffer consumed by page-owned WebGL (packaging/web/host_web.js),
+// pump() reads an input snapshot plus a command ring, and audio goes to an
+// AudioWorklet ring. Touch, haptics, host overlays and the mobile lifecycle map
+// onto browser equivalents (pointer events -> TouchHub, navigator.vibrate, a
+// 2D-canvas display list, page visibility). Capabilities the browser lacks
+// (gyro, solar keys without bindings, exclusive fullscreen, runtime UI overlay,
+// overlay text) are reported absent, never simulated. See
+// packaging/web/README.md.
 
 #pragma once
 
@@ -18,6 +29,8 @@
 struct RecompRuntimeUi;
 
 namespace gbarecomp {
+
+class HostOverlay;
 
 class HostWindow {
 public:
@@ -45,8 +58,10 @@ public:
               const char* title = "gbarecomp", const char* screen = nullptr,
               bool linear_filter = false, bool sharp_filter = false,
               bool resize_driven_view = false,
-              int audio_freq = 0);
+              int audio_freq = 0,
+              bool freely_resizable_window = false);
     void close();
+    void set_title(const char* title);
     bool is_open() const { return open_; }
 
     // Resize the logical streaming surface without changing the host window.
@@ -67,7 +82,9 @@ public:
     //     WindowBigger, WindowSmaller, VolumeUp, VolumeDown, DisplayPerf.
     // Never called => built-in defaults for both. Safe to call when the
     // files don't exist.
-    void load_input_config(const char* dir);
+    void load_input_config(const char* dir,
+                           bool assist_tools_default = true,
+                           int fast_forward_multiplier_default = 4);
 
     // Live window/audio controls (hotkey + launcher-driven). All no-ops when
     // the window isn't open or this build has no SDL2.
@@ -90,17 +107,72 @@ public:
     // Dear ImGui's SDL_Renderer2 backend over the existing game renderer.
     void set_runtime_ui(RecompRuntimeUi* ui);
 #endif
+    // ---- touch (touch_input.h) ---------------------------------------------
+    // `policy` = the game consumes touch through RunOptions::input_frame;
+    // non-pad touches are then routed to the TouchHub instead of only opening
+    // settings. `claims` are the game's TouchClaim bits. `pad_default` is the
+    // virtual-pad visibility when config.ini holds no saved choice (-1 =
+    // platform default). `emulate_touch` turns desktop mouse input into touch
+    // (left = finger, right = two-finger tap, middle = three-finger tap,
+    // Backspace = platform Back) for development and validation.
+    void configure_touch(bool policy, std::uint32_t claims, int pad_default,
+                         bool emulate_touch);
+    // Loads/persists the player's pad choice in <dir>/config.ini [Touch].
+    void set_touch_config_dir(const char* dir);
+    bool touch_pad_visible() const;
+    void set_touch_pad_visible(bool visible);
+    // Logical view margins inside the surface (for touch/overlay mapping).
+    void set_view_margins(std::uint32_t left, std::uint32_t right,
+                          std::uint32_t top, std::uint32_t bottom);
+    // Game-owned host overlay, drawn each present (null = none).
+    void set_host_overlay(void (*overlay)(HostOverlay*));
+    // Physical density of the window's display (drawable px per mm).
+    float px_per_mm() const;
+    // Portrait presentations may anchor the image to the top edge so host
+    // chrome below it gets the remaining space (per-present game request).
+    void set_presentation_anchor_top(bool anchor_top);
+    // Orientation policy for rotating platforms: 0 landscape, 1 portrait,
+    // 2 any. Must be set BEFORE open(); ignored on desktop.
+    void set_orientation_policy(int policy) { orientation_policy_ = policy; }
+
+    // Mobile lifecycle. pump() reports entering the background once; the
+    // runtime then persists state and calls wait_for_foreground(), which
+    // blocks (audio paused) until the app returns (true) or quits (false).
+    bool wait_for_foreground();
+
+    // Short vibration where the platform supports it (no-op otherwise).
+    void haptic_pulse(int duration_ms, float strength);
+
     void set_fps_readout(bool on);      // presents-per-second in the title bar
     bool fps_readout() const;
+    bool assist_tools_enabled() const;
+    int  fast_forward_multiplier() const;
 
     // Upload one base_w x base_h RGB888 frame (the dimensions passed to open())
     // and present.
     void present(const uint8_t* rgb888);
 
-    // Push `count` int16_t mono samples (32.768 kHz) into the audio
-    // output queue. Backend converts to the host device's format.
+    // Push `count` int16_t mono samples into the audio output queue. The SDL
+    // backend configures its resampler for a 65.536 kHz source; the real
+    // mixer rate follows SOUNDBIAS (GbaAudio::sample_rate(), 32.768 to
+    // 262.144 kHz), so rate-aware callers use push_audio_block on the web.
+    // Backend converts to the host device's format.
     // No-op if audio init failed or this build has no SDL2.
     void push_audio_samples(const int16_t* samples, std::size_t count);
+
+#if defined(GBARECOMP_WEB_HOST)
+    // Rate-tagged mono PCM (one SOUNDBIAS rate per block, from
+    // GbaAudio::drain_sample_block). Never blocks the guest: a full ring is
+    // counted as overflow and requests a playback reset.
+    void push_audio_block(const int16_t* samples, std::size_t count, uint32_t rate);
+    // Starts a new playback epoch (pause, state load, overflow). Samples are
+    // not accepted until the AudioWorklet acknowledges the reset.
+    void reset_audio();
+    // True while the page is hidden; the runner holds the guest at the frame
+    // boundary, distinct from the user's own pause toggle.
+    bool auto_paused() const;
+    void report_paused(bool paused);
+#endif
 
     // Service the native window-system queue without consuming input events.
     // Long guest frames use this to remain responsive between presentations.
@@ -127,6 +199,10 @@ public:
         // held (default Tab). Uncaps the frame limiter for as long as it's
         // down.
         bool     fast_forward = false;
+        // Repeating global Assist binding. It fires immediately, then every
+        // half-second while held so one-second rewind steps move backward at
+        // approximately normal speed.
+        bool     rewind = false;
         // Edge-triggered system hotkeys (config.ini [KeyMap] bindings; see
         // load_input_config). The caller owns the semantics: fullscreen and
         // window scale route back into this window, pause gates stepping in
@@ -146,12 +222,36 @@ public:
         // Controller angular velocity around its face-normal axis, in rad/s.
         // A DualSense supplies this through SDL's standard gyro sensor API.
         float    gyro_rate_z = 0.0f;
+        // Mobile lifecycle: the OS is moving the app to the background (or
+        // terminating it). The runtime must flush saves NOW; see
+        // wait_for_foreground().
+        bool     enter_background = false;
+        bool     terminating = false;
     };
     Events pump();
 
 private:
     bool open_ = false;
     void* impl_ = nullptr;  // backend-specific opaque
+    int orientation_policy_ = 0;
 };
+
+// Engine-wide haptic hook for game input policies (touch_input.h users).
+// Installed by the open HostWindow; a no-op when no window/vibrator exists.
+void host_haptic_pulse(int duration_ms, float strength);
+
+// Ask the open window to show the runtime settings menu at its next pump
+// (thread-safe). Lets a policy that claims Back/long-press still offer the
+// menu from a context of its choosing, e.g. Back on the free overworld.
+void host_request_settings_menu();
+
+#if defined(GBARECOMP_WEB_HOST)
+// Persistent browser storage: the page (packaging/web/save_store.js) owns
+// when /saves is synced to IndexedDB; the runtime only reports that it wrote.
+enum class WebStorageWrite : uint32_t { Battery = 1, State = 2 };
+// Worker -> page, non-blocking. Integers only (async proxy). Independent of
+// HostWindow lifetime: the final battery flush runs after HostWindow::close().
+void web_notify_storage_write(WebStorageWrite kind, bool ok);
+#endif
 
 }  // namespace gbarecomp

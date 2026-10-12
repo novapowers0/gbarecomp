@@ -129,6 +129,26 @@ uint32_t runtime_mem_cycles(uint32_t addr, uint32_t width,
 uint32_t runtime_mul_cycles(uint32_t rs_value, uint32_t signed_variant,
                             uint32_t extra);
 
+// ── Opcode-fetch wait states + GamePak prefetch ────────────────────
+// instr_cycle_base charges every fetch as a zero-wait 1S. Generated code
+// adds the real fetch waits of the code region: S per instruction, N after
+// a data access or a multiply, and the refill N+S pair in the target region
+// after a PC write — the same terms Interpreter::step adds through
+// Bus::code_wait (see arm_ir.h next_fetch_nonsequential). `g_runtime_waits`
+// is the active bus's table (WAITCNT + EWRAM control): the active
+// gba::GbaBus keeps its live state here (bind_wait_table), so generated
+// code reads it with a single load.
+extern RuntimeWaitTable g_runtime_waits;
+// Refill waits for an exception return (MOVS pc / LDM ^): the restored
+// instruction set is the current mode's SPSR.T, read before the restore.
+uint32_t runtime_exception_return_refill(uint32_t target_pc);
+// rwt_prefetch_stall(g_runtime_waits, wait) - wait for the cartridge
+// instruction at `pc` (runtime_wait_model.h). A shadow re-run (widescreen
+// sidecar draws, gate validation) evaluates on a copy so the guest stays
+// bit-identical.
+uint32_t runtime_prefetch_stall_delta(uint32_t wait, uint32_t pc,
+                                      uint32_t thumb);
+
 // ── Shifter helpers ────────────────────────────────────────────────
 // Generated code uses these for data-processing operand2 shifts and
 // for register-shifted-by-register cases. They update the shifter
@@ -160,6 +180,56 @@ void arm_set_nzcv_sbc(uint32_t a, uint32_t b, uint32_t c_in, uint32_t result);
 void runtime_dispatch(uint32_t target_pc);
 void runtime_dispatch_with_exchange(uint32_t target_pc);
 void runtime_dispatch_miss(uint32_t target_pc);
+
+// ── Guaranteed tail transfers ──────────────────────────────────────
+// Every guest transfer that never returns to its host caller (B, a computed
+// PC write, BX, LDR/LDM/POP into PC, SWI entry and the function fall-through)
+// is a C call in tail position. Native clang/gcc lower those calls to jumps
+// (sibling-call optimisation), so a guest loop that crosses function
+// boundaries costs no host stack. The WebAssembly backend does not: every
+// generated function has several `return`s and the calls stay calls, so the
+// V8 stack overflows as play time grows (docs/WEB_WASM_EXPERIMENTS.md §5).
+//
+// The generator emits those transfers through the macros below, always as a
+// complete statement at the start of a line inside a braced block (never as
+// the body of an unbraced `if`). Natively they expand to exactly the
+// historical text — `f(); return;` — so native builds, the gcc/tcc self-heal
+// overlays and MSVC see the same token stream as before. Under Emscripten
+// they become musttail returns, which clang must lower to `return_call` or
+// reject at compile time. musttail needs identical signatures, so the
+// dispatch-shaped transfers hand their argument over in g_runtime_tail_arg to
+// void(void) entry points. Set immediately before the tail call and read
+// first thing by the callee; nothing may run between. Thread-local so a
+// second thread entering the runtime (TCP server, worker) can never observe
+// or clobber the guest thread's hand-off.
+#if defined(__cplusplus)
+#  define GBARECOMP_TAIL_ARG_TLS thread_local
+#else
+#  define GBARECOMP_TAIL_ARG_TLS _Thread_local
+#endif
+extern GBARECOMP_TAIL_ARG_TLS uint32_t g_runtime_tail_arg;
+void runtime_dispatch_tail(void);                // runtime_dispatch(g_runtime_tail_arg)
+void runtime_dispatch_with_exchange_tail(void);  // runtime_dispatch_with_exchange(g_runtime_tail_arg)
+void runtime_swi_tail(void);                     // runtime_swi(g_runtime_tail_arg)
+
+#if defined(__EMSCRIPTEN__)
+#  if !defined(__wasm_tail_call__)
+#    error "gbarecomp: generated code needs guaranteed tail calls; compile and link with -mtail-call"
+#  endif
+#  define GBARECOMP_MUSTTAIL __attribute__((musttail))
+#  define GBARECOMP_TAIL_CALL(fn) GBARECOMP_MUSTTAIL return fn()
+#  define GBARECOMP_TAIL_DISPATCH(pc) \
+       g_runtime_tail_arg = (pc); GBARECOMP_MUSTTAIL return runtime_dispatch_tail()
+#  define GBARECOMP_TAIL_DISPATCH_WITH_EXCHANGE(pc) \
+       g_runtime_tail_arg = (pc); GBARECOMP_MUSTTAIL return runtime_dispatch_with_exchange_tail()
+#  define GBARECOMP_TAIL_SWI(imm) \
+       g_runtime_tail_arg = (imm); GBARECOMP_MUSTTAIL return runtime_swi_tail()
+#else
+#  define GBARECOMP_TAIL_CALL(fn) fn(); return
+#  define GBARECOMP_TAIL_DISPATCH(pc) runtime_dispatch(pc); return
+#  define GBARECOMP_TAIL_DISPATCH_WITH_EXCHANGE(pc) runtime_dispatch_with_exchange(pc); return
+#  define GBARECOMP_TAIL_SWI(imm) runtime_swi(imm); return
+#endif
 
 // Whole-program force-interpreter backend (co-simulation "interp" side). When
 // g_force_interp != 0, the main run loop calls runtime_force_interp_step() once
@@ -209,11 +279,21 @@ uint32_t        runtime_call_stack_depth(void);
 const uint32_t* runtime_call_stack_data(void);
 void            runtime_call_stack_restore(const uint32_t* entries,
                                            uint32_t depth);
+// Restored entries have no host frame. When the stack is full, a push evicts
+// the older half of those above the IRQ floor (loudly: stderr + trace) instead
+// of aborting; guest returns stay correct because unmatched returns dispatch.
+// Only a stack full of host-backed frames still aborts.
+extern unsigned long long g_runtime_call_return_evictions;
 
-// Always-on structured execution trace. The RUNTIME_TRACE_* kind macros
+// Structured execution trace. The RUNTIME_TRACE_* kind macros
 // and RuntimeTraceEntry are defined in runtime_arm_types.h. This records
 // diagnostic state only; it never routes execution or substitutes for
-// missing codegen.
+// missing codegen. It is disabled by default for normal gameplay; set
+// GBARECOMP_RUNTIME_TRACE=1 or one of the trace/watchpoint env vars to arm it.
+extern unsigned g_runtime_trace_enabled;
+static inline int runtime_trace_enabled(void) {
+    return g_runtime_trace_enabled != 0u;
+}
 void runtime_trace_event(uint32_t kind, uint32_t pc, uint32_t addr,
                          uint32_t value, uint32_t aux);
 void runtime_trace_reset(void);
@@ -272,6 +352,12 @@ uint32_t runtime_current_pc(void);
 // world-coord args). nullptr (the default) costs one not-taken branch per
 // function entry and is byte-identical to the un-hooked guest state.
 extern void (*g_runtime_fn_entry_hook)(uint32_t entry_pc);
+
+// Trusted mod replacement hook. Unlike g_runtime_fn_entry_hook (which is
+// observability-only), a non-zero result means the callback authored g_cpu's
+// post-call state and the generated body must return immediately. Only reviewed
+// [[mod_function_hook]] entries emit this call.
+int gba_mod_function_entry(uint32_t entry_pc, int thumb, ArmCpuState* cpu);
 
 // ── Mid-function alias resume PC ───────────────────────────────────────
 // Set by a thin per-alias dispatch wrapper (generated) to the alternate
@@ -434,6 +520,10 @@ void runtime_unimplemented_op(const char* op_name, uint32_t pc);
 
 void runtime_init(void* bus_handle);
 void runtime_shutdown(void);
+
+// Inline fetch-wait helpers (runtime_refill_cycles, runtime_prefetch_adjust)
+// shared verbatim with the Stage-2 overlay shim.
+#include "runtime_wait_inline.h"
 
 #ifdef __cplusplus
 }  // extern "C"

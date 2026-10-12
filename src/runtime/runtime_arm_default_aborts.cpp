@@ -26,6 +26,7 @@
 // and supply their own versions that record state for the diff runner.
 
 #include "runtime_arm.h"
+#include "mod_function_hooks.h"
 #include "symbol_lookup.h"
 #include "self_heal.h"
 #include "overlay_loader.h"
@@ -410,8 +411,8 @@ void record_and_log_miss(std::uint32_t pc, bool thumb) {
         } else if (!g_miss_notice_logged) {
             g_miss_notice_logged = true;
             std::fprintf(stderr,
-                "self_heal: missing static coverage detected; healing in the "
-                "background and recording a TOML proposal. Set "
+                "self_heal: NOT_STATIC; missing static coverage detected; "
+                "interpreter bridge active, recording a TOML proposal. Set "
                 "GBARECOMP_SELFHEAL_VERBOSE=1 for per-PC diagnostics.\n");
         }
 
@@ -587,6 +588,18 @@ extern "C" int runtime_bridge_interpret(uint32_t entry_pc, bool entry_thumb,
         const bool was_thumb = cpu.thumb;
         const std::uint32_t old_mode = cpu.cpsr.mode;
         g_cpu.R[15] = pc;  // store_interp already set this; explicit for clarity
+        // The bridge has no generated prologue, so it owns the entry decision.
+        // Do this before fetch/fingerprint/timing. A handled callback authored
+        // g_cpu's return state and replaces the entire bridged subtree.
+        if (gba_mod_function_entry(pc, was_thumb ? 1 : 0, &g_cpu)) {
+            g_interp_insns += bridged_insns;
+            bus->set_bios_access_enabled(g_cpu.R[15] < 0x00004000u);
+            if (!top_level && !irq_cont) {
+                runtime_call_stack_restore(entry_stack.data(),
+                                           entry_depth - 1);
+            }
+            return 1;
+        }
         bus->set_bios_access_enabled(pc < 0x00004000u);
         if (g_runtime_insn_trace) runtime_insn_fp();
 
@@ -796,6 +809,14 @@ struct ForceInterpBus : armv4t::Bus {
     uint32_t access_cycles(uint32_t a, uint8_t w, bool s) const override {
         return raw->access_cycles(a, w, s);
     }
+    // Fetch waits and the prefetch buffer are bus timing state, not data
+    // accesses: forward to the real bus exactly like access_cycles.
+    uint32_t code_wait(uint32_t pc, bool t, bool s) const override {
+        return raw->code_wait(pc, t, s);
+    }
+    int32_t prefetch_stall(int32_t w, uint32_t pc, bool t) override {
+        return raw->prefetch_stall(w, pc, t);
+    }
 };
 }  // namespace
 
@@ -803,6 +824,16 @@ extern "C" void runtime_force_interp_step(void) {
     using gbarecomp::active_bus;
     gba::GbaBus* bus = active_bus();
     if (!bus) return;
+
+    // Whole-program / forced interpreter execution has no generated function
+    // prologue. Check the registry once at the current instruction boundary;
+    // non-matching entries are inert and a handled callback owns g_cpu's next
+    // PC, exactly as the static and healed prologues do.
+    if (gba_mod_function_entry(g_cpu.R[15],
+                               (g_cpu.cpsr & CPSR_T_BIT) != 0 ? 1 : 0,
+                               &g_cpu)) {
+        return;
+    }
 
     // Per-instruction prologue, matching the generated-code prologue exactly
     // (arm_codegen.cpp: "if (runtime_should_yield()) return;"). runtime_should_yield

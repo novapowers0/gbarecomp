@@ -27,10 +27,16 @@
 #include "bus.h"
 #include "cpu_state.h"
 #include "interpreter.h"
+#include "overlay_abi.h"
 #include "runtime_arm.h"
+#include "runtime_context.h"
 #include "stubs.h"
 #include "test_cases.h"
 #include "thumb_decode.h"
+#include "gba_waitstates.h"
+
+extern "C" int overlay_runtime_trace_gate_compile_smoke(
+    const GbaOverlayCallbacks* callbacks);
 
 namespace {
 
@@ -87,6 +93,15 @@ struct FlatBus : armv4t::Bus {
         p[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
         p[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
     }
+    // Fetch waits + prefetch come from the same table the generated side
+    // reads through g_runtime_waits (stubs.cpp), exactly as the real GbaBus
+    // and the runtime share gba::GbaBus::wait_table().
+    uint32_t code_wait(uint32_t pc, bool thumb, bool seq) const override {
+        return gba::waits_code(codegen_test::g_waits, pc, thumb, seq);
+    }
+    int32_t prefetch_stall(int32_t wait, uint32_t pc, bool thumb) override {
+        return gba::waits_prefetch_stall(codegen_test::g_waits, wait, pc, thumb);
+    }
 };
 
 // ── CPSR pack / unpack between interpreter-style and recomp-style ──
@@ -133,6 +148,210 @@ armv4t::Instr decode_one(const TestCase& tc) {
 // 64 KB window from 0 — every test case's working set fits.
 struct BusGeom { uint32_t base; uint32_t size; };
 BusGeom default_bus_geom() { return {0u, 64u * 1024u}; }
+
+void set_env_var(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+void unset_env_var(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
+struct EnvSnapshot {
+    struct Entry {
+        const char* name;
+        bool present;
+        std::string value;
+    };
+    std::vector<Entry> entries;
+
+    explicit EnvSnapshot(const char* const* names, std::size_t count) {
+        entries.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            const char* value = std::getenv(names[i]);
+            entries.push_back({names[i], value != nullptr,
+                               value ? std::string(value) : std::string()});
+        }
+    }
+
+    ~EnvSnapshot() {
+        for (const Entry& e : entries) {
+            if (e.present) {
+                set_env_var(e.name, e.value.c_str());
+            } else {
+                unset_env_var(e.name);
+            }
+        }
+        runtime_trace_reset();
+    }
+};
+
+constexpr const char* kTraceEnvVars[] = {
+    "GBARECOMP_RUNTIME_TRACE",
+    "GBARECOMP_TRACE_ON_DISPATCH_MISS",
+    "GBARECOMP_ABORT_ON_BIOS_WRITE",
+    "GBARECOMP_ABORT_ON_MEM_WRITE_ADDR",
+    "GBARECOMP_ABORT_ON_MEM_READ_HIGH",
+    "GBARECOMP_ABORT_AFTER_BRANCHES",
+    "GBARECOMP_ABORT_ON_BRANCH_PC",
+};
+
+void clear_trace_env() {
+    for (const char* name : kTraceEnvVars) unset_env_var(name);
+}
+
+void seed_trace_state() {
+    std::memset(&g_cpu, 0, sizeof(g_cpu));
+    for (uint32_t i = 0; i < 16; ++i) {
+        g_cpu.R[i] = 0x10000000u + i * 0x1111111u;
+    }
+    g_cpu.cpsr = CPSR_N_BIT | CPSR_C_BIT | 0x1Fu;
+    g_runtime_cycles = 0x123456789ull;
+}
+
+bool cpu_and_cycles_match(const ArmCpuState& cpu_before,
+                          unsigned long long cycles_before) {
+    return std::memcmp(&g_cpu, &cpu_before, sizeof(g_cpu)) == 0 &&
+           g_runtime_cycles == cycles_before;
+}
+
+bool trace_event_preserves_guest_state(const char* label) {
+    ArmCpuState cpu_before = g_cpu;
+    unsigned long long cycles_before = g_runtime_cycles;
+    runtime_trace_event(RUNTIME_TRACE_BRANCH, 0x08000100u, 0x08000200u,
+                        0xA5A55A5Au, 0x1234u);
+    if (!cpu_and_cycles_match(cpu_before, cycles_before)) {
+        std::printf("FAIL runtime_trace_gate: %s mutated guest state\n",
+                    label);
+        return false;
+    }
+    return true;
+}
+
+bool expect_trace_state(const char* label, bool enabled) {
+    if ((g_runtime_trace_enabled != 0u) != enabled) {
+        std::printf("FAIL runtime_trace_gate: %s enabled=%u expected=%u\n",
+                    label, g_runtime_trace_enabled, enabled ? 1u : 0u);
+        return false;
+    }
+    return true;
+}
+
+bool expect_empty_trace(const char* label) {
+    RuntimeTraceEntry entries[1] = {};
+    uint32_t count = runtime_trace_copy_recent(entries, 1);
+    if (count != 0u) {
+        std::printf("FAIL runtime_trace_gate: %s copied %u entries\n",
+                    label, count);
+        return false;
+    }
+    return true;
+}
+
+bool run_runtime_trace_gate_cases() {
+    EnvSnapshot env(kTraceEnvVars,
+                    sizeof(kTraceEnvVars) / sizeof(kTraceEnvVars[0]));
+    clear_trace_env();
+
+    runtime_trace_reset();
+    if (!expect_trace_state("default env", false)) return false;
+    seed_trace_state();
+    if (!trace_event_preserves_guest_state("disabled trace")) return false;
+    if (!expect_empty_trace("disabled trace")) return false;
+
+    set_env_var("GBARECOMP_RUNTIME_TRACE", "");
+    runtime_trace_reset();
+    if (!expect_trace_state("empty runtime trace env", false)) return false;
+
+    set_env_var("GBARECOMP_RUNTIME_TRACE", "0");
+    runtime_trace_reset();
+    if (!expect_trace_state("runtime trace env 0", false)) return false;
+
+    set_env_var("GBARECOMP_RUNTIME_TRACE", "1");
+    runtime_trace_reset();
+    if (!expect_trace_state("runtime trace env 1", true)) return false;
+    seed_trace_state();
+    if (!trace_event_preserves_guest_state("enabled trace")) return false;
+    RuntimeTraceEntry entries[1] = {};
+    uint32_t count = runtime_trace_copy_recent(entries, 1);
+    if (count != 1u || entries[0].kind != RUNTIME_TRACE_BRANCH ||
+        entries[0].pc != 0x08000100u ||
+        entries[0].cycles != 0x123456789ull) {
+        std::printf("FAIL runtime_trace_gate: enabled trace entry mismatch "
+                    "count=%u kind=%u pc=0x%08X cycles=%llu\n",
+                    count, entries[0].kind, entries[0].pc,
+                    entries[0].cycles);
+        return false;
+    }
+
+    unset_env_var("GBARECOMP_RUNTIME_TRACE");
+    runtime_trace_reset();
+    if (!expect_trace_state("reset disables after env clear", false)) {
+        return false;
+    }
+    if (!expect_empty_trace("reset clears trace ring")) return false;
+
+    set_env_var("GBARECOMP_ABORT_AFTER_BRANCHES", "0");
+    runtime_trace_reset();
+    if (!expect_trace_state("numeric branch-count watchpoint", true)) {
+        return false;
+    }
+
+    unset_env_var("GBARECOMP_ABORT_AFTER_BRANCHES");
+    set_env_var("GBARECOMP_ABORT_ON_MEM_WRITE_ADDR", "0");
+    runtime_trace_reset();
+    if (!expect_trace_state("numeric mem-write watchpoint", true)) {
+        return false;
+    }
+
+    unset_env_var("GBARECOMP_ABORT_ON_MEM_WRITE_ADDR");
+    set_env_var("GBARECOMP_ABORT_ON_BRANCH_PC", "0");
+    runtime_trace_reset();
+    if (!expect_trace_state("numeric branch-PC watchpoint", true)) {
+        return false;
+    }
+
+    unset_env_var("GBARECOMP_ABORT_ON_BRANCH_PC");
+    set_env_var("GBARECOMP_ABORT_ON_BIOS_WRITE", "0");
+    runtime_trace_reset();
+    if (!expect_trace_state("existing BIOS watchpoint presence", true)) {
+        return false;
+    }
+
+    unset_env_var("GBARECOMP_ABORT_ON_BIOS_WRITE");
+    set_env_var("GBARECOMP_ABORT_ON_MEM_READ_HIGH", "0");
+    runtime_trace_reset();
+    if (!expect_trace_state("existing mem-read-high presence", true)) {
+        return false;
+    }
+
+    return true;
+}
+
+bool run_overlay_runtime_trace_gate_cases() {
+    unsigned trace_enabled = 0;
+    GbaOverlayCallbacks callbacks = {};
+    callbacks.runtime_trace_enabled = &trace_enabled;
+
+    if (overlay_runtime_trace_gate_compile_smoke(&callbacks) != 0) {
+        std::printf("FAIL overlay_runtime_trace_gate: disabled pointer read\n");
+        return false;
+    }
+    trace_enabled = 1;
+    if (overlay_runtime_trace_gate_compile_smoke(&callbacks) != 1) {
+        std::printf("FAIL overlay_runtime_trace_gate: enabled pointer read\n");
+        return false;
+    }
+    return true;
+}
 
 // ── Diff machinery ─────────────────────────────────────────────────
 
@@ -210,7 +429,29 @@ void diff_state(const TestCase& tc,
 
 // ── Main per-case runner ───────────────────────────────────────────
 
-bool run_case(const TestCase& tc, std::size_t idx) {
+// Wait-state configuration a pass runs under. `overlap` seeds the prefetch
+// buffer just ahead of each instruction (exercising GBAMemoryStall's
+// previous-loads path) instead of far away.
+struct WaitConfig {
+    const char* name;
+    uint16_t waitcnt;
+    uint32_t memctl;
+    bool overlap;
+};
+
+void apply_wait_config(const WaitConfig& wc, const TestCase& tc) {
+    gba::waits_reset(codegen_test::g_waits);
+    gba::waits_apply_waitcnt(codegen_test::g_waits, wc.waitcnt);
+    gba::waits_apply_memctl(codegen_test::g_waits, wc.memctl);
+    codegen_test::g_waits.last_prefetched_pc =
+        wc.overlap ? tc.pc + (tc.thumb ? 4u : 8u) + 6u : 0u;
+}
+
+const WaitConfig kPowerOn = {"power-on", 0x0000u, 0x0D000020u, false};
+
+bool run_case(const TestCase& tc, std::size_t idx, TestFn fn,
+              const WaitConfig& wc) {
+    apply_wait_config(wc, tc);
     BusGeom geom = default_bus_geom();
     if (tc.mem_size) {
         geom = BusGeom{tc.mem_base, tc.mem_size};
@@ -232,8 +473,11 @@ bool run_case(const TestCase& tc, std::size_t idx) {
 
     uint32_t saved_pc = cpu_interp.R[15];
     uint32_t interp_cycles = 0;
+    const RuntimeWaitTable waits_before = codegen_test::g_waits;
     auto r = armv4t::Interpreter::step(cpu_interp, bus_interp, ins,
                                        &interp_cycles);
+    const uint32_t interp_prefetched = codegen_test::g_waits.last_prefetched_pc;
+    codegen_test::g_waits = waits_before;  // recomp starts from the same state
     if (r == armv4t::Interpreter::Result::NotImplemented) {
         std::printf("FAIL [%zu] %s: interpreter NotImplemented for "
                     "this instruction shape — fix the interpreter or "
@@ -263,7 +507,7 @@ bool run_case(const TestCase& tc, std::size_t idx) {
             tc.mem_init[k].addr, tc.mem_init[k].value);
     }
 
-    kTestFns[idx]();
+    fn();
 
     // Check for unimplemented op aborts.
     if (codegen_test::g_unimplemented_called) {
@@ -289,8 +533,59 @@ bool run_case(const TestCase& tc, std::size_t idx) {
     // region-specific waitstates live in gba::GbaBus and are checked by
     // the differential oracle, not here.
     if (codegen_test::g_ticked_cycles != interp_cycles) {
-        note(d, "cycles: interp=%u recomp=%llu", interp_cycles,
+        note(d, "cycles [%s pc=0x%08X]: interp=%u recomp=%llu", wc.name,
+             tc.pc, interp_cycles,
              static_cast<unsigned long long>(codegen_test::g_ticked_cycles));
+    }
+    if (codegen_test::g_waits.last_prefetched_pc != interp_prefetched) {
+        note(d, "prefetch buffer [%s]: interp=0x%08X recomp=0x%08X", wc.name,
+             interp_prefetched, codegen_test::g_waits.last_prefetched_pc);
+    }
+    // Tail-transfer contract. GBARECOMP_TAIL_* natively expands to
+    // `call; return`, so a transfer that does not link must leave the
+    // function, and an instruction the interpreter does not branch on must
+    // continue to the next one. A transfer may leave by dispatching or, for a
+    // self-loop, by returning with R15 set for the caller to redispatch. BL
+    // keeps its continuation (call, then return-address check) and is exempt.
+    const bool links = ins.op == armv4t::IrOp::BL ||
+                       ins.op == armv4t::IrOp::BL_suffix ||
+                       ins.op == armv4t::IrOp::BLX_reg;
+    const uint32_t next_pc = tc.pc + (tc.thumb ? 2u : 4u);
+    const bool taken = tc.branches && cpu_interp.R[15] != next_pc;
+    if (!links && (taken || codegen_test::g_dispatch_called) &&
+        codegen_test::g_fellthrough) {
+        note(d, "transfer (dispatch=%d target=0x%08X) fell through instead "
+                "of returning", codegen_test::g_dispatch_called ? 1 : 0,
+             codegen_test::g_last_dispatch_target);
+    }
+    if (!taken && !codegen_test::g_dispatch_called &&
+        !codegen_test::g_fellthrough) {
+        note(d, "returned although nothing was transferred");
+    }
+    // Same instruction with its direct target resolved to a named function:
+    // B must leave through GBARECOMP_TAIL_CALL, BL must call and continue its
+    // return-address check, and a not-taken branch must call nothing.
+    if (fn == kTestFns[idx] && kNamedTestFns[idx]) {
+        std::memset(&g_cpu, 0, sizeof(g_cpu));
+        for (int rg = 0; rg < 16; ++rg) g_cpu.R[rg] = tc.r_init[rg];
+        g_cpu.cpsr = tc.cpsr_init;
+        g_cpu.R[15] = tc.pc;
+        codegen_test::bus_reset(geom.base, geom.size);
+        for (std::size_t k = 0; k < tc.mem_init_count; ++k) {
+            codegen_test::bus_write_u32_direct(
+                tc.mem_init[k].addr, tc.mem_init[k].value);
+        }
+        kNamedTestFns[idx]();
+        if (taken != codegen_test::g_named_sink_called) {
+            note(d, "named target: taken=%d but named call=%d", taken ? 1 : 0,
+                 codegen_test::g_named_sink_called ? 1 : 0);
+        }
+        if (taken && !links && codegen_test::g_fellthrough) {
+            note(d, "named target: GBARECOMP_TAIL_CALL fell through");
+        }
+        if (!taken && !codegen_test::g_fellthrough) {
+            note(d, "named target: not-taken branch did not fall through");
+        }
     }
     // runtime_tick can synchronously deliver an IRQ. BX must therefore expose
     // the destination instruction-set mode before ticking, not merely before
@@ -340,6 +635,72 @@ bool run_call_return_stack_cases() {
         return false;
     }
 
+    runtime_shutdown();
+    return true;
+}
+
+// A restored (host-less) stack that the guest never returns through must not
+// abort a session when it fills: suspended multiplayer dispatch keeps these
+// continuations, and MKSC's far-branch BLs used to leak one per frame.
+bool run_call_return_eviction_cases() {
+    auto fail = [](const char* why) {
+        std::printf("FAIL runtime_call_return_eviction: %s\n", why);
+        runtime_shutdown();
+        return false;
+    };
+    constexpr uint32_t kCap = 1024u;
+    std::vector<uint32_t> leaked(kCap);
+    for (uint32_t i = 0; i < kCap; ++i) leaked[i] = 0x08001000u + i * 4u;
+
+    // Full host-less stack: the next push evicts the older half.
+    runtime_init(nullptr);
+    const unsigned long long before = g_runtime_call_return_evictions;
+    runtime_call_stack_restore(leaked.data(), kCap);
+    runtime_call_push_return(0x08100000u);
+    if (g_runtime_call_return_evictions != before + 1u)
+        return fail("full host-less stack did not evict");
+    if (runtime_call_stack_depth() != kCap / 2u + 1u)
+        return fail("eviction did not drop exactly the older half");
+    const uint32_t* s = runtime_call_stack_data();
+    if (s[0] != leaked[kCap / 2u] || s[kCap / 2u - 1u] != leaked[kCap - 1u] ||
+        s[kCap / 2u] != 0x08100000u)
+        return fail("eviction reordered surviving entries");
+    // Survivors still behave as return hints.
+    if (!runtime_call_should_return(leaked[kCap - 1u]))
+        return fail("surviving newest host-less entry no longer matches");
+
+    // The host-less mark follows the depth down: a return into slot 3 leaves
+    // 3 host-less entries. Filling the rest with host-backed pushes, the next
+    // push may evict only from those 3 (the older 2), never a host frame.
+    runtime_call_stack_restore(leaked.data(), 8u);
+    if (!runtime_call_should_return(leaked[3]))
+        return fail("return into restored frame did not match");
+    for (uint32_t i = 0; i < kCap - 3u; ++i) runtime_call_push_return(0x09000000u + i * 4u);
+    const unsigned long long mid = g_runtime_call_return_evictions;
+    runtime_call_push_return(0x09F00000u);
+    if (g_runtime_call_return_evictions != mid + 1u)
+        return fail("host-less prefix below a full stack was not evicted");
+    s = runtime_call_stack_data();
+    if (runtime_call_stack_depth() != kCap - 1u || s[0] != leaked[2] ||
+        s[1] != 0x09000000u)
+        return fail("eviction touched host-backed frames or kept too many");
+    runtime_shutdown();
+
+    // Entries below the IRQ floor belong to the interrupted mainline and are
+    // never evicted, even when host-less.
+    gbarecomp::RuntimeArmContext ctx;
+    ctx.returns = leaked;
+    ctx.return_floor = kCap - 2u;
+    runtime_init(nullptr);
+    gbarecomp::runtime_restore_arm_context(ctx);
+    const unsigned long long floor_before = g_runtime_call_return_evictions;
+    runtime_call_push_return(0x08200000u);
+    s = runtime_call_stack_data();
+    if (g_runtime_call_return_evictions != floor_before + 1u ||
+        runtime_call_stack_depth() != kCap ||
+        s[kCap - 3u] != leaked[kCap - 3u] || s[kCap - 2u] != leaked[kCap - 1u] ||
+        s[kCap - 1u] != 0x08200000u)
+        return fail("eviction crossed the IRQ floor");
     runtime_shutdown();
     return true;
 }
@@ -469,10 +830,35 @@ int main() {
 
     int failures = 0;
     for (std::size_t i = 0; i < kTestCasesCount; ++i) {
-        if (!run_case(kTestCases[i], i)) ++failures;
+        if (!run_case(kTestCases[i], i, kTestFns[i], kPowerOn)) ++failures;
     }
+    // Cartridge-ROM relocations under the WAITCNT settings games use: the
+    // power-on 4/2, the common 3/1 with and without the prefetch buffer,
+    // the fastest 2/1 with a prefetch buffer already running ahead, and
+    // 8/1 with a 1-wait EWRAM. Cycles and the prefetch position must match
+    // the interpreter (Bus::code_wait / prefetch_stall) exactly.
+    const WaitConfig kRomConfigs[] = {
+        {"rom power-on", 0x0000u, 0x0D000020u, false},
+        {"rom 3/1 prefetch", 0x4317u, 0x0D000020u, false},
+        {"rom 3/1", 0x0317u, 0x0D000020u, false},
+        {"rom 2/1 prefetch overlap", 0x4318u, 0x0D000020u, true},
+        {"rom 8/1 prefetch ewram1", 0x401Cu, 0x0E000020u, false},
+    };
+    std::size_t rom_runs = 0;
+    for (const WaitConfig& wc : kRomConfigs) {
+        for (std::size_t i = 0; i < kTestCasesCount; ++i) {
+            TestCase tc = kTestCases[i];
+            tc.pc = rom_relocated_pc(tc.pc);
+            ++rom_runs;
+            if (!run_case(tc, i, kRomTestFns[i], wc)) ++failures;
+        }
+    }
+    std::printf("codegen_tests: %zu cartridge-ROM wait-state runs\n", rom_runs);
     if (!run_call_return_stack_cases()) ++failures;
+    if (!run_call_return_eviction_cases()) ++failures;
     if (!run_thumb_alu_immediate_override_cases()) ++failures;
+    if (!run_runtime_trace_gate_cases()) ++failures;
+    if (!run_overlay_runtime_trace_gate_cases()) ++failures;
     if (failures) {
         std::printf("\ncodegen_tests: %d / %zu failed\n",
                     failures, kTestCasesCount);

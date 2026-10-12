@@ -1,6 +1,7 @@
 // gba_io.cpp — see gba_io.h.
 
 #include "gba_io.h"
+#include "gba_serial_device.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -9,22 +10,41 @@
 
 #include "gba_audio.h"
 #include "gba_ppu.h"
+#include "gba_bus.h"
 #include "snapshot.h"
 
-// Always-on MMIO write-trace ring (Axis 4). File-local statics mirroring the
-// runtime_arm.cpp ring style; lazily allocated on the first write. The cycle and
-// pc stamps come from the recomp runtime globals (declared here to avoid pulling
-// the ArmCpuState layout into this lib).
+// Opt-in MMIO write-trace ring (Axis 4). File-local statics mirroring the
+// runtime_arm.cpp ring style; lazily allocated on the first captured write. The
+// cycle and pc stamps come from the recomp runtime globals (declared here to
+// avoid pulling the ArmCpuState layout into this lib).
 extern "C" unsigned long long g_runtime_cycles;
 extern "C" uint32_t runtime_current_pc(void);
 
 namespace gba {
+const char* dma_ram_implementation() {
+#if defined(GBARECOMP_DMA_RAM_HLE)
+    return "HLE (contiguous ordinary-RAM DMA)";
+#else
+    return "LLE (per-unit DMA bus service)";
+#endif
+}
 namespace {
 MmioCapEntry* g_mmio_ring  = nullptr;
 uint64_t      g_mmio_write = 0;      // total committed writes (monotonic)
 bool          g_mmio_split = false;  // suppress nested write16 from write32
 
+bool mmio_cap_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("GBARECOMP_MMIO_CAP");
+        if (value && *value && *value != '0') return true;
+        value = std::getenv("GBARECOMP_MMIO_DUMP");
+        return value && *value;
+    }();
+    return enabled;
+}
+
 inline void mmio_cap_record(uint32_t addr, uint32_t value, uint32_t size) {
+    if (!mmio_cap_enabled()) return;
     if (!g_mmio_ring) {
         g_mmio_ring = static_cast<MmioCapEntry*>(
             std::calloc(kMmioCapRingSize, sizeof(MmioCapEntry)));
@@ -40,14 +60,16 @@ inline void mmio_cap_record(uint32_t addr, uint32_t value, uint32_t size) {
 }
 }  // namespace
 
+bool gba_mmio_cap_enabled() { return mmio_cap_enabled(); }
 uint64_t gba_mmio_cap_total()  { return g_mmio_write; }
 uint64_t gba_mmio_cap_oldest() {
+    if (!mmio_cap_enabled()) return 0;
     return g_mmio_write > kMmioCapRingSize ? g_mmio_write - kMmioCapRingSize : 0;
 }
 std::size_t gba_mmio_cap_query(uint64_t start, std::size_t count,
                                MmioCapEntry* out, uint64_t& out_first) {
     out_first = start;
-    if (!g_mmio_ring || count == 0 || !out) return 0;
+    if (!mmio_cap_enabled() || !g_mmio_ring || count == 0 || !out) return 0;
     uint64_t oldest = gba_mmio_cap_oldest();
     uint64_t head   = g_mmio_write;
     if (start < oldest) start = oldest;
@@ -141,7 +163,7 @@ GbaIo::GbaIo() {
     io_[0x088] = 0x00;
     io_[0x089] = 0x02;
 }
-GbaIo::~GbaIo() = default;
+GbaIo::~GbaIo() { set_serial_device(nullptr); }
 
 namespace {
 
@@ -279,6 +301,14 @@ void GbaIo::run_immediate_dma(int channel) {
 
     uint32_t s = sad;
     uint32_t d = dad;
+#if defined(GBARECOMP_DMA_RAM_HLE)
+    const bool copied = dma_watch < 0 && src_ctrl == 0 &&
+        (dest_ctrl == 0 || dest_ctrl == 3) && word_count >= 4u &&
+        dynamic_cast<GbaBus*>(bus_) &&
+        static_cast<GbaBus*>(bus_)->dma_copy_ram(s, d, word_count * step);
+    if (copied) { s += word_count * step; d += word_count * step; }
+    else
+#endif
     for (uint32_t k = 0; k < word_count; ++k) {
         if (transfer_32) {
             bus_->write32(d, bus_->read32(s));
@@ -342,6 +372,14 @@ void GbaIo::run_timed_dma(int start_mode) {
         uint32_t s = dma_next_source_[channel] & align_mask;
         uint32_t d = dma_next_dest_[channel] & align_mask;
         dma_steal_cycles_ += dma_transfer_cost(s, d, transfer_32, word_count);
+#if defined(GBARECOMP_DMA_RAM_HLE)
+        const bool copied = dma_watch < 0 && src_ctrl == 0 &&
+            (dest_ctrl == 0 || dest_ctrl == 3) && word_count >= 4u &&
+            dynamic_cast<GbaBus*>(bus_) &&
+            static_cast<GbaBus*>(bus_)->dma_copy_ram(s, d, word_count * step);
+        if (copied) { s += word_count * step; d += word_count * step; }
+        else
+#endif
         for (uint32_t k = 0; k < word_count; ++k) {
             if (transfer_32) bus_->write32(d, bus_->read32(s));
             else             bus_->write16(d, bus_->read16(s));
@@ -507,6 +545,7 @@ void GbaIo::request_irq(uint16_t bit) {
 }
 
 void GbaIo::tick_sio(uint32_t cycles) {
+    if (serial_device_) { serial_device_->tick(cycles); return; }
     if (!sio_transfer_active_) return;
     if (cycles < sio_cycles_remaining_) {
         sio_cycles_remaining_ -= cycles;
@@ -525,12 +564,19 @@ void GbaIo::tick_sio(uint32_t cycles) {
 }
 
 uint32_t GbaIo::cycles_until_next_sio_event() const {
+    if (serial_device_) return serial_device_->cycles_until_event();
     if (!sio_transfer_active_) return 0xFFFFFFFFu;
     return sio_cycles_remaining_ ? sio_cycles_remaining_ : 1u;
 }
 
 void GbaIo::set_keyinput(uint16_t keys) {
-    store_u16(&io_[IoReg::KEYINPUT], static_cast<uint16_t>(keys & 0x03FFu));
+    host_keyinput_ = static_cast<uint16_t>(keys & 0x03FFu);
+    store_u16(&io_[IoReg::KEYINPUT], composed_keyinput());
+}
+
+void GbaIo::set_synthesized_keyinput(uint16_t keys) {
+    synth_keyinput_ = static_cast<uint16_t>(keys & 0x03FFu);
+    store_u16(&io_[IoReg::KEYINPUT], composed_keyinput());
 }
 
 bool GbaIo::irq_pending() const {
@@ -579,6 +625,8 @@ void GbaIo::warn_unhandled(uint32_t off, uint32_t value, bool is_write, uint8_t 
 // ─────────────────────────────────────────────────────────────────────
 
 uint8_t GbaIo::read8(uint32_t off) {
+    if (serial_device_ && GbaSerialDevice::handles(off))
+        return static_cast<uint8_t>(serial_device_->read16(off & ~1u) >> ((off & 1u) * 8));
     if (off >= kIoSize) { warn_unhandled(off, 0, false, 1); return 0; }
     // POSTFLG: low bit is the boot flag. We're always "first boot"
     // for now, so return 0.
@@ -605,6 +653,7 @@ uint8_t GbaIo::read8(uint32_t off) {
 }
 
 uint16_t GbaIo::read16(uint32_t off) {
+    if (serial_device_ && GbaSerialDevice::handles(off)) return serial_device_->read16(off);
     if (off + 1 >= kIoSize) { warn_unhandled(off, 0, false, 2); return 0; }
     if (off == IoReg::VCOUNT) {
         return ppu_ ? ppu_->vcount() : 0;
@@ -640,6 +689,12 @@ uint32_t GbaIo::read32(uint32_t off) {
 // ─────────────────────────────────────────────────────────────────────
 
 void GbaIo::write8(uint32_t off, uint8_t v) {
+    if (serial_device_ && GbaSerialDevice::handles(off)) {
+        auto shift = (off & 1u) * 8;
+        serial_device_->write16(off & ~1u, static_cast<uint16_t>(v << shift),
+                                static_cast<uint16_t>(0xffu << shift));
+        return;
+    }
     if (off == IoReg::UNDOC_410) {
         // The retail BIOS writes FF here during reset. Hardware exposes this
         // as an undocumented 8-bit write-only register; no verified side
@@ -694,6 +749,7 @@ void GbaIo::write8(uint32_t off, uint8_t v) {
 }
 
 void GbaIo::write16(uint32_t off, uint16_t v) {
+    if (serial_device_ && GbaSerialDevice::handles(off)) { serial_device_->write16(off, v); return; }
     if (off + 1 >= kIoSize) { warn_unhandled(off, v, true, 2); return; }
     if (!g_mmio_split) mmio_cap_record(0x04000000u + off, v, 2);
     if (audio_ && off >= 0x060 && off <= 0x0AF) {

@@ -10,9 +10,10 @@ DMA, timers, interrupts, cartridge saves, GPIO devices, and input—and retains 
 safe interpreter/self-healing tier for code that cannot yet be resolved
 statically.
 
-Projects built on GBARecomp already ship with **adaptive widescreen, versioned
-mods, GBA screen color profiles, save states, host-synchronized RTC, modern
-motion controls, Android support, and cartridge-specific hardware such as
+GBARecomp and its game integrations support **adaptive widescreen, versioned
+mods, link-cable netplay, native Wireless Adapter support, GBA screen color
+profiles, save states, host-synchronized RTC, modern motion controls, Android
+support, and cartridge-specific hardware such as
 gyroscopes and solar sensors.**
 
 <table>
@@ -61,7 +62,8 @@ the faithful 240×160 viewport toward its validated maximum while retaining the
 original 160-line height.
 
 The framework provides live resize policy, a wider PPU presentation surface,
-launcher integration, and validation tools. Each game still owns the parts
+launcher integration, and validation tools. The shared surface reaches 896×160
+(enough for 50:9); each game sets its own ceiling within it. Each game still owns the parts
 only its engine understands: background streaming, room or field boundaries,
 actor visibility, sprite clipping, camera policy, menus, and HUD placement.
 Unsupported scenes can remain at their authentic width.
@@ -82,6 +84,44 @@ authored room buffers in *The Minish Cap*, streamed stage margins in *Mega Man
 Zero* and *Super Mario Advance 2*, race presentation in *Mario Kart: Super
 Circuit*, and large authored field planes in the three *Dragon Ball Z* games.
 The default remains the native GBA view, and the enhanced modes are opt-in.
+
+## Multiplayer: Link Cable and Wireless Adapter
+
+GBARecomp supports **Link Cable** and **Wireless Adapter** multiplayer through
+`recomp-net`, with both delay-sync and whole-session rollback. Each peer runs
+the complete set of virtual GBAs and their local cable or radio domain.
+The network carries player inputs; serial transfers and radio events stay on
+the shared emulated timeline, independent of Internet latency.
+
+| Device | Current validated scope |
+|---|---|
+| **Link Cable** | Two-player, same-game multiplayer in *Pokémon Emerald* and *Mario Kart: Super Circuit*. |
+| **Wireless Adapter** | Two *Pokémon Emerald* instances enter the Union Room, discover one another and initiate contact, with deterministic replay and delay/rollback input netplay. This is an initial RFU implementation; complete wireless battle/trade flows and every adapter command are not yet qualified. |
+
+The game developer declares supported devices. The lobby host selects
+**Lobby Settings → Connection type**, and everyone joins using that device.
+Link Cable remains the default. Connection type is separate from the
+delay-sync/rollback choice and from LAN/Internet transport.
+
+Both peers currently need the same verified ROM and recomp build. Session
+snapshots include every machine, peripheral and scheduler; rollback suppresses
+catch-up audio/video and keeps speculative cartridge saves in memory. Game
+integrations choose whether independent widescreen settings are safe for netplay.
+
+Application sessions currently admit **two players**. The cable hardware model
+has four ports; the wireless domain can represent multiple groups of one parent
+and up to four children. Those hardware limits do not imply that larger online
+lobbies are enabled. Mixed cartridges (such as Emerald ↔ FireRed), Single-Pak
+multiboot and larger sessions remain future work. No ROMs or native game code
+are distributed between players.
+
+See [multiplayer architecture and validation](docs/MULTIPLAYER.md) and
+[Wireless Adapter implementation, setup and fidelity limits](docs/WIRELESS.md).
+The [mixed-cartridge design](docs/MIXED_CARTRIDGE_MULTIPLAYER.md) records the
+Pokémon cable/wireless compatibility matrix, player-limit distinctions and
+planned manifest negotiation for future cross-version sessions.
+These describe source support; existing game release binaries only include the
+features present at their pinned engine/UI versions.
 
 ## Mods
 
@@ -180,6 +220,11 @@ verification, or the faithful Raw output.
 The CLI generates a recompilation project; it does not turn an arbitrary ROM
 into a finished playable port by itself.
 
+If you are on Windows and want step-by-step help, read
+[`docs/WINDOWS_GAME_SETUP.md`](docs/WINDOWS_GAME_SETUP.md). It explains what
+`gbarecomp_game.lib` means, why it is not a playable `.exe`, and what to do
+next.
+
 1. Open the [GBARecomp Releases](https://github.com/mstan/gbarecomp/releases)
    page.
 2. Download `gbarecomp-cli-windows-x86_64.zip` and extract the entire archive.
@@ -197,10 +242,11 @@ library compiles:
 
 ```powershell
 cd "C:\Projects\MyGameRecomp"
-.\build.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\build.ps1"
 ```
 
-A playable integration still needs verified function coverage, a host
+If this creates `build\Release\gbarecomp_game.lib`, the generated-library step
+worked. A playable integration still needs verified function coverage, a host
 application, cartridge configuration, and game-specific validation. Use one of
 the public game repositories below as a reference.
 
@@ -218,6 +264,18 @@ cmake --build build
 ctest --test-dir build
 ```
 
+Fresh builds use the shared scanline HLE renderer. To select the LLE renderer,
+configure a separate build directory:
+
+```sh
+cmake -S . -B build-lle -DGBARECOMP_SCANLINE_IMPLEMENTATION=LLE
+```
+
+CMake preserves an existing build's cached choice. To switch an existing build
+to HLE, configure it with `-DGBARECOMP_SCANLINE_IMPLEMENTATION=HLE`. Ordinary-RAM
+DMA remains LLE by default. See [`docs/ENGINE_HLE_DMA.md`](docs/ENGINE_HLE_DMA.md)
+for the renderer comparison and performance evidence.
+
 To build the self-contained Windows CLI ZIP, install Python 3.12 and
 PyInstaller, then run:
 
@@ -232,6 +290,46 @@ Cartridge recompilation always emits parallel `recompiled_NNN.cpp` shards. On
 Windows, the supplied Clang-MinGW toolchain and automatic ccache/sccache
 integration can reduce large clean builds substantially; see
 [`docs/BUILD_PERFORMANCE.md`](docs/BUILD_PERFORMANCE.md).
+
+## Build and test a browser bundle
+
+The browser target uses Emscripten and pthreads. The recompiler and BIOS must
+be built natively first; the generated game and runtime are then compiled to
+WebAssembly. Install and activate the Emscripten SDK (the current workflow is
+validated with 6.0.10) before running the web build:
+
+```sh
+source ~/emsdk/emsdk_env.sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGBARECOMP_COMPILER_CACHE=OFF
+cmake --build build --target gba_recompile -- -j10
+build/gba_recompile --bios bios/gba_bios.bin --config bios/gba_bios.toml \
+  --out build/generated_bios
+GBARECOMP_CORE="$PWD/build/gba_recompile" python3 tools/cli.py build \
+  --rom /path/to/game.gba --output /path/to/game-recomp \
+  --config /path/to/game.toml --force
+bash packaging/web/build_web.sh /path/to/game-recomp \
+  build/generated_bios /path/to/game.gba "" /path/to/game.toml
+python3 packaging/web/serve.py /path/to/game-recomp/web 8080
+```
+
+Open `http://127.0.0.1:8080/` in a browser, choose your own game ROM and GBA
+BIOS, and press Start. The bundle contains neither file: the page checks the
+ROM against the SHA-1 it was built for and keeps both files in that browser's
+IndexedDB, so each player picks them once and a normal bundle can be
+published. The ROM argument above is only hashed. The server supplies the COOP
+and COEP headers required by WebAssembly pthreads. `index.html?autostart=1`
+starts as soon as stored files are available; the browser must still be
+allowed to start audio through a real user click when autoplay is blocked.
+
+`build_web.sh` accepts an optional fifth argument with the original TOML
+configuration. If omitted, it uses `<project>/game.toml` when present and
+otherwise writes an empty `runtime.toml`; passing a missing explicit file is an
+error. Runtime settings are copied to the bundle, while local ROM/BIOS/save
+paths are omitted. For local testing only, `--embed-private-rom` builds a
+`web-PRIVATE` bundle with the ROM and BIOS inside (never publish it), and
+`--dev` enables `?args=` / `?env=` URL parameters on localhost. See
+[`packaging/web/README.md`](packaging/web/README.md) for isolated build
+directories, cache behavior, validation commands and browser troubleshooting.
 
 ## Architecture
 

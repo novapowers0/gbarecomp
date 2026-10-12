@@ -105,6 +105,14 @@ struct ConfigAluImmediateOverride {
     std::string note;
 };
 
+// Reviewed function entry eligible for a trusted native replacement callback.
+// This does not seed discovery: codegen audits it against actual emitted roots.
+struct ConfigModFunctionHook {
+    uint32_t    addr = 0;
+    CpuMode     mode = CpuMode::Arm;
+    std::string note;
+};
+
 struct ConfigDataRange {
     uint32_t    start = 0;
     uint32_t    end = 0;    // [start, end)
@@ -143,6 +151,7 @@ struct Config {
     std::vector<ConfigThumbAluImmediateOverride>
         thumb_alu_immediate_overrides;
     std::vector<ConfigAluImmediateOverride> alu_immediate_overrides;
+    std::vector<ConfigModFunctionHook> mod_function_hooks;
     std::vector<ConfigDataRange>    data_ranges;
     std::vector<ConfigCodeCopy>     code_copies;
     std::vector<ConfigJumpTable>    jump_tables;
@@ -156,6 +165,25 @@ struct Config {
 // Identity hash verification is NOT performed here — call
 // verify_identity() against the actual binary bytes after loading.
 bool load_config(const std::string& path, Config& out);
+
+// Merge a supplemental TOML overlay on top of an already-loaded base
+// config. An overlay carries only the tables that describe bytes
+// ([[extra_func]], [[data_range]], [[code_copy]], [[jump_table]], ...);
+// declaring [program] is an error, and [identity] — when present — must
+// match the base's sha1, which is what binds a generated overlay to the
+// exact binary it was derived from.
+//
+// The base wins every conflict: an [[extra_func]] the base already
+// declares at the same (addr, mode) keeps its reviewed name and note, and
+// an overlay entry the base excludes or marks as data is dropped with a
+// warning. This is the same precedence the function finder applies
+// downstream, where the first seed for an (addr, mode) supplies the name.
+//
+// Used for machine-generated symbol overlays (see
+// tools/symbol_import/import_decomp_symbols.py and
+// docs/SYMBOL_OVERLAY.md) so importing symbols never means replacing, or
+// writing to, a game's hand-authored game.toml.
+bool load_config_overlay(const std::string& path, Config& base);
 
 // Verify the config's identity hashes against the binary bytes.
 // Returns true on match; false and prints a diagnostic on

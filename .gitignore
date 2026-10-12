@@ -82,6 +82,10 @@ recomp_master_misses*.toml.frag
 hang_trace.csv
 recomp_cache/
 
-# Spanish box art embedded as a byte array (copyrighted artwork).
-# Generated locally from a user-provided cover.jpg; never commit.
+# Buu's Fury: the Spanish box art is copyrighted and must never be committed.
 src/runtime/cover_embedded.h
+
+# Android signing material stays local (see F:\Projects\Android\README.md).
+signing.local.properties
+*.jks
+*.keystore

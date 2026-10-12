@@ -21,6 +21,10 @@
 #include "../gba/gba_bus.h"       // rom_ptr / rom_size
 #include "../gba/gba_bios.h"      // GbaBios snapshot
 
+#ifndef GBARECOMP_SELFHEAL_RECOMPILE_DEFAULT
+#  define GBARECOMP_SELFHEAL_RECOMPILE_DEFAULT 1
+#endif
+
 namespace fs = std::filesystem;
 
 namespace gbarecomp {
@@ -161,8 +165,10 @@ bool gcc_toolchain_available() {
 }
 
 // Resolve the production heal backend: GBARECOMP_HEAL_BACKEND = gcc | tcc |
-// auto (default auto). `auto` prefers gcc when a real toolchain is reachable
-// (the dev/release-quality producer), else the bundled, toolchain-free tcc.
+// auto (default auto). `auto` prefers the release-bundled tcc when present so a
+// player's stale/partial MinGW install cannot hijack self-heal through PATH.
+// Dev trees without a bundled tcc keep preferring gcc when a real toolchain is
+// reachable, else fall back to tcc on PATH.
 HealBackend resolve_backend() {
     const char* be = std::getenv("GBARECOMP_HEAL_BACKEND");
     if (be && be[0]) {
@@ -174,6 +180,7 @@ HealBackend resolve_backend() {
         if (std::strcmp(be, "auto-no-gcc") == 0) return HealBackend::Tcc;
         // anything else (incl. "auto") → auto-resolve below
     }
+    if (overlay_bundled_tcc_available()) return HealBackend::Tcc;
     return gcc_toolchain_available() ? HealBackend::Gcc : HealBackend::Tcc;
 }
 
@@ -247,9 +254,11 @@ void fill_callbacks() {
 
     g_callbacks.cpu                = &g_cpu;
     g_callbacks.runtime_insn_trace = &g_runtime_insn_trace;
+    g_callbacks.runtime_trace_enabled = &g_runtime_trace_enabled;
     g_callbacks.runtime_cycles     = &g_runtime_cycles;
     g_callbacks.runtime_break_pc   = &g_runtime_break_pc;
     g_callbacks.runtime_fn_entry_hook = &g_runtime_fn_entry_hook;
+    g_callbacks.gba_mod_function_entry = gba_mod_function_entry;
 
     g_callbacks.bus_read_u32  = bus_read_u32;
     g_callbacks.bus_read_u16  = bus_read_u16;
@@ -281,6 +290,9 @@ void fill_callbacks() {
     g_callbacks.runtime_idle_backedge = runtime_idle_backedge;
     g_callbacks.runtime_mem_cycles = runtime_mem_cycles;
     g_callbacks.runtime_mul_cycles = runtime_mul_cycles;
+    g_callbacks.runtime_waits      = &g_runtime_waits;
+    g_callbacks.runtime_exception_return_refill = runtime_exception_return_refill;
+    g_callbacks.runtime_prefetch_stall_delta = runtime_prefetch_stall_delta;
 
     g_callbacks.runtime_swi                  = runtime_swi;
     g_callbacks.runtime_irq                  = runtime_irq;
@@ -412,19 +424,31 @@ void overlay_loader_init(const std::string& cache_root,
         return;
     }
 
-    // Self-improving native healing is ON by default so released games heal
-    // interpreter misses to native AND persist them across launches (the cached
-    // DLLs warm-load next session). Opt out for pure-interpreter runs (oracle
-    // diff / cycle-accurate trace) with GBARECOMP_SELFHEAL_RECOMPILE=0.
+#if defined(__EMSCRIPTEN__)
+    s_active = false;
+    std::printf("self_heal_recompile=UNAVAILABLE host=wasm "
+                "interpreter_bridge=NOT_STATIC proposals=MEMFS\n");
+    return;
+#endif
+
+    // Self-improving native healing is a build-time default with an env
+    // override. Dynamic/overlay-heavy games can keep it ON; fixed-ROM games
+    // with proven static coverage can default it OFF so player runs never spawn
+    // a compiler unless diagnostics explicitly request it.
     const char* sh_env = std::getenv("GBARECOMP_SELFHEAL_RECOMPILE");
-    const bool sh_off = sh_env && (std::strcmp(sh_env, "0") == 0 ||
-                                   std::strcmp(sh_env, "false") == 0 ||
-                                   std::strcmp(sh_env, "off") == 0);
-    if (sh_off) {
+    bool sh_enabled = GBARECOMP_SELFHEAL_RECOMPILE_DEFAULT != 0;
+    if (sh_env && sh_env[0]) {
+        sh_enabled = !(std::strcmp(sh_env, "0") == 0 ||
+                       std::strcmp(sh_env, "false") == 0 ||
+                       std::strcmp(sh_env, "off") == 0);
+    }
+    if (!sh_enabled) {
         s_active = false;
         std::printf("self_heal_recompile=DISABLED "
-                    "(GBARECOMP_SELFHEAL_RECOMPILE=0 — pure Stage-1 interpreter "
-                    "bridge this session)\n");
+                    "(%s - pure Stage-1 interpreter bridge this session)\n",
+                    sh_env && sh_env[0]
+                        ? "GBARECOMP_SELFHEAL_RECOMPILE=0"
+                        : "build default");
         return;
     }
 

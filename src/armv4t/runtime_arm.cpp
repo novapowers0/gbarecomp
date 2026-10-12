@@ -8,10 +8,13 @@
 // interpreter's case in src/armv4t/interpreter.cpp.
 
 #include "runtime_arm.h"
+#include "runtime_context.h"
 #include "symbol_lookup.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <stdexcept>
 
 // runtime_dispatch_miss / runtime_unimplemented_op default-abort
 // implementations live in src/runtime/runtime_arm_default_aborts.cpp
@@ -67,6 +70,10 @@ extern "C" unsigned long long g_runtime_vblank_starts;
 
 namespace {
 
+gbarecomp::RuntimeArmContext* g_resumable_context = nullptr;
+bool g_return_yield = false, g_dispatch_suspended = false;
+std::uint32_t g_suspended_pc = 0;
+
 constexpr uint32_t kTraceSize = 4096u;
 RuntimeTraceEntry g_trace[kTraceSize] = {};
 uint32_t g_trace_write = 0;
@@ -85,6 +92,20 @@ uint32_t g_call_return_depth = 0;
 // to the live depth for the duration of the handler; should_return/cancel_return
 // never look below it. Saved/restored across nested IRQs by runtime_irq().
 uint32_t g_call_return_floor = 0;
+// Entries [0, hostless) have no host C frame waiting on them: they were live
+// when the stack was restored from a context/snapshot, which is only legal
+// outside native dispatch. Suspended multiplayer dispatch keeps such entries
+// as guest continuations (cancel_return is a no-op then), so a call the guest
+// never returns through would otherwise stay forever. They are pure host
+// unwinding hints — every generated return falls back to dispatch when no
+// entry matches — so a full stack evicts the oldest of them instead of
+// aborting. Clamped whenever the depth drops below it.
+uint32_t g_call_return_hostless = 0;
+
+void clamp_call_return_hostless() {
+    if (g_call_return_hostless > g_call_return_depth)
+        g_call_return_hostless = g_call_return_depth;
+}
 
 const char* trace_kind_name(uint32_t kind) {
     switch (kind) {
@@ -100,11 +121,34 @@ const char* trace_kind_name(uint32_t kind) {
     }
 }
 
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] != '\0' && value[0] != '0';
+}
+
+bool env_present(const char* name) {
+    return std::getenv(name) != nullptr;
+}
+
+bool trace_enabled_from_env() {
+    return env_flag_enabled("GBARECOMP_RUNTIME_TRACE") ||
+           env_present("GBARECOMP_TRACE_ON_DISPATCH_MISS") ||
+           env_present("GBARECOMP_ABORT_ON_BIOS_WRITE") ||
+           env_present("GBARECOMP_ABORT_ON_MEM_WRITE_ADDR") ||
+           env_present("GBARECOMP_ABORT_ON_MEM_READ_HIGH") ||
+           env_present("GBARECOMP_ABORT_AFTER_BRANCHES") ||
+           env_present("GBARECOMP_ABORT_ON_BRANCH_PC");
+}
+
 }  // namespace
+
+extern "C" unsigned g_runtime_trace_enabled =
+    trace_enabled_from_env() ? 1u : 0u;
 
 extern "C" void runtime_trace_event(uint32_t kind, uint32_t pc,
                                      uint32_t addr, uint32_t value,
                                      uint32_t aux) {
+    if (!g_runtime_trace_enabled) return;
     RuntimeTraceEntry& e = g_trace[g_trace_write];
     e.seq = ++g_trace_seq;
     e.cycles = g_runtime_cycles;
@@ -182,10 +226,20 @@ extern "C" void runtime_trace_event(uint32_t kind, uint32_t pc,
     if (kind == RUNTIME_TRACE_MEM_WRITE && addr == abort_mem_addr &&
         g_runtime_vblank_starts >= abort_min_vblank &&
         (abort_mem_value < 0 || value == static_cast<uint32_t>(abort_mem_value))) {
+        char pcbuf[96], databuf[96];
+        pcbuf[0] = databuf[0] = '\0';
+        uint32_t sym_off = 0;
+        if (const char* s = gba_symbol_lookup(pc, &sym_off)) {
+            std::snprintf(pcbuf, sizeof(pcbuf), " <%s+0x%X>", s, sym_off);
+        }
+        uint32_t data_off = 0;
+        if (const char* s = gba_data_symbol_lookup(addr, &data_off)) {
+            std::snprintf(databuf, sizeof(databuf), " <%s+0x%X>", s, data_off);
+        }
         std::fprintf(stderr,
-                     "runtime_trace: mem-write-addr abort pc=0x%08X "
-                     "addr=0x%08X value=0x%08X width=%u (vblanks=%llu)\n",
-                     pc, addr, value, aux,
+                     "runtime_trace: mem-write-addr abort pc=0x%08X%s "
+                     "addr=0x%08X%s value=0x%08X width=%u (vblanks=%llu)\n",
+                     pc, pcbuf, addr, databuf, value, aux,
                      static_cast<unsigned long long>(g_runtime_vblank_starts));
         runtime_trace_dump_recent(abort_dump_depth);
         std::abort();
@@ -245,6 +299,7 @@ extern "C" void runtime_trace_reset(void) {
     g_trace_count = 0;
     g_trace_seq = 0;
     g_runtime_cycles = 0;  // cycle clock shares the machine-reset lifecycle
+    g_runtime_trace_enabled = trace_enabled_from_env() ? 1u : 0u;
     // Arm per-instruction fingerprinting for the whole run if requested, so the
     // ring is always-on from reset (no arm-then-run latency gap) and we query it
     // after the fact. Also settable via the TCP `insn_trace` command.
@@ -268,21 +323,32 @@ extern "C" void runtime_trace_dump_recent(uint32_t max_entries) {
         if (sym) {
             std::snprintf(symbuf, sizeof(symbuf), " <%s+0x%X>", sym, off);
         }
+        // Annotate the memory operand too, when a data-symbol map is linked.
+        // For a watchpoint or hang dump the address a store touched is at
+        // least as informative as the PC that issued it.
+        char databuf[96];
+        databuf[0] = '\0';
+        uint32_t data_off = 0;
+        const char* data_sym = gba_data_symbol_lookup(e.addr, &data_off);
+        if (data_sym) {
+            std::snprintf(databuf, sizeof(databuf), " <%s+0x%X>",
+                          data_sym, data_off);
+        }
         std::fprintf(stderr,
                      "  #%u %-8s pc=0x%08X%s cpsr=0x%08X "
-                     "addr=0x%08X value=0x%08X aux=0x%X "
+                     "addr=0x%08X%s value=0x%08X aux=0x%X "
                      "r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X "
                      "r4=0x%08X r5=0x%08X r12=0x%08X "
                      "sp=0x%08X lr=0x%08X\n",
                      e.seq, trace_kind_name(e.kind), e.pc, symbuf, e.cpsr,
-                     e.addr, e.value, e.aux, e.r0, e.r1, e.r2, e.r3,
+                     e.addr, databuf, e.value, e.aux, e.r0, e.r1, e.r2, e.r3,
                      e.r4, e.r5, e.r12, e.r13, e.r14);
     }
 }
 
 extern "C" uint32_t runtime_trace_copy_recent(RuntimeTraceEntry* out,
                                                uint32_t max_entries) {
-    if (!out || max_entries == 0) return 0;
+    if (!out || max_entries == 0 || !g_runtime_trace_enabled) return 0;
     if (max_entries > g_trace_count) max_entries = g_trace_count;
     uint32_t start = (g_trace_write + kTraceSize - max_entries) % kTraceSize;
     for (uint32_t i = 0; i < max_entries; ++i) {
@@ -751,6 +817,14 @@ namespace {
 // and THUMB entries, so scan the equal-address run for CPSR.T.
 const DispatchEntry* lookup_in(const DispatchEntry* table, unsigned len,
                                uint32_t pc, bool thumb) {
+    // Both generated tables are immutable for this executable. Resume PCs in
+    // hot guest loops need not repeat a binary search at every native slice.
+    // Cache hits validate table, PC and mode; this is disposable host metadata.
+    struct CachedEntry { const DispatchEntry* table=nullptr; const DispatchEntry* entry=nullptr; };
+    static CachedEntry cache[4096];
+    auto& cached=cache[((pc>>1)^(pc>>12)^unsigned(thumb))&4095];
+    if (cached.table==table && cached.entry && cached.entry->addr==pc &&
+        (cached.entry->thumb!=0)==thumb) return cached.entry;
     unsigned lo = 0, hi = len;
     while (lo < hi) {
         unsigned mid = (lo + hi) >> 1u;
@@ -758,7 +832,9 @@ const DispatchEntry* lookup_in(const DispatchEntry* table, unsigned len,
         else                       hi = mid;
     }
     for (unsigned i = lo; i < len && table[i].addr == pc; ++i) {
-        if ((table[i].thumb != 0) == thumb) return &table[i];
+        if ((table[i].thumb != 0) == thumb) {
+            cached={table,&table[i]}; return &table[i];
+        }
     }
     return nullptr;
 }
@@ -771,25 +847,51 @@ constexpr uint32_t kBiosRegionEnd = 0x00004000u;
 
 }  // namespace
 
-extern "C" void runtime_dispatch(uint32_t target_pc) {
+extern "C" {
+GBARECOMP_TAIL_ARG_TLS uint32_t g_runtime_tail_arg = 0u;
+}
+
+namespace {
+
+// Everything runtime_dispatch does before entering generated code. Returns the
+// entry to call, or nullptr when the transfer already completed here (force-
+// interpreter bridge, RAM hook, self-heal overlay or dispatch miss). Shared by
+// runtime_dispatch and runtime_dispatch_tail so the two stay identical.
+const DispatchEntry* dispatch_resolve(uint32_t target_pc) {
+    // Preserve the resumable dispatcher yield boundary.
+    if (gbarecomp::runtime_dispatch_suspended()) return nullptr;
     // Strip THUMB bit; codegen handles the mode via cpsr_T already.
     uint32_t pc = target_pc & ~1u;
-    runtime_trace_event(RUNTIME_TRACE_DISPATCH, pc, target_pc, 0, 0);
+    if (runtime_trace_enabled())
+        runtime_trace_event(RUNTIME_TRACE_DISPATCH, pc, target_pc, 0, 0);
 
     bool thumb = (g_cpu.cpsr & CPSR_T_BIT) != 0;
+    if (g_resumable_context && g_resumable_context->program_dispatch &&
+        g_resumable_context->program_dispatch(pc, thumb ? 1 : 0)) return nullptr;
     // A generated caller may enter mutable code without returning through the
     // outer run loop first. Honor the per-PC interpreter predicate at this
     // central dispatch boundary too, and use the existing whole-subtree bridge
     // so the generated call/return ABI remains balanced.
     if (g_runtime_force_interp_hook &&
         g_runtime_force_interp_hook(pc, thumb ? 1 : 0)) {
+        if (g_resumable_context)
+            throw std::logic_error("multiplayer requires native dispatch coverage");
         runtime_bridge_interpret(pc, thumb, 0u, 0u);
-        return;
+        return nullptr;
     }
-    if (pc >= 0x02000000u && pc < 0x04000000u &&
-        g_runtime_ram_dispatch_hook &&
-        g_runtime_ram_dispatch_hook(pc, thumb ? 1 : 0)) {
-        return;
+    if (pc >= 0x02000000u && pc < 0x04000000u && g_runtime_ram_dispatch_hook &&
+        (!g_resumable_context || !g_resumable_context->ram_dispatch_filter ||
+         g_resumable_context->ram_dispatch_filter(pc, thumb ? 1 : 0))) {
+        if (g_resumable_context && g_resumable_context->ram_dispatch_boundary)
+            g_resumable_context->ram_dispatch_boundary(pc);
+        // User callbacks need not obey the generated return-propagation ABI.
+        // A declined hook still allows its generated RAM body to use it.
+        struct CallbackYieldScope {
+            bool previous = g_return_yield;
+            CallbackYieldScope() { g_return_yield = false; }
+            ~CallbackYieldScope() { g_return_yield = previous; }
+        } callback_yield;
+        if (g_runtime_ram_dispatch_hook(pc, thumb ? 1 : 0)) return nullptr;
     }
     const DispatchEntry* entry = nullptr;
     if (pc < kBiosRegionEnd) {
@@ -800,24 +902,59 @@ extern "C" void runtime_dispatch(uint32_t target_pc) {
     }
     if (entry) {
         g_runtime_resume_pc = entry->resume ? pc : 0u;
-        entry->fn();
-        return;
+        return entry;
     }
     // Stage-2 self-heal: third dispatch tier. After the static tables miss,
     // consult the runtime-healed native overlays before bridging. Defined in
     // src/runtime/overlay_loader.cpp (a null stub in tests/codegen/stubs.cpp,
     // since armv4t must not depend on the runtime lib). When the feature is
     // off this is a single bool check and returns 0.
-    if (overlay_try_dispatch(pc, thumb ? 1 : 0)) return;
+    if (overlay_try_dispatch(pc, thumb ? 1 : 0)) return nullptr;
+    if (g_resumable_context) {
+        char message[96];
+        std::snprintf(message,sizeof(message),"multiplayer native dispatch entry is missing: %08x (%s)",
+            pc,thumb ? "Thumb" : "ARM");
+        throw std::logic_error(message);
+    }
     runtime_dispatch_miss(target_pc);
+    return nullptr;
 }
 
-extern "C" void runtime_dispatch_with_exchange(uint32_t target_pc) {
+void exchange_instruction_set(uint32_t target_pc) {
     // Bit 0 of target indicates THUMB.
     if (target_pc & 1u) g_cpu.cpsr |= CPSR_T_BIT;
     else                g_cpu.cpsr &= ~CPSR_T_BIT;
-    runtime_trace_event(RUNTIME_TRACE_EXCHANGE, target_pc & ~1u, target_pc, 0, 0);
+    if (runtime_trace_enabled())
+        runtime_trace_event(RUNTIME_TRACE_EXCHANGE, target_pc & ~1u, target_pc,
+                            0, 0);
+}
+
+}  // namespace
+
+extern "C" void runtime_dispatch(uint32_t target_pc) {
+    const DispatchEntry* entry = dispatch_resolve(target_pc);
+    if (entry) entry->fn();
+}
+
+// Tail entry: the generated GBARECOMP_TAIL_DISPATCH stored the target in
+// g_runtime_tail_arg. Under Emscripten the call into generated code is a
+// guaranteed return_call, so a guest loop that crosses functions never grows
+// the host stack; natively it is the same sibling call runtime_dispatch makes.
+extern "C" void runtime_dispatch_tail(void) {
+    const DispatchEntry* entry = dispatch_resolve(g_runtime_tail_arg);
+    if (!entry) return;
+    GBARECOMP_TAIL_CALL(entry->fn);
+}
+
+extern "C" void runtime_dispatch_with_exchange(uint32_t target_pc) {
+    exchange_instruction_set(target_pc);
     runtime_dispatch(target_pc);
+}
+
+extern "C" void runtime_dispatch_with_exchange_tail(void) {
+    const uint32_t target_pc = g_runtime_tail_arg;
+    exchange_instruction_set(target_pc);
+    GBARECOMP_TAIL_DISPATCH(target_pc);
 }
 
 extern "C" int runtime_has_static_entry(uint32_t pc, int thumb) {
@@ -828,8 +965,30 @@ extern "C" int runtime_has_static_entry(uint32_t pc, int thumb) {
     return entry != nullptr ? 1 : 0;
 }
 
+extern "C" unsigned long long g_runtime_call_return_evictions = 0;
+
 extern "C" void runtime_call_push_return(uint32_t return_pc) {
     uint32_t pc = return_pc & ~1u;
+    if (g_call_return_depth >= kCallReturnStackSize &&
+        g_call_return_hostless > g_call_return_floor) {
+        // Evict the older half of the host-less run above the IRQ floor. No
+        // IRQ continuation stores an index above the current floor, so only
+        // depth and the host-less mark move.
+        const uint32_t lo = g_call_return_floor;
+        const uint32_t n = (g_call_return_hostless - lo + 1u) / 2u;
+        std::memmove(&g_call_return_stack[lo], &g_call_return_stack[lo + n],
+                     (g_call_return_depth - lo - n) * sizeof(uint32_t));
+        g_call_return_depth -= n;
+        g_call_return_hostless -= n;
+        ++g_runtime_call_return_evictions;
+        if ((g_runtime_call_return_evictions & (g_runtime_call_return_evictions - 1u)) == 0)
+            std::fprintf(stderr,
+                         "runtime_arm: evicted %u host-less call-return "
+                         "entries at return_pc=0x%08X (eviction #%llu)\n",
+                         n, pc, g_runtime_call_return_evictions);
+        if (runtime_trace_enabled())
+            runtime_trace_event(RUNTIME_TRACE_CALL, pc, n, g_call_return_depth, 6u);
+    }
     if (g_call_return_depth >= kCallReturnStackSize) {
         std::fprintf(stderr,
                      "runtime_arm: generated call-return stack overflow "
@@ -839,7 +998,8 @@ extern "C" void runtime_call_push_return(uint32_t return_pc) {
         std::abort();
     }
     g_call_return_stack[g_call_return_depth++] = pc;
-    runtime_trace_event(RUNTIME_TRACE_CALL, pc, pc, g_call_return_depth, 1u);
+    if (runtime_trace_enabled())
+        runtime_trace_event(RUNTIME_TRACE_CALL, pc, pc, g_call_return_depth, 1u);
 }
 
 extern "C" int runtime_call_should_return(uint32_t target_pc) {
@@ -849,28 +1009,37 @@ extern "C" int runtime_call_should_return(uint32_t target_pc) {
     for (uint32_t i = g_call_return_depth; i != g_call_return_floor; --i) {
         uint32_t slot = i - 1u;
         if (g_call_return_stack[slot] == pc) {
-            runtime_trace_event(RUNTIME_TRACE_CALL, pc, pc,
-                                g_call_return_depth,
-                                (slot + 1u == g_call_return_depth) ? 2u : 5u);
+            if (runtime_trace_enabled()) {
+                runtime_trace_event(RUNTIME_TRACE_CALL, pc, pc,
+                                    g_call_return_depth,
+                                    (slot + 1u == g_call_return_depth) ? 2u : 5u);
+            }
             g_call_return_depth = slot;
+            clamp_call_return_hostless();
             return 1;
         }
     }
     uint32_t top = g_call_return_depth != 0
         ? g_call_return_stack[g_call_return_depth - 1u]
         : 0xFFFFFFFFu;
-    runtime_trace_event(RUNTIME_TRACE_CALL, pc, top, g_call_return_depth, 3u);
+    if (runtime_trace_enabled())
+        runtime_trace_event(RUNTIME_TRACE_CALL, pc, top, g_call_return_depth, 3u);
     return 0;
 }
 
 extern "C" void runtime_call_cancel_return(uint32_t return_pc) {
+    // Host frames are returning because the scheduler suspended the guest;
+    // their guest continuations must survive until guest BX/POP consumes them.
+    if (gbarecomp::runtime_dispatch_suspended()) return;
     uint32_t pc = return_pc & ~1u;
     // Never pop below the active IRQ floor (an interrupted mainline frame).
     if (g_call_return_depth > g_call_return_floor &&
         g_call_return_stack[g_call_return_depth - 1u] == pc) {
-        runtime_trace_event(RUNTIME_TRACE_CALL, pc, pc, g_call_return_depth,
-                            4u);
+        if (runtime_trace_enabled())
+            runtime_trace_event(RUNTIME_TRACE_CALL, pc, pc, g_call_return_depth,
+                                4u);
         --g_call_return_depth;
+        clamp_call_return_hostless();
     }
 }
 
@@ -892,6 +1061,8 @@ extern "C" void runtime_call_stack_restore(const uint32_t* entries,
     if (depth > kCallReturnStackSize) depth = kCallReturnStackSize;
     g_call_return_depth = depth;
     for (uint32_t i = 0; i < depth; ++i) g_call_return_stack[i] = entries[i];
+    // Restoring is only legal outside native dispatch: no host frame waits.
+    g_call_return_hostless = depth;
 }
 
 // runtime_dispatch_miss is defined in src/runtime/runtime_arm_default_aborts.cpp
@@ -1048,6 +1219,19 @@ extern "C" void runtime_msr_spsr(uint32_t value, uint32_t mask) {
 extern "C" uint32_t g_irq_nest_depth;
 extern "C" uint32_t g_irq_iret_depth;
 
+// Refill waits of an exception return, charged before it restores CPSR: the
+// target region's N+S fetch pair in the instruction set of the current mode's
+// SPSR (the state being restored). Interpreter::step charges the same after
+// its exception_return, from the restored CPSR.T.
+extern "C" uint32_t runtime_exception_return_refill(uint32_t target_pc) {
+    const uint32_t mode = g_cpu.cpsr & 0x1Fu;
+    uint32_t psr = g_cpu.cpsr;
+    if (mode != 0x10u && mode != 0x1Fu)
+        psr = g_cpu.banked_spsr[mode_to_bank(g_cpu.cpsr)];
+    return runtime_refill_cycles(target_pc & ~1u,
+                                 (psr & CPSR_T_BIT) ? 1u : 0u);
+}
+
 extern "C" void runtime_exception_return(uint32_t new_pc) {
     uint32_t old_cpsr = g_cpu.cpsr;
     uint32_t old_mode = old_cpsr & 0x1Fu;
@@ -1072,7 +1256,26 @@ extern "C" void runtime_exception_return(uint32_t new_pc) {
     // can tell when *its* IRQ (vs. a nested inner one) has returned. Set
     // after the bank swap so g_irq_nest_depth still reflects the level being
     // left (runtime_irq decrements only after its loop exits).
-    if (old_mode == 0x12u) g_irq_iret_depth = g_irq_nest_depth;
+    if (old_mode == 0x12u) {
+        g_irq_iret_depth = g_irq_nest_depth;
+        if (g_resumable_context) {
+            auto& stack = g_resumable_context->interrupts;
+            if (stack.empty()) throw std::logic_error("IRQ return without continuation");
+            const auto frame = stack.back();
+            stack.pop_back();
+            for (unsigned i = 0; i < 4; ++i) g_cpu.R[i] = frame.preserved[i];
+            g_cpu.R[12] = frame.preserved[4];
+            g_call_return_depth = frame.return_depth;
+            clamp_call_return_hostless();
+            g_call_return_floor = frame.return_floor;
+            g_irq_iret_depth = frame.iret_depth;
+            --g_irq_nest_depth;
+            // Generated exception-return instructions tail-return immediately.
+            // Keep the restored mainline PC while their native callers unwind.
+            gbarecomp::runtime_suspend_dispatch();
+            return;
+        }
+    }
 }
 
 extern "C" void runtime_note_interpreted_exception_return(uint32_t old_mode) {
@@ -1117,12 +1320,30 @@ extern "C" void runtime_restore_cpsr_from_spsr(void) {
 // strong (production) version aborts there — that abort is the
 // "BIOS not recompiled" gate.
 
-extern "C" void runtime_swi(uint32_t swi_imm) {
+namespace {
+
+// SWI exception entry up to (not including) the BIOS vector dispatch. Returns
+// false when the opt-in HLE hook serviced the call and the guest resumes at LR.
+bool swi_enter(uint32_t swi_imm) {
     uint32_t return_address = g_cpu.R[15];
     uint32_t saved_cpsr     = g_cpu.cpsr;
-    runtime_trace_event(RUNTIME_TRACE_SWI, return_address, swi_imm, saved_cpsr, 0);
+    if (runtime_trace_enabled())
+        runtime_trace_event(RUNTIME_TRACE_SWI, return_address, swi_imm,
+                            saved_cpsr, 0);
     runtime_swi_log_record(swi_imm, return_address, g_cpu.R[0], g_cpu.R[1],
                            g_cpu.R[2], g_cpu.R[14], bus_read_u32(0x03007FF8u));
+
+    // Wait states of the SWI instruction's own opcode fetch in the calling
+    // code region (the generated code leaves the whole SWI cost to us).
+    uint32_t swi_fetch = 0u;
+    {
+        const bool thumb = (saved_cpsr & CPSR_T_BIT) != 0;
+        const uint32_t region =
+            (return_address - (thumb ? 2u : 4u)) >> 24;
+        if (region <= 0xFu)
+            swi_fetch = thumb ? g_runtime_waits.s16[region]
+                              : g_runtime_waits.s32[region];
+    }
 
     // ── BIOS HLE (opt-in alternative to the recompiled/LLE BIOS) ────────
     // When an HLE handler is installed and it services this SWI, the guest
@@ -1137,7 +1358,12 @@ extern "C" void runtime_swi(uint32_t swi_imm) {
     if (g_bios_hle_hook) {
         bool thumb = (saved_cpsr & CPSR_T_BIT) != 0;
         uint32_t swi_num = thumb ? (swi_imm & 0xFFu) : ((swi_imm >> 16) & 0xFFu);
-        if (g_bios_hle_hook(swi_num)) return;
+        // The hook ticks the service's cost; the SWI instruction itself
+        // still took its 1S fetch (mGBA charges the same under HLE).
+        if (g_bios_hle_hook(swi_num)) {
+            runtime_tick(1u + swi_fetch);
+            return false;
+        }
     }
 
     // Switch to SVC mode. SPSR_svc gets the pre-SWI CPSR. LR_svc gets
@@ -1160,14 +1386,27 @@ extern "C" void runtime_swi(uint32_t swi_imm) {
     g_cpu.R[15]                 = 0x00000008u;
 
     // Charge the SWI instruction's own cost (instr_cycle_base(SWI) = 3:
-    // 2S+1N). Ticked here — AFTER CPSR.I is masked above — so a VBlank/
-    // timer IRQ that becomes pending during these 3 cycles stays masked
-    // until the handler re-enables it, matching the interpreter oracle
-    // (enter_swi sets I=1, then pump_step(3), then the next-boundary IRQ
-    // check sees I=1). The recompiled SWI codegen does not tick this op.
-    runtime_tick(3u);
+    // 2S+1N, the refill into the zero-wait BIOS vector) plus its own opcode
+    // fetch's wait states (swi_fetch above). Ticked here — AFTER
+    // CPSR.I is masked above — so a VBlank/timer IRQ that becomes pending
+    // during these cycles stays masked until the handler re-enables it,
+    // matching the interpreter oracle (enter_swi sets I=1, then pump_step,
+    // then the next-boundary IRQ check sees I=1). The recompiled SWI
+    // codegen does not tick this op.
+    runtime_tick(3u + swi_fetch);
+    return true;
+}
 
+}  // namespace
+
+extern "C" void runtime_swi(uint32_t swi_imm) {
+    if (!swi_enter(swi_imm)) return;
     runtime_dispatch(0x00000008u);
+}
+
+extern "C" void runtime_swi_tail(void) {
+    if (!swi_enter(g_runtime_tail_arg)) return;
+    GBARECOMP_TAIL_DISPATCH(0x00000008u);
 }
 
 // Count of IRQ vectorings performed by the recompiled runtime (every
@@ -1234,8 +1473,9 @@ extern "C" void runtime_irq(uint32_t return_address) {
     // vectored and how deep — used to pin the MC-HP-002 IRQ storm. Reading
     // IE/IF is side-effect-free.
     uint32_t irq_src = bus_read_u16(0x04000200u) & bus_read_u16(0x04000202u);
-    runtime_trace_event(RUNTIME_TRACE_IRQ, return_address, irq_src, saved_cpsr,
-                        g_irq_nest_depth);
+    if (runtime_trace_enabled())
+        runtime_trace_event(RUNTIME_TRACE_IRQ, return_address, irq_src,
+                            saved_cpsr, g_irq_nest_depth);
     runtime_irq_log_record(irq_src, return_address, saved_cpsr);
 
     uint32_t new_cpsr =
@@ -1283,6 +1523,18 @@ extern "C" void runtime_irq(uint32_t return_address) {
     // enclosing IRQ's) frames — see g_call_return_floor. Restored below.
     uint32_t saved_floor   = g_call_return_floor;
     g_call_return_floor    = g_call_return_depth;
+    if (g_resumable_context) {
+        gbarecomp::RuntimeIrqContinuation frame;
+        frame.preserved = {saved_r0, saved_r1, saved_r2, saved_r3, saved_r12};
+        frame.return_floor = saved_floor;
+        frame.return_depth = g_call_return_depth;
+        frame.iret_depth = saved_iret;
+        g_resumable_context->interrupts.push_back(frame);
+        // The outer dispatcher resumes the recompiled BIOS vector. The
+        // continuation, including nesting/floor state, now belongs to the GBA.
+        gbarecomp::runtime_suspend_dispatch();
+        return;
+    }
     // Whole-program interpreter mode must cover exception handlers too.
     // Previously only the main run loop honored GBARECOMP_FORCE_INTERP, while
     // IRQs always entered the generated dispatch table. Besides making the
@@ -1332,9 +1584,75 @@ extern "C" void runtime_irq(uint32_t return_address) {
 extern "C" void runtime_init(void* bus_handle) {
     gbarecomp::runtime_arm::g_bus_handle = bus_handle;
     g_call_return_depth = 0;
+    g_call_return_hostless = 0;
 }
 
 extern "C" void runtime_shutdown(void) {
     gbarecomp::runtime_arm::g_bus_handle = nullptr;
     g_call_return_depth = 0;
+    g_call_return_hostless = 0;
 }
+
+namespace gbarecomp {
+void runtime_capture_arm_context(RuntimeArmContext& out) {
+    out.cpu = g_cpu;
+    out.returns.assign(g_call_return_stack, g_call_return_stack + g_call_return_depth);
+    out.return_floor = g_call_return_floor;
+    out.irq_depth = g_irq_nest_depth;
+    out.iret_depth = g_irq_iret_depth;
+    out.resume_pc = g_runtime_resume_pc;
+    out.irq_from_halt = g_runtime_irq_from_halt;
+    out.irq_entries = g_runtime_irq_entries;
+    out.immediate_override = g_runtime_thumb_alu_imm_override;
+    out.read_override = g_runtime_bus_read_override;
+    out.ram_dispatch = g_runtime_ram_dispatch_hook;
+    out.force_interp = g_runtime_force_interp_hook;
+    out.entry_hook = g_runtime_fn_entry_hook;
+    out.bios_hook = g_bios_hle_hook;
+}
+void runtime_restore_arm_context(const RuntimeArmContext& in) {
+    if (in.returns.size() > kCallReturnStackSize || in.return_floor > in.returns.size() ||
+        in.irq_depth != in.interrupts.size())
+        throw std::invalid_argument("invalid runtime execution context");
+    for (const auto& frame : in.interrupts)
+        if (frame.return_floor > frame.return_depth || frame.return_depth > in.returns.size())
+            throw std::invalid_argument("invalid IRQ continuation");
+    g_cpu = in.cpu;
+    runtime_call_stack_restore(in.returns.data(), static_cast<std::uint32_t>(in.returns.size()));
+    g_call_return_floor = in.return_floor;
+    g_irq_nest_depth = in.irq_depth;
+    g_irq_iret_depth = in.iret_depth;
+    g_runtime_resume_pc = in.resume_pc;
+    g_runtime_irq_from_halt = in.irq_from_halt;
+    g_runtime_irq_entries = in.irq_entries;
+    g_runtime_thumb_alu_imm_override = in.immediate_override;
+    g_runtime_bus_read_override = in.read_override;
+    g_runtime_ram_dispatch_hook = in.ram_dispatch;
+    g_runtime_force_interp_hook = in.force_interp;
+    g_runtime_force_interp_step_active = 0;
+    g_runtime_fn_entry_hook = in.entry_hook;
+    g_bios_hle_hook = in.bios_hook;
+}
+void runtime_set_resumable_context(RuntimeArmContext* context) {
+    g_resumable_context = context;
+    runtime_set_return_yield(false);
+}
+bool runtime_has_resumable_context() { return g_resumable_context != nullptr; }
+void runtime_set_return_yield(bool enabled) {
+    g_return_yield = enabled;
+    g_dispatch_suspended = false;
+}
+bool runtime_suspend_dispatch() {
+    if (!g_return_yield) throw RuntimeDispatchYield{};
+    g_suspended_pc = g_cpu.R[15];
+    g_dispatch_suspended = true;
+    return true;
+}
+bool runtime_dispatch_suspended() {
+    if (!g_dispatch_suspended) return false;
+    // Every generated instruction installs its PC before should_yield(). A
+    // caller which reached that prologue must not overwrite the callee's PC.
+    g_cpu.R[15] = g_suspended_pc;
+    return true;
+}
+} // namespace gbarecomp

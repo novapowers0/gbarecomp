@@ -5,7 +5,14 @@
 
 #include <cstdint>
 
+#include "runtime_arm_types.h"
+
 namespace codegen_test {
+
+// Wait-state table shared by both sides of the diff: generated code reads it
+// through g_runtime_waits, the interpreter's FlatBus through code_wait /
+// prefetch_stall. The runner configures it per pass.
+extern RuntimeWaitTable& g_waits;
 
 // Re-seed the singleton bus before each test. `size` bytes starting
 // at `base`. Also resets dispatch / SWI / unimplemented recorders.
@@ -36,6 +43,11 @@ extern uint32_t g_last_dispatch_target;
 extern bool     g_dispatch_called;
 extern uint32_t g_last_swi_imm;
 extern bool     g_swi_called;
+// Set by codegen_test_fellthrough(), which each generated tc_<idx> calls
+// after its body: true iff control fell through past the instruction.
+extern bool     g_fellthrough;
+// Set when a named-target variant calls its resolved branch target.
+extern bool     g_named_sink_called;
 extern bool     g_unimplemented_called;
 extern const char* g_unimplemented_op;
 extern uint32_t g_unimplemented_pc;

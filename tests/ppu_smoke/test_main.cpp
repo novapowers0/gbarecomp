@@ -1,6 +1,8 @@
 #include "gba_ppu.h"
+#include "foreign_presentation_internal.h"
 #include "snapshot.h"
 #include "view_config.h"
+#include "presentation_layout.h"
 
 #include <algorithm>
 #include <array>
@@ -8,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <vector>
 
@@ -35,6 +38,18 @@ void expect_pixel(const uint8_t* actual,
                  "%s: expected RGB(%u,%u,%u), got RGB(%u,%u,%u)\n",
                  label, r, g, b, actual[0], actual[1], actual[2]);
     std::exit(1);
+}
+
+// Manual visual QA only: leave normal tests hermetic, but let CI/developers
+// request the deterministic focus fixture as a portable screenshot artifact.
+void dump_focus_screenshot_if_requested(const uint8_t* rgb) {
+    const char* path = std::getenv("GBARECOMP_PPU_FOCUS_SCREENSHOT");
+    if (!path || !*path) return;
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) return;
+    file << "P6\n240 160\n255\n";
+    file.write(reinterpret_cast<const char*>(rgb),
+               gba::GbaPpu::kFramebufferBytes);
 }
 
 struct Fixture {
@@ -146,6 +161,109 @@ void test_brightness_native_domain_and_green_precision() {
     expect_pixel(f.rgb.data(), 24, 49, 16, "darken native-domain rounding");
 }
 
+int portrait_tiles(int bg, int, int y, uint16_t* tile) {
+    if (bg != 1) return 0;
+    *tile = y < 0 ? 1 : 2;
+    return gba::kWsTilemapReplace;
+}
+
+void test_authored_portrait_geometry_and_composition() {
+    const auto fit = gbarecomp::compute_adaptive_presentation_layout(540, 960, 240, 427);
+    const auto tiny = gbarecomp::compute_adaptive_presentation_layout(180, 320, 240, 427);
+    const auto cap = gbarecomp::compute_adaptive_presentation_layout(1000, 300, 240, 427);
+    if (fit.x || fit.y || fit.width != 540 || fit.height != 960 || fit.integer_scale ||
+        tiny.width != 180 || tiny.height != 320 || cap.width != 169 || cap.height != 300) {
+        std::fprintf(stderr, "adaptive presenter left a reduced-ratio border or failed downscale\n"); std::exit(1);
+    }
+    using gbarecomp::resize_driven_view_geometry;
+    constexpr uint32_t kEngineW = gba::GbaPpu::kMaxRenderWidth;
+    constexpr uint32_t kEngineH = gba::GbaPpu::kMaxRenderHeight;
+    auto geometry = resize_driven_view_geometry(540, 960, 569, 854, kEngineW, kEngineH);
+    if (geometry.width != 240 || geometry.height != 427 ||
+        geometry.extra_top != 133 || geometry.extra_bottom != 134 ||
+        resize_driven_view_geometry(540, 960, 569, 160, kEngineW, kEngineH).height != 160 ||
+        resize_driven_view_geometry(1, 100000, 569, 854, kEngineW, kEngineH).height != 854 ||
+        resize_driven_view_geometry(0, 960, 569, 854, kEngineW, kEngineH).height != 160) {
+        std::fprintf(stderr, "portrait aspect/capability policy failed\n"); std::exit(1);
+    }
+    Fixture f;
+    constexpr uint16_t dispcnt = 0x6200; // BG1, native rectangular window.
+    store16(&f.io[0x0a], 0x0180); // 256-color BG1, screen block 1.
+    store16(&f.io[0x40], 240); store16(&f.io[0x44], 160);
+    store16(&f.io[0x48], 0x1f); store16(&f.io[0x4a], 1); // Emerald WINOUT.
+    std::fill_n(f.vram.data(), 64, 3);
+    std::fill_n(f.vram.data() + 64, 64, 1);
+    std::fill_n(f.vram.data() + 128, 64, 2);
+    store16(&f.pal[2], 31); store16(&f.pal[4], 31 << 5); store16(&f.pal[6], 31 << 10);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(), f.oam.data(), f.pal.data());
+    f.ppu.set_view_margins(0, 0, 133, 134);
+    std::vector<uint8_t> image(f.ppu.render_bytes());
+    f.ppu.render(image.data(), dispcnt, f.io.data(), f.vram.data(), f.oam.data(), f.pal.data());
+    expect_pixel(image.data(), 0, 0, 0, "unauthorized portrait rows must be black");
+    gba::g_ws_authored_margin_layers = 1;
+    gba::g_ws_tilemap_provider = portrait_tiles;
+    f.ppu.render(image.data(), dispcnt, f.io.data(), f.vram.data(), f.oam.data(), f.pal.data());
+    expect_pixel(image.data(), 255, 0, 0, "top authored row");
+    expect_pixel(image.data() + 426 * 240 * 3, 0, 255, 0, "bottom authored row");
+    if (std::memcmp(image.data() + 133 * 240 * 3, f.rgb.data(), f.rgb.size())) {
+        std::fprintf(stderr, "portrait changed native center\n"); std::exit(1);
+    }
+    for (unsigned y = 0; y < 160; ++y)
+        f.ppu.render_scanline(y, dispcnt, f.io.data(), f.vram.data(), f.oam.data(), f.pal.data());
+    f.ppu.mark_framebuffer_latched();
+    if (std::memcmp(f.ppu.latched_framebuffer(), image.data(), image.size()) || f.ppu.frame_count() != 0) {
+        std::fprintf(stderr, "portrait live scanout differs or changed guest timing\n"); std::exit(1);
+    }
+    gbarecomp::debug::SnapshotWriter writer;
+    f.ppu.serialize(writer);
+    gba::GbaPpu loaded;
+    gbarecomp::debug::SnapshotReader reader(writer.buffer().data(), writer.size());
+    loaded.deserialize(reader);
+    if (!reader.ok() || reader.remaining() || std::memcmp(loaded.latched_framebuffer(), f.rgb.data(), f.rgb.size())) {
+        std::fprintf(stderr, "portrait savestate did not preserve native payload\n"); std::exit(1);
+    }
+    gba::g_ws_pillarbox = 1;
+    f.ppu.render(image.data(), dispcnt, f.io.data(), f.vram.data(), f.oam.data(), f.pal.data());
+    expect_pixel(image.data(), 0, 0, 0, "portrait native-scene fallback top");
+    expect_pixel(image.data() + 426 * 240 * 3, 0, 0, 0, "portrait native-scene fallback bottom");
+    gba::g_ws_pillarbox = 0;
+    gba::g_ws_authored_margin_layers = 0;
+    gba::g_ws_tilemap_provider = nullptr;
+}
+
+int ui_xy_fixture(int bg, int x, int y, int* sx, int* sy) {
+    if (bg != 0) return 0;
+    if (x < 8 && y >= -8 && y < 0) { *sx = x; *sy = y + 8; return 1; }
+    return -1;
+}
+
+void test_authored_ui_xy_uses_source_window_and_effects() {
+    Fixture f;
+    // Red BG0 in a native window, with 50% darkening. WINOUT disables it.
+    store16(&f.io[8], 0x0180);
+    store16(&f.io[0x40], 240); store16(&f.io[0x44], 160);
+    store16(&f.io[0x48], 0x21); store16(&f.io[0x4a], 0);
+    store16(&f.io[0x50], 0xC1); store16(&f.io[0x54], 8);
+    store16(&f.pal[2], 31);
+    std::fill_n(f.vram.data(), 64, 1);
+    constexpr uint16_t dispcnt = 0x2100;
+    gba::g_ws_bg_xy_provider = ui_xy_fixture;
+    gba::g_ws_bg_xy_provider_layers = 1;
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(), f.oam.data(), f.pal.data());
+    expect_pixel(f.rgb.data(), 132, 0, 0, "native render ignored XY enhancement");
+    gba::g_ws_tilemap_provider = portrait_tiles;
+    gba::g_ws_authored_margin_layers = 1;
+    f.ppu.set_view_margins(0, 0, 8, 0);
+    std::vector<uint8_t> image(f.ppu.render_bytes());
+    f.ppu.render(image.data(), dispcnt, f.io.data(), f.vram.data(), f.oam.data(), f.pal.data());
+    expect_pixel(image.data(), 132, 0, 0, "relocated UI uses native window and brightness");
+    expect_pixel(image.data() + 8 * 240 * 3, 0, 0, 0, "relocated UI leaves no native duplicate");
+    gba::g_ws_bg_xy_provider = nullptr;
+    gba::g_ws_bg_xy_provider_layers = 0xf;
+    gba::g_ws_tilemap_provider = nullptr;
+    gba::g_ws_authored_margin_layers = 0;
+}
+
 void test_extended_view_geometry_and_clamp() {
     gba::GbaPpu ppu;
     ppu.set_view_margins(24, 24, 0, 0);
@@ -163,16 +281,32 @@ void test_extended_view_geometry_and_clamp() {
     }
 
     ppu.set_view_margins(120, 120, 0, 0);
-    if (ppu.render_width() != 480 ||
-        ppu.render_width() != gba::GbaPpu::kMaxRenderWidth) {
+    if (ppu.render_width() != 480) {
         std::fprintf(stderr, "extended-view 480x160 capacity mismatch\n");
         std::exit(1);
     }
 
+    ppu.set_view_margins(164, 165, 0, 0);
+    if (ppu.render_width() != 569 || ppu.view_extra_left() != 164 ||
+        ppu.view_extra_right() != 165) {
+        std::fprintf(stderr, "32:9 odd-width geometry mismatch\n");
+        std::exit(1);
+    }
+    ppu.set_view_margins(324, 325, 0, 0);
+    if (ppu.render_width() != 889 || ppu.view_extra_left() != 324 ||
+        ppu.view_extra_right() != 325 || ppu.render_bytes() != 889u * 160u * 3u) {
+        std::fprintf(stderr, "50:9 odd-width geometry mismatch\n");
+        std::exit(1);
+    }
+    static_assert(gba::GbaPpu::kMaxExtraX == 328 &&
+                  gba::GbaPpu::kMaxRenderWidth == 896,
+                  "engine horizontal capacity must cover 50:9 (889x160)");
     ppu.set_view_margins(1000, 1000, 7, 9);
     if (ppu.render_width() != gba::GbaPpu::kMaxRenderWidth ||
-        ppu.render_height() != gba::GbaPpu::kScreenHeight ||
-        ppu.view_extra_top() != 0 || ppu.view_extra_bottom() != 0) {
+        ppu.view_extra_left() != gba::GbaPpu::kMaxExtraX ||
+        ppu.view_extra_right() != gba::GbaPpu::kMaxExtraX ||
+        ppu.render_height() != 176 ||
+        ppu.view_extra_top() != 7 || ppu.view_extra_bottom() != 9) {
         std::fprintf(stderr, "extended-view clamp mismatch\n");
         std::exit(1);
     }
@@ -208,8 +342,23 @@ void test_extended_view_capability_policy() {
         std::exit(1);
     }
     g = resolve_view_geometry(600, 600, false, kEngineMax);
-    if (g.width != 480 || g.extra_left != 120 || g.extra_right != 120) {
-        std::fprintf(stderr, "480x160 engine capacity was not enforced\n");
+    if (g.width != 600 || g.extra_left != 180 || g.extra_right != 180) {
+        std::fprintf(stderr, "opted-in 600x160 geometry mismatch\n");
+        std::exit(1);
+    }
+    g = resolve_view_geometry(889, 896, false, kEngineMax);
+    if (g.width != 889 || g.extra_left != 324 || g.extra_right != 325) {
+        std::fprintf(stderr, "opted-in 50:9 889x160 geometry mismatch\n");
+        std::exit(1);
+    }
+    g = resolve_view_geometry(2000, 2000, false, kEngineMax);
+    if (g.width != 896 || g.extra_left != 328 || g.extra_right != 328) {
+        std::fprintf(stderr, "896x160 engine capacity was not enforced\n");
+        std::exit(1);
+    }
+    g = resolve_view_geometry(2000, 569, false, kEngineMax);
+    if (g.width != 569) {
+        std::fprintf(stderr, "per-game 32:9 maximum was not enforced\n");
         std::exit(1);
     }
     g = resolve_view_geometry(288, 240, true, kEngineMax);
@@ -257,6 +406,28 @@ void test_resize_driven_view_policy() {
             std::exit(1);
         }
     }
+    // Engine capacity: a 50:9 drawable reaches 889 only when the game allows
+    // it; games validated at narrower ceilings keep their clamp.
+    constexpr uint32_t kEngineMax = gba::GbaPpu::kMaxRenderWidth;
+    const Case wide_cases[] = {
+        {5000, 900, 896, 889}, {5000, 900, 576, 576}, {5000, 900, 569, 569},
+        {5000, 900, 480, 480}, {20000, 900, 2000, 896}, {3840, 1080, 896, 569},
+    };
+    for (const Case& c : wide_cases) {
+        if (resize_driven_view_width(c.w, c.h, c.max, kEngineMax) != c.expected) {
+            std::fprintf(stderr, "resize-driven wide view policy mismatch %dx%d max %u\n",
+                         c.w, c.h, c.max);
+            std::exit(1);
+        }
+    }
+    const auto wide_geometry =
+        gbarecomp::resize_driven_view_geometry(5000, 900, 896, 160, kEngineMax,
+                                               gba::GbaPpu::kMaxRenderHeight);
+    if (wide_geometry.width != 889 || wide_geometry.extra_left != 324 ||
+        wide_geometry.extra_right != 325 || wide_geometry.height != 160) {
+        std::fprintf(stderr, "resize-driven 50:9 geometry mismatch\n");
+        std::exit(1);
+    }
 }
 
 void test_extended_view_preserves_authentic_center() {
@@ -281,7 +452,7 @@ void test_extended_view_preserves_authentic_center() {
 
     std::vector<uint8_t> wide(gba::GbaPpu::kMaxFramebufferBytes, 0);
     const std::size_t authentic_stride = gba::GbaPpu::kScreenWidth * 3u;
-    for (const uint32_t extra : {24u, 72u, 120u}) {
+    for (const uint32_t extra : {24u, 72u, 120u, 168u, 324u, gba::GbaPpu::kMaxExtraX}) {
         f.ppu.set_view_margins(extra, extra, 0, 0);
         std::fill(wide.begin(), wide.end(), 0);
         f.ppu.render(wide.data(), dispcnt, f.io.data(), f.vram.data(),
@@ -297,6 +468,25 @@ void test_extended_view_preserves_authentic_center() {
                              "authentic row %u\n",
                              f.ppu.render_width(), y);
                 std::exit(1);
+            }
+            // Margins continue the 256-pixel-wrapping BG0 map out to the full
+            // render width: every margin column whose wrapped map X is also
+            // visible natively must match that native column. This covers the
+            // outermost columns of the widest (engine-capacity) render.
+            for (uint32_t x = 0; x < f.ppu.render_width(); ++x) {
+                const int hx = static_cast<int>(x) - static_cast<int>(extra);
+                const int map_x = ((hx + 13) % 256 + 256) % 256;
+                const int native_x = map_x - 13;
+                if (native_x < 0 || native_x >= static_cast<int>(gba::GbaPpu::kScreenWidth))
+                    continue;
+                if (std::memcmp(wide.data() + y * wide_stride + x * 3u,
+                                expected + static_cast<std::size_t>(native_x) * 3u, 3) != 0) {
+                    std::fprintf(stderr,
+                                 "extended-view %ux160 margin column %u row %u "
+                                 "does not continue the BG map\n",
+                                 f.ppu.render_width(), x, y);
+                    std::exit(1);
+                }
             }
         }
     }
@@ -553,6 +743,102 @@ void test_extended_view_obj_attr_x_is_explicitly_opt_in() {
     expect_pixel(wide.data() + (24u + 260u) * 3u, 255, 0, 0,
                  "attribute-aware HUD OBJ placement");
     gba::g_ws_obj_attr_x_provider = nullptr;
+}
+
+void test_extended_view_obj_native_clip_is_opt_in() {
+    Fixture f;
+    disable_all_objects(f);
+    // OBJ 0: parked just off the native left edge (signed 9-bit X = -4), the
+    // idiom games use to hide sprites. Vanilla wide draws its colored texels
+    // in the left margin; the opt-in clip must not.
+    store16(&f.oam[0], 0x0000);
+    store16(&f.oam[2], 0x01FC);
+    store16(&f.oam[4], 0x0000);
+    // OBJ 1: fully inside the native viewport at X=8; must be unaffected.
+    store16(&f.oam[8], 0x0000);
+    store16(&f.oam[10], 8);
+    store16(&f.oam[12], 0x0000);
+    f.vram[0x10000] = 0x11;          // Tile 0: first two texels use color 1.
+    store16(&f.pal[0x202], 0x001F);  // OBJ color 1 = red.
+
+    f.ppu.set_view_margins(24, 24, 0, 0);
+    std::vector<uint8_t> wide(gba::GbaPpu::kMaxFramebufferBytes, 0);
+    f.ppu.render(wide.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(wide.data() + (24u - 4u) * 3u, 255, 0, 0,
+                 "vanilla wide margin OBJ");
+    expect_pixel(wide.data() + (24u + 8u) * 3u, 255, 0, 0,
+                 "vanilla wide center OBJ");
+
+    gba::g_ws_obj_native_clip = 1;
+    std::fill(wide.begin(), wide.end(), 0);
+    f.ppu.render(wide.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(wide.data() + (24u - 4u) * 3u, 0, 0, 0,
+                 "clipped margin OBJ leaked into margin");
+    expect_pixel(wide.data() + (24u + 8u) * 3u, 255, 0, 0,
+                 "clip altered native-viewport OBJ");
+    gba::g_ws_obj_native_clip = 0;
+
+    // The faithful native renderer must be inert to the flag.
+    gba::g_ws_obj_native_clip = 1;
+    f.ppu.set_view_margins(0, 0, 0, 0);
+    f.ppu.render(f.rgb.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(f.rgb.data() + 8u * 3u, 255, 0, 0,
+                 "native render changed by OBJ clip flag");
+    gba::g_ws_obj_native_clip = 0;
+}
+
+bool margin_object_semitransparent = false;
+const gba::WsMarginObjPixel* margin_object_row(int, int* left, int* width) {
+    static std::array<gba::WsMarginObjPixel, 288> row;
+    row.fill({0x001f, 2, 0, margin_object_semitransparent});
+    *left = -24; *width = 288;
+    return row.data();
+}
+
+void test_authored_margin_objects_preserve_center_and_depth() {
+    Fixture f;
+    disable_all_objects(f);
+    store16(&f.io[0x08], 0x0181); // 8bpp BG0, priority 1, map block 1
+    std::fill_n(f.vram.begin(), 64, 1);
+    store16(&f.pal[2], 0x7c00); // blue foreground
+    f.ppu.set_view_margins(24,24,0,0);
+    std::vector<uint8_t> wide(gba::GbaPpu::kMaxFramebufferBytes, 0);
+    gba::g_ws_obj_margin_provider = margin_object_row;
+    f.ppu.render(wide.data(),0x1100,f.io.data(),f.vram.data(),f.oam.data(),f.pal.data());
+    expect_pixel(wide.data(),0,0,255,"margin NPC must stay behind foreground BG");
+    store16(&f.io[0x08], 0x0183); // BG moves behind NPC
+    f.ppu.render(wide.data(),0x1100,f.io.data(),f.vram.data(),f.oam.data(),f.pal.data());
+    expect_pixel(wide.data(),255,0,0,"authored margin NPC missing");
+    expect_pixel(wide.data()+24*3,0,0,255,"authored NPC altered native center");
+    expect_pixel(wide.data()+264*3,255,0,0,"right margin NPC missing");
+    // Emerald's ordinary field window: all world layers inside the native
+    // viewport, only BG0 in WINOUT. Decoded NPC pixels must survive this final
+    // compositor gate when the game explicitly authors its margin layers.
+    store16(&f.io[0x40],0x00ff); store16(&f.io[0x44],0x00ff);
+    store16(&f.io[0x48],0x001f); store16(&f.io[0x4a],0x0001);
+    f.ppu.render(wide.data(),0x3100,f.io.data(),f.vram.data(),f.oam.data(),f.pal.data());
+    expect_pixel(wide.data(),0,0,255,"default OBJ margin ignored native window policy");
+    gba::g_ws_authored_margin_layers = 1;
+    f.ppu.render(wide.data(),0x3100,f.io.data(),f.vram.data(),f.oam.data(),f.pal.data());
+    expect_pixel(wide.data(),255,0,0,"WINOUT culled authored NPC margin");
+    expect_pixel(wide.data()+24*3,0,0,255,"authored NPC window policy leaked into native center");
+    gba::g_ws_authored_margin_layers = 0;
+    margin_object_semitransparent = true;
+    store16(&f.io[0x50], 0x0100); // BG0 is second target; OBJ mode forces alpha.
+    store16(&f.io[0x52], 0x0808);
+    f.ppu.render(wide.data(),0x1100,f.io.data(),f.vram.data(),f.oam.data(),f.pal.data());
+    expect_pixel(wide.data(),132,0,132,"authored semitransparent OBJ lost alpha");
+    expect_pixel(wide.data()+24*3,0,0,255,"authored alpha changed native center");
+    margin_object_semitransparent = false;
+    f.ppu.render(wide.data(),0x0100,f.io.data(),f.vram.data(),f.oam.data(),f.pal.data());
+    expect_pixel(wide.data(),0,0,255,"authored NPC ignored OBJ disable");
+    f.ppu.set_view_margins(0,0,0,0);
+    f.ppu.render(f.rgb.data(),0x1100,f.io.data(),f.vram.data(),f.oam.data(),f.pal.data());
+    expect_pixel(f.rgb.data(),0,0,255,"native PPU consumed margin callback");
+    gba::g_ws_obj_margin_provider = nullptr;
 }
 
 void test_extended_view_extends_nearest_window_edge() {
@@ -812,6 +1098,686 @@ void test_bitmap_mode_wide_center_and_margins() {
                  "mode 4 wide right margin");
 }
 
+void test_trusted_foreign_background_keeps_guest_objects_and_resets() {
+    Fixture f;
+    disable_all_objects(f);
+    std::array<uint16_t, gba::GbaPpu::kScreenWidth * gba::GbaPpu::kScreenHeight>
+        foreign{};
+    std::array<uint16_t, 1> overlay_pixels{0x001F};
+    std::array<uint8_t, 1> overlay_alpha{16};
+    const GbaForeignScreenOverlay overlay{
+        GBA_FOREIGN_SCREEN_OVERLAY_ABI_VERSION,
+        overlay_pixels.data(), overlay_alpha.data(),
+        0, 0, 1, 1, 1, 0, 0,
+    };
+    const GbaForeignObjFocusTransform focus{
+        GBA_FOREIGN_OBJ_FOCUS_ABI_VERSION,
+        0, 0, 8, 8,
+        8, 8,
+        GBA_FOREIGN_OBJ_FOCUS_PRESERVE_UNFOCUSED,
+        0, 0,
+        0, 0,
+        0, 0, 0, 0,
+    };
+    foreign.fill(0x001F);  // Red foreign terrain.
+
+    // Stock backdrop is blue, which gives a byte-for-byte inactive baseline.
+    store16(&f.pal[0], 0x7C00);
+    f.ppu.render(f.rgb.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    const auto stock = f.rgb;
+
+    // A normal priority-3 OBJ remains above the foreign background.  Its tile
+    // is green in OBJ palette bank zero and appears at the top-left.
+    std::fill_n(f.vram.begin() + 0x10000, 32, static_cast<uint8_t>(0x11));
+    store16(&f.pal[0x202], 0x03E0);
+    store16(&f.oam[0], 0x0000);
+    store16(&f.oam[2], 0x0000);
+    store16(&f.oam[4], 0x0C00);  // Tile 0, OBJ priority 3.
+    gba::foreign_presentation_internal::set_background(foreign.data());
+    f.ppu.render(f.rgb.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(f.rgb.data(), 0, 255, 0,
+                 "foreign background keeps guest OBJ");
+    expect_pixel(&f.rgb[8 * 3], 255, 0, 0,
+                 "foreign background replaces guest backdrop");
+
+    // The normal semitransparent-OBJ path still blends against the foreign
+    // BG2 replacement when the game's BLDCNT names BG2 as second target.
+    store16(&f.oam[0], 0x0400);  // OBJ mode 1 = semitransparent.
+    store16(&f.io[0x50], 0x0440);  // Alpha, BG2 second target.
+    store16(&f.io[0x52], 0x0808);  // Equal OBJ/foreign blend.
+    f.ppu.render(f.rgb.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(f.rgb.data(), 132, 123, 0,
+                 "foreign background is semitransparent OBJ target");
+
+    // A trusted foreign frame is opaque to stale native windows. The one-pixel
+    // WIN0 disables guest BG2, but must not reveal screen-fixed guest room
+    // tiles over a later foreign room; OBJ composition remains covered above.
+    store16(&f.io[0x40], 0x0001);  // WIN0 x=[0,1)
+    store16(&f.io[0x44], 0x00A0);  // WIN0 y=[0,160)
+    store16(&f.io[0x48], 0x0010);  // WIN0: OBJ only, no BG2.
+    store16(&f.io[0x4A], 0x0004);  // Outside: BG2.
+    disable_all_objects(f);
+    f.ppu.render(f.rgb.data(), 0x3000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(f.rgb.data(), 255, 0, 0,
+                 "foreign background ignores stale native BG2 window mask");
+
+    // Reset and clearing the provider both return to the literal stock path;
+    // neither stale host presentation nor a callback survives reset.
+    gbarecomp::debug::SnapshotWriter writer;
+    f.ppu.serialize(writer);
+    gbarecomp::debug::SnapshotReader reader(writer.buffer().data(),
+                                              writer.buffer().size());
+    gba::foreign_presentation_internal::set_obj_focus(&focus);
+    gba::foreign_presentation_internal::set_screen_overlay(&overlay);
+    f.ppu.deserialize(reader);
+    if (gba::foreign_presentation_internal::background() != nullptr ||
+        gba::foreign_presentation_internal::obj_focus() != nullptr ||
+        gba::foreign_presentation_internal::screen_overlay() != nullptr) {
+        std::fprintf(stderr, "foreign presentation survived PPU savestate load\n");
+        std::exit(1);
+    }
+    gba::foreign_presentation_internal::set_background(foreign.data());
+    gba::foreign_presentation_internal::set_obj_focus(&focus);
+    gba::foreign_presentation_internal::set_screen_overlay(&overlay);
+    f.ppu.reset();
+    if (gba::foreign_presentation_internal::background() != nullptr ||
+        gba::foreign_presentation_internal::obj_focus() != nullptr ||
+        gba::foreign_presentation_internal::screen_overlay() != nullptr) {
+        std::fprintf(stderr, "foreign presentation survived PPU reset\n");
+        std::exit(1);
+    }
+    disable_all_objects(f);
+    f.ppu.render(f.rgb.data(), 0x0000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    if (std::memcmp(f.rgb.data(), stock.data(), stock.size()) != 0) {
+        std::fprintf(stderr, "inactive foreign background changed stock PPU output\n");
+        std::exit(1);
+    }
+}
+
+void test_bounded_foreign_screen_overlay_composites_under_objects() {
+    Fixture f;
+    disable_all_objects(f);
+    // Native background/backdrop is blue. The overlay uses red at 50% alpha,
+    // then fully opaque red, and one transparent texel. This is deliberately
+    // independent of foreign-world art or a game-specific tile allocation.
+    store16(&f.pal[0], 0x7C00);
+    std::array<uint16_t, 12> pixels{};
+    std::array<uint8_t, 12> alpha{};
+    pixels.fill(0x001F);
+    alpha.fill(16);
+    alpha[0] = 0;
+    alpha[1] = 8;
+    const GbaForeignScreenOverlay overlay{
+        GBA_FOREIGN_SCREEN_OVERLAY_ABI_VERSION,
+        pixels.data(), alpha.data(),
+        10, 10, 4, 3, 4, 0, 0,
+    };
+    gba::foreign_presentation_internal::set_screen_overlay(&overlay);
+    f.ppu.render(f.rgb.data(), 0, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(10 * 240 + 10) * 3], 0, 0, 255,
+                 "transparent portal texel keeps native terrain");
+    expect_pixel(&f.rgb[(10 * 240 + 11) * 3], 132, 0, 132,
+                 "Q4 portal alpha mixes in native color domain");
+    expect_pixel(&f.rgb[(10 * 240 + 12) * 3], 255, 0, 0,
+                 "opaque portal texel covers native terrain");
+
+    // Native window masks apply to the synthetic BG2 identity: a room
+    // transition/window may hide the portal without it piercing the mask.
+    // WIN0 covers X=[12,13), Y=[10,11) and permits no layer there; WINOUT
+    // keeps normal native layers visible elsewhere.
+    store16(&f.io[0x40], 0x0C0D);
+    store16(&f.io[0x44], 0x0A0B);
+    store16(&f.io[0x48], 0x0000);
+    store16(&f.io[0x4A], 0x003F);
+    f.ppu.render(f.rgb.data(), 0x2000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(10 * 240 + 12) * 3], 0, 0, 255,
+                 "native WIN0 hides portal through BG2 mask");
+    // The same synthetic BG2 target identity enters the normal brightness
+    // pipeline; a black channel brightens to the expected native-domain value.
+    store16(&f.io[0x50], 0x0084);  // Brighten, BG2 first target.
+    store16(&f.io[0x54], 8);
+    f.ppu.render(f.rgb.data(), 0, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(10 * 240 + 12) * 3], 255, 132, 132,
+                 "native brightness effect applies to portal BG2 identity");
+    store16(&f.io[0x50], 0x0000);
+    store16(&f.io[0x54], 0);
+
+    // A normal guest OBJ must win even where the portal rectangle is opaque.
+    std::fill_n(f.vram.begin() + 0x10000, 32, static_cast<uint8_t>(0x11));
+    store16(&f.pal[0x202], 0x03E0);
+    store16(&f.oam[0], 10);
+    store16(&f.oam[2], 10);
+    store16(&f.oam[4], 0x0C00);  // tile zero, priority 3
+    f.ppu.render(f.rgb.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(10 * 240 + 12) * 3], 0, 255, 0,
+                 "guest OBJ draws above native portal overlay");
+
+    // Clipping is native-screen based, rather than relying on any game camera
+    // behavior. The first source column is clipped, source column one appears.
+    const GbaForeignScreenOverlay clipped{
+        GBA_FOREIGN_SCREEN_OVERLAY_ABI_VERSION,
+        pixels.data(), alpha.data(),
+        -1, 20, 4, 3, 4, 0, 0,
+    };
+    disable_all_objects(f);
+    gba::foreign_presentation_internal::set_screen_overlay(&clipped);
+    f.ppu.render(f.rgb.data(), 0, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(20 * 240 + 0) * 3], 132, 0, 132,
+                 "clipped portal source columns map safely");
+
+    // PPU-side validation is defensive too: direct/internal publication of a
+    // descriptor with nonzero reserved fields fails closed, and a later corrupt
+    // alpha texel cannot become an accidental opaque pixel.
+    GbaForeignScreenOverlay malformed = overlay;
+    malformed.reserved32 = 1;
+    gba::foreign_presentation_internal::set_screen_overlay(&malformed);
+    f.ppu.render(f.rgb.data(), 0, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(10 * 240 + 12) * 3], 0, 0, 255,
+                 "reserved overlay descriptor fails closed");
+    alpha[2] = 17;
+    gba::foreign_presentation_internal::set_screen_overlay(&overlay);
+    f.ppu.render(f.rgb.data(), 0, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(10 * 240 + 12) * 3], 0, 0, 255,
+                 "out-of-range Q4 alpha fails closed per texel");
+    alpha[2] = 16;
+
+    // Full foreign terrain owns the complete BG plane and suppresses a stale
+    // native-world overlay without relying on the plugin to clear it first.
+    std::array<uint16_t, gba::GbaPpu::kScreenWidth * gba::GbaPpu::kScreenHeight>
+        foreign{};
+    foreign.fill(0x03E0);
+    gba::foreign_presentation_internal::set_background(foreign.data());
+    gba::foreign_presentation_internal::set_screen_overlay(&overlay);
+    f.ppu.render(f.rgb.data(), 0, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(10 * 240 + 12) * 3], 0, 255, 0,
+                 "full foreign background suppresses native portal overlay");
+    gba::foreign_presentation_internal::clear();
+}
+
+void test_wide_foreign_screen_overlay_stays_in_native_viewport() {
+    Fixture f;
+    disable_all_objects(f);
+    constexpr uint32_t margin = 24;
+    f.ppu.set_view_margins(margin, margin, 0, 0);
+    std::vector<uint8_t> wide(gba::GbaPpu::kMaxFramebufferBytes, 0);
+    store16(&f.pal[0], 0x7C00);  // Native backdrop blue.
+
+    std::array<uint16_t, 4> pixels{};
+    std::array<uint8_t, 4> alpha{};
+    pixels.fill(0x001F);  // Red portal.
+    alpha.fill(16);
+    alpha[0] = 0;
+    const GbaForeignScreenOverlay overlay{
+        GBA_FOREIGN_SCREEN_OVERLAY_ABI_VERSION,
+        pixels.data(), alpha.data(),
+        10, 10, 4, 1, 4, 0, 0,
+    };
+    gba::foreign_presentation_internal::set_screen_overlay(&overlay);
+    f.ppu.render(wide.data(), 0, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&wide[(10 * (240 + margin * 2) + margin + 10) * 3],
+                 0, 0, 255,
+                 "wide transparent portal texel keeps centered native terrain");
+    expect_pixel(&wide[(10 * (240 + margin * 2) + margin + 12) * 3],
+                 255, 0, 0,
+                 "wide portal uses centered native screen coordinate");
+    expect_pixel(&wide[(10 * (240 + margin * 2) + margin - 1) * 3],
+                 0, 0, 255,
+                 "wide portal never appears in left margin");
+    expect_pixel(&wide[(10 * (240 + margin * 2) + margin + 240) * 3],
+                 0, 0, 255,
+                 "wide portal never appears in right margin");
+
+    // Guest OBJ coordinates are centered by the same margin and still win
+    // above the portal in the wide compositor.
+    std::fill_n(f.vram.begin() + 0x10000, 32, static_cast<uint8_t>(0x11));
+    store16(&f.pal[0x202], 0x03E0);
+    store16(&f.oam[0], 10);
+    store16(&f.oam[2], 10);
+    store16(&f.oam[4], 0x0C00);
+    f.ppu.render(wide.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&wide[(10 * (240 + margin * 2) + margin + 12) * 3],
+                 0, 255, 0,
+                 "wide guest OBJ draws above centered portal overlay");
+
+    // Foreign terrain publication suppresses the overlay on the wide path
+    // too, even though the native backdrop remains the wide-path base.
+    std::array<uint16_t, gba::GbaPpu::kScreenWidth * gba::GbaPpu::kScreenHeight>
+        foreign{};
+    foreign.fill(0x03E0);
+    disable_all_objects(f);
+    gba::foreign_presentation_internal::set_background(foreign.data());
+    f.ppu.render(wide.data(), 0, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&wide[(10 * (240 + margin * 2) + margin + 12) * 3],
+                 0, 0, 255,
+                 "wide foreign background publication suppresses portal overlay");
+    gba::foreign_presentation_internal::clear();
+}
+
+void test_foreign_background_preserves_only_named_hud_bg_map_cells() {
+    Fixture f;
+    disable_all_objects(f);
+    std::array<uint16_t, gba::GbaPpu::kScreenWidth * gba::GbaPpu::kScreenHeight>
+        foreign{};
+    foreign.fill(0x7C00);  // Blue foreign terrain.
+
+    // BG0 map cell (1,1) contains one red, nontransparent texel. BG1 is a
+    // green room/playfield layer above it everywhere. The HUD declaration is
+    // in BG0 *map-cell* coordinates, after HOFS=8 maps that cell to x=0.
+    // Preserving the composed screen pixel would incorrectly preserve BG1.
+    const uint16_t dispcnt = 0x0300;  // mode 0, BG0 + BG1.
+    store16(&f.io[0x08], 0x0181);  // BG0: 256-color, map block 1, priority 1.
+    store16(&f.io[0x0A], 0x0280);  // BG1: 256-color, map block 2, priority 0.
+    store16(&f.io[0x10], 8);       // BG0 HOFS => output x0 is source tile x1.
+    store16(&f.io[0x14], 8);       // BG1 follows the same scroll.
+    f.vram[0] = 1;                 // BG0 tile 0: red only at texel (0,0).
+    std::fill_n(f.vram.begin() + 64, 64, static_cast<uint8_t>(2));
+    store16(&f.vram[0x800 + (1 * 32 + 1) * 2], 0);  // BG0 tile 0 at (1,1).
+    for (int tile_y = 0; tile_y < 32; ++tile_y) {
+        for (int tile_x = 0; tile_x < 32; ++tile_x) {
+            store16(&f.vram[0x1000 + (tile_y * 32 + tile_x) * 2], 1);
+        }
+    }
+    store16(&f.pal[2], 0x001F);  // Red BG0 HUD texel.
+    store16(&f.pal[4], 0x03E0);  // Green native room BG1.
+
+    const GbaForeignObjFocusTransform focus{
+        GBA_FOREIGN_OBJ_FOCUS_ABI_VERSION,
+        0, 0, 0, 0,
+        0, 0,
+        GBA_FOREIGN_OBJ_FOCUS_PRESERVE_UNFOCUSED,
+        0, 0,
+        0, 0,
+        0, 0, 0, 0,
+        1, 1, 0,
+        1, 1, 1, 1,
+        0, 8, 8, 8,
+    };
+    gba::foreign_presentation_internal::set_background(foreign.data());
+    gba::foreign_presentation_internal::set_obj_focus(&focus);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(8 * 240 + 0) * 3], 255, 0, 0,
+                 "foreign HUD map-cell keeps direct BG0 heart texel");
+    expect_pixel(&f.rgb[(8 * 240 + 1) * 3], 0, 0, 255,
+                 "transparent HUD BG0 texel exposes foreign terrain");
+    expect_pixel(&f.rgb[(8 * 240 + 8) * 3], 0, 0, 255,
+                 "unnamed native BG1 terrain cannot leak over foreign frame");
+
+    // The same BG0 map cell can wrap into a playfield output row when the
+    // guest changes VOFS after dialogue. Map-cell identity alone is therefore
+    // insufficient: the source-backed native HUD output rectangle must also
+    // match, otherwise the foreign terrain stays visible.
+    store16(&f.io[0x12], 128);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(136 * 240 + 0) * 3], 0, 0, 255,
+                 "wrapped HUD map cell outside output bounds exposes foreign terrain");
+
+    // The inactive form is canonical: no stale map/output field may remain
+    // when count is zero. It fails closed rather than retaining a partial HUD
+    // policy from a prior descriptor publication.
+    GbaForeignObjFocusTransform dangling = focus;
+    dangling.hud_bg_map_rect_count = 0;
+    store16(&f.io[0x12], 0);
+    gba::foreign_presentation_internal::set_obj_focus(&dangling);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(8 * 240 + 0) * 3], 0, 0, 255,
+                 "noncanonical inactive HUD policy fails closed");
+
+    // Descriptor bounds are part of the trusted presentation gate: malformed
+    // map coordinates retain no guest HUD pixels and cannot expose terrain.
+    GbaForeignObjFocusTransform malformed = focus;
+    malformed.hud_bg_map_tile_x = 64;
+    gba::foreign_presentation_internal::set_obj_focus(&malformed);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(8 * 240 + 0) * 3], 0, 0, 255,
+                 "malformed HUD map-cell policy fails closed to foreign terrain");
+    gba::foreign_presentation_internal::clear();
+}
+
+void test_trusted_foreign_obj_focus_transforms_only_matching_objects() {
+    // Normal OBJ origin matching, unrelated OBJ preservation, and inactive
+    // byte identity use the same native composition path.
+    Fixture f;
+    disable_all_objects(f);
+    store16(&f.pal[0], 0x7C00);       // Blue backdrop.
+    store16(&f.pal[0x202], 0x001F);   // OBJ palette 1 red.
+    store16(&f.pal[0x204], 0x03E0);   // OBJ palette 2 green.
+    std::fill_n(f.vram.begin() + 0x10000, 32, static_cast<uint8_t>(0x11));
+    std::fill_n(f.vram.begin() + 0x10020, 32, static_cast<uint8_t>(0x22));
+    store16(&f.oam[0], 20);
+    store16(&f.oam[2], 20);
+    store16(&f.oam[4], 0);
+    store16(&f.oam[8], 20);
+    store16(&f.oam[10], 80);
+    store16(&f.oam[12], 1);
+    // 32x32 OBJ whose origin is outside the focus rectangle but whose center
+    // is inside it, exercising the Link-body association fallback.
+    store16(&f.oam[16], 4);
+    store16(&f.oam[18], 0x8000 | 4);
+    store16(&f.oam[20], 1);
+    f.ppu.render(f.rgb.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    const auto stock = f.rgb;
+
+    const GbaForeignObjFocusTransform focus{
+        GBA_FOREIGN_OBJ_FOCUS_ABI_VERSION,
+        20, 20, 30, 28,
+        8, 8,
+        GBA_FOREIGN_OBJ_FOCUS_PRESERVE_UNFOCUSED,
+        0, 0,
+        0, 0,
+        0, 0, 0,
+    };
+    gba::foreign_presentation_internal::set_obj_focus(&focus);
+    f.ppu.render(f.rgb.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    dump_focus_screenshot_if_requested(f.rgb.data());
+    expect_pixel(&f.rgb[(20 * 240 + 20) * 3], 0, 0, 255,
+                 "focused normal OBJ leaves source location");
+    expect_pixel(&f.rgb[(28 * 240 + 30) * 3], 255, 0, 0,
+                 "focused normal OBJ reaches destination");
+    expect_pixel(&f.rgb[(4 * 240 + 4) * 3], 0, 0, 255,
+                 "focused center-match OBJ leaves source location");
+    expect_pixel(&f.rgb[(12 * 240 + 14) * 3], 0, 255, 0,
+                 "focused center-match OBJ reaches destination");
+    for (int y = 20; y < 28; ++y) {
+        if (std::memcmp(&f.rgb[(y * 240 + 80) * 3],
+                        &stock[(y * 240 + 80) * 3], 8 * 3) != 0) {
+            std::fprintf(stderr, "unfocused OBJ changed during focus transform\n");
+            std::exit(1);
+        }
+    }
+    gba::foreign_presentation_internal::set_obj_focus(nullptr);
+    f.ppu.render(f.rgb.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    if (std::memcmp(f.rgb.data(), stock.data(), stock.size()) != 0) {
+        std::fprintf(stderr, "inactive OBJ focus changed stock PPU output\n");
+        std::exit(1);
+    }
+
+    // Source-mapped player presentation uses a bounded native-playfield
+    // association. These values model the captured Minish house portal frame:
+    // Link source feet at (112,85), the visible 32x32 door at (103,48), and
+    // the production 32x40 focus radius. Its center is inside that rectangle
+    // even though its origin is high above Link; a distant HUD-like object is
+    // deliberately outside it.
+    Fixture strict;
+    disable_all_objects(strict);
+    store16(&strict.pal[0], 0x7C00);
+    store16(&strict.pal[0x202], 0x001F);
+    store16(&strict.pal[0x204], 0x03E0);
+    std::fill_n(strict.vram.begin() + 0x10000, 32,
+                static_cast<uint8_t>(0x11));
+    std::fill_n(strict.vram.begin() + 0x10020, 32,
+                static_cast<uint8_t>(0x22));
+    std::fill_n(strict.vram.begin() + 0x10040, 32,
+                static_cast<uint8_t>(0x22));
+    std::fill_n(strict.vram.begin() + 0x10060, 32,
+                static_cast<uint8_t>(0x22));
+    std::fill_n(strict.vram.begin() + 0x10080, 32,
+                static_cast<uint8_t>(0x22));
+    std::fill_n(strict.vram.begin() + 0x100A0, 32,
+                static_cast<uint8_t>(0x22));
+    store16(&strict.oam[0], 85);
+    store16(&strict.oam[2], 112);
+    store16(&strict.oam[4], 0);
+    store16(&strict.oam[8], 48);
+    store16(&strict.oam[10], 0x8000 | 103);  // 32x32 door at (103,48).
+    store16(&strict.oam[12], 0x0C01);  // Low-priority 32x32 room prop.
+    store16(&strict.oam[16], 0x4000 | 93); // 16x8 source-player shadow.
+    store16(&strict.oam[18], 114);
+    store16(&strict.oam[20], 2);
+    // A small native playfield effect inside the source association must not
+    // stay frozen after the player moves. The distant tile is HUD-like and
+    // proves that this is not a blanket OBJ hide.
+    store16(&strict.oam[24], 85);
+    store16(&strict.oam[26], 140);
+    store16(&strict.oam[28], 0x0803);  // Native playfield priority 2.
+    store16(&strict.oam[32], 20);
+    store16(&strict.oam[34], 200);
+    store16(&strict.oam[36], 4);
+    // A second priority-2 native prop is intentionally farther than the
+    // 32x40 Link rectangle. It proves foreign presentation does not leave a
+    // visible room prop merely because the portal was entered farther away.
+    store16(&strict.oam[40], 120);
+    store16(&strict.oam[42], 10);
+    store16(&strict.oam[44], 0x0805);
+    const GbaForeignObjFocusTransform origin_only{
+        GBA_FOREIGN_OBJ_FOCUS_ABI_VERSION,
+        112, 85, 160, 100,
+        32, 40,
+        GBA_FOREIGN_OBJ_FOCUS_PRESERVE_UNFOCUSED |
+            GBA_FOREIGN_OBJ_FOCUS_ORIGIN_ONLY |
+            GBA_FOREIGN_OBJ_FOCUS_SOURCE_TILE_RANGE |
+            GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_LARGE_NEARBY |
+            GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_NEARBY_NONMATCHING |
+            GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_NONMATCHING_EXCEPT_HUD_OAM,
+        0, 1,
+        2, 1,
+        0, 0, UINT64_C(1) << 4, 0,
+    };
+    gba::foreign_presentation_internal::set_obj_focus(&origin_only);
+    strict.ppu.render(strict.rgb.data(), 0x1000, strict.io.data(),
+                      strict.vram.data(), strict.oam.data(), strict.pal.data());
+    expect_pixel(&strict.rgb[(100 * 240 + 160) * 3], 255, 0, 0,
+                 "origin-only focus moves source player origin");
+    expect_pixel(&strict.rgb[(108 * 240 + 162) * 3], 0, 255, 0,
+                 "source focus moves the bounded player shadow allocation");
+    expect_pixel(&strict.rgb[(48 * 240 + 103) * 3], 0, 0, 255,
+                 "bounded source focus suppresses observed house-door anchor");
+    expect_pixel(&strict.rgb[(63 * 240 + 151) * 3], 0, 0, 255,
+                 "house door is not translated to foreign destination");
+    expect_pixel(&strict.rgb[(85 * 240 + 140) * 3], 0, 0, 255,
+                 "bounded source focus suppresses small native playfield OBJ");
+    expect_pixel(&strict.rgb[(120 * 240 + 10) * 3], 0, 0, 255,
+                 "HUD-class focus suppresses distant native playfield OBJ");
+    expect_pixel(&strict.rgb[(20 * 240 + 200) * 3], 0, 255, 0,
+                 "bounded source focus preserves distant HUD-like OBJ");
+    gba::foreign_presentation_internal::set_obj_focus(nullptr);
+
+    // A source player is a composite of independent body and shadow OBJs.
+    // Scaling every matched component around one Link-feet anchor keeps the
+    // pieces contiguous: do not merely shrink them at their old origins.
+    Fixture scaled;
+    disable_all_objects(scaled);
+    store16(&scaled.pal[0], 0x7C00);       // Blue backdrop.
+    store16(&scaled.pal[0x202], 0x001F);   // Tile 0 pixel 0: red.
+    store16(&scaled.pal[0x204], 0x03E0);   // Tile 0 pixel 1: green.
+    store16(&scaled.pal[0x206], 0x7C00);   // Tile 0 pixel 2: blue.
+    store16(&scaled.pal[0x208], 0x7FFF);   // Tile 0 pixel 3: white.
+    store16(&scaled.pal[0x20A], 0x03FF);   // Tile 0 pixel 4: cyan.
+    store16(&scaled.pal[0x20C], 0x7C1F);   // Tile 0 pixel 5: magenta.
+    store16(&scaled.pal[0x20E], 0x7FE0);   // Tile 0 pixel 6: yellow.
+    store16(&scaled.pal[0x210], 0x4210);   // Tile 0 pixel 7: grey.
+    for (int row = 0; row < 8; ++row) {
+        for (int col = 0; col < 8; ++col) {
+            const std::size_t byte = 0x10000u + row * 4u + col / 2u;
+            scaled.vram[byte] |= static_cast<uint8_t>((col + 1) <<
+                ((col & 1) != 0 ? 4 : 0));
+        }
+    }
+    std::fill_n(scaled.vram.begin() + 0x10020, 32,
+                static_cast<uint8_t>(0x22));  // Green second body piece.
+    std::fill_n(scaled.vram.begin() + 0x10040, 64,
+                static_cast<uint8_t>(0x44));  // White 16x8 shadow.
+    store16(&scaled.oam[0], 20);              // 8x8 body left at (20,20).
+    store16(&scaled.oam[2], 20);
+    store16(&scaled.oam[4], 0);
+    store16(&scaled.oam[8], 20);              // 8x8 body right at (28,20).
+    store16(&scaled.oam[10], 28);
+    store16(&scaled.oam[12], 1);
+    store16(&scaled.oam[16], 0x4000 | 28);    // 16x8 shadow at (20,28).
+    store16(&scaled.oam[18], 20);
+    store16(&scaled.oam[20], 2);
+    const GbaForeignObjFocusTransform scaled_focus{
+        GBA_FOREIGN_OBJ_FOCUS_ABI_VERSION,
+        20, 28, 100, 100,
+        16, 16,
+        GBA_FOREIGN_OBJ_FOCUS_PRESERVE_UNFOCUSED |
+            GBA_FOREIGN_OBJ_FOCUS_ORIGIN_ONLY |
+            GBA_FOREIGN_OBJ_FOCUS_SOURCE_TILE_RANGE,
+        0, 2,
+        2, 1,
+        192, 0, 0, 0,
+    };
+    gba::foreign_presentation_internal::set_obj_focus(&scaled_focus);
+    scaled.ppu.render(scaled.rgb.data(), 0x1000, scaled.io.data(),
+                      scaled.vram.data(), scaled.oam.data(), scaled.pal.data());
+    dump_focus_screenshot_if_requested(scaled.rgb.data());
+    // Pixel-center nearest-neighbor maps the 8px left tile to source columns
+    // 0,2,3,4,6,7. Its scaled 6px span is immediately followed by the second
+    // component's scaled span: no body gap or unscaled source residue.
+    expect_pixel(&scaled.rgb[(94 * 240 + 100) * 3], 255, 0, 0,
+                 "scaled composite samples first source pixel");
+    expect_pixel(&scaled.rgb[(94 * 240 + 101) * 3], 0, 0, 255,
+                 "scaled composite nearest-neighbor samples source pixel 2");
+    expect_pixel(&scaled.rgb[(94 * 240 + 102) * 3], 255, 255, 255,
+                 "scaled composite nearest-neighbor samples source pixel 3");
+    expect_pixel(&scaled.rgb[(94 * 240 + 105) * 3], 132, 132, 132,
+                 "scaled composite retains the right edge source pixel");
+    expect_pixel(&scaled.rgb[(94 * 240 + 106) * 3], 0, 255, 0,
+                 "scaled composite keeps second body piece contiguous");
+    expect_pixel(&scaled.rgb[(100 * 240 + 100) * 3], 255, 255, 255,
+                 "scaled source shadow follows the common feet anchor");
+    expect_pixel(&scaled.rgb[(100 * 240 + 111) * 3], 255, 255, 255,
+                 "scaled 16px shadow has a 12px nearest-neighbor span");
+    expect_pixel(&scaled.rgb[(94 * 240 + 112) * 3], 0, 0, 255,
+                 "scaled composite leaves pixels outside its new bounds alone");
+
+    // The same descriptor clips normally at the native PPU edge; clipping is
+    // still applied after the shared-anchor scale rather than mutating OAM.
+    GbaForeignObjFocusTransform clipped_focus = scaled_focus;
+    clipped_focus.destination_link_feet_x = -2;
+    gba::foreign_presentation_internal::set_obj_focus(&clipped_focus);
+    scaled.ppu.render(scaled.rgb.data(), 0x1000, scaled.io.data(),
+                      scaled.vram.data(), scaled.oam.data(), scaled.pal.data());
+    expect_pixel(&scaled.rgb[(94 * 240 + 0) * 3], 255, 255, 255,
+                 "scaled composite clips its negative left edge");
+    expect_pixel(&scaled.rgb[(94 * 240 + 4) * 3], 0, 255, 0,
+                 "scaled composite keeps the clipped second piece aligned");
+    gba::foreign_presentation_internal::set_obj_focus(nullptr);
+
+    // The PPU independently validates the immutable descriptor. A corrupted
+    // pointer that bypassed publication fails closed to the stock result.
+    GbaForeignObjFocusTransform malformed_focus = focus;
+    malformed_focus.flags = 0x80000000u;
+    gba::foreign_presentation_internal::set_obj_focus(&malformed_focus);
+    f.ppu.render(f.rgb.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    if (std::memcmp(f.rgb.data(), stock.data(), stock.size()) != 0) {
+        std::fprintf(stderr, "malformed OBJ focus did not fail closed\n");
+        std::exit(1);
+    }
+    gba::foreign_presentation_internal::set_obj_focus(nullptr);
+
+    // Affine and semi-transparent modes use the same translated decoded
+    // coordinates before their established PPU paths, not a special blit.
+    Fixture affine;
+    disable_all_objects(affine);
+    store16(&affine.pal[0], 0x7C00);
+    store16(&affine.pal[0x202], 0x001F);
+    std::fill_n(affine.vram.begin() + 0x10000, 32,
+                static_cast<uint8_t>(0x11));
+    // Matrix group zero is stored in the interleaved entries 0..3. OBJ 4 uses
+    // it while those entries remain disabled.
+    store16(&affine.oam[6], 0x0100);
+    store16(&affine.oam[14], 0);
+    store16(&affine.oam[22], 0);
+    store16(&affine.oam[30], 0x0100);
+    store16(&affine.oam[32], 0x0100 | 40);  // Affine OBJ at (20,40).
+    store16(&affine.oam[34], 20);
+    store16(&affine.oam[36], 0);
+    const GbaForeignObjFocusTransform affine_focus{
+        GBA_FOREIGN_OBJ_FOCUS_ABI_VERSION,
+        20, 40, 30, 50,
+        8, 8,
+        0,
+        0, 0,
+        0, 0,
+        0, 0, 0,
+    };
+    gba::foreign_presentation_internal::set_obj_focus(&affine_focus);
+    affine.ppu.render(affine.rgb.data(), 0x1000, affine.io.data(),
+                      affine.vram.data(), affine.oam.data(), affine.pal.data());
+    expect_pixel(&affine.rgb[(50 * 240 + 30) * 3], 255, 0, 0,
+                 "focused affine OBJ reaches destination");
+
+    Fixture translucent;
+    disable_all_objects(translucent);
+    store16(&translucent.pal[0], 0x7C00);
+    store16(&translucent.pal[0x202], 0x001F);
+    std::fill_n(translucent.vram.begin() + 0x10000, 32,
+                static_cast<uint8_t>(0x11));
+    store16(&translucent.oam[0], 0x0400 | 60);  // Mode 1 at (20,60).
+    store16(&translucent.oam[2], 20);
+    store16(&translucent.oam[4], 0);
+    store16(&translucent.io[0x50], 0x2000);  // Backdrop is second target.
+    store16(&translucent.io[0x52], 0x0808);
+    const GbaForeignObjFocusTransform translucent_focus{
+        GBA_FOREIGN_OBJ_FOCUS_ABI_VERSION,
+        20, 60, 30, 70,
+        8, 8,
+        GBA_FOREIGN_OBJ_FOCUS_SOURCE_TILE_RANGE,
+        0, 1,
+        0, 0,
+        192, 0, 0,
+    };
+    gba::foreign_presentation_internal::set_obj_focus(&translucent_focus);
+    translucent.ppu.render(translucent.rgb.data(), 0x1000,
+                            translucent.io.data(), translucent.vram.data(),
+                            translucent.oam.data(), translucent.pal.data());
+    expect_pixel(&translucent.rgb[(70 * 240 + 30) * 3], 132, 0, 132,
+                 "focused semitransparent OBJ blends at destination");
+    expect_pixel(&translucent.rgb[(70 * 240 + 36) * 3], 0, 0, 255,
+                 "scaled semitransparent OBJ clips at its nearest-neighbor bounds");
+
+    // Signed OAM wrap happens before focus; a clipped (-4,-4) OBJ can become
+    // visible at (0,0) without mutating the wrapped guest OAM value.
+    Fixture wrapped;
+    disable_all_objects(wrapped);
+    store16(&wrapped.pal[0], 0x7C00);
+    store16(&wrapped.pal[0x202], 0x001F);
+    std::fill_n(wrapped.vram.begin() + 0x10000, 32,
+                static_cast<uint8_t>(0x11));
+    store16(&wrapped.oam[0], 0x00FC);
+    store16(&wrapped.oam[2], 0x01FC);
+    store16(&wrapped.oam[4], 0);
+    const GbaForeignObjFocusTransform wrapped_focus{
+        GBA_FOREIGN_OBJ_FOCUS_ABI_VERSION,
+        0, 0, 4, 4,
+        8, 8,
+        0,
+        0, 0,
+        0, 0,
+        0, 0, 0,
+    };
+    gba::foreign_presentation_internal::set_obj_focus(&wrapped_focus);
+    wrapped.ppu.render(wrapped.rgb.data(), 0x1000, wrapped.io.data(),
+                       wrapped.vram.data(), wrapped.oam.data(), wrapped.pal.data());
+    expect_pixel(&wrapped.rgb[(4 * 240 + 4) * 3], 255, 0, 0,
+                 "focused wrapped OBJ reaches unclipped destination");
+    gba::foreign_presentation_internal::set_obj_focus(nullptr);
+}
+
 void test_affine_reference_reload_overrides_scanline_accumulation() {
     Fixture f;
     disable_all_objects(f);
@@ -958,6 +1924,8 @@ int main() {
     test_alpha_native_domain_and_green_precision();
     test_brightness_native_domain_and_green_precision();
     test_extended_view_geometry_and_clamp();
+    test_authored_portrait_geometry_and_composition();
+    test_authored_ui_xy_uses_source_window_and_effects();
     test_extended_view_capability_policy();
     test_resize_driven_view_policy();
     test_extended_view_preserves_authentic_center();
@@ -966,12 +1934,19 @@ int main() {
     test_obj_only_palette_backdrop_is_not_policy_black();
     test_extended_view_obj_x_is_explicitly_opt_in();
     test_extended_view_obj_attr_x_is_explicitly_opt_in();
+    test_extended_view_obj_native_clip_is_opt_in();
+    test_authored_margin_objects_preserve_center_and_depth();
     test_extended_view_extends_nearest_window_edge();
     test_bitmap_mode3_direct_color_and_affine_origin();
     test_bitmap_mode4_palette_transparency_and_page_flip();
     test_bitmap_mode5_bounds_and_page_flip();
     test_bitmap_mode_obj_compositing_and_obj_window();
     test_bitmap_mode_wide_center_and_margins();
+    test_trusted_foreign_background_keeps_guest_objects_and_resets();
+    test_bounded_foreign_screen_overlay_composites_under_objects();
+    test_wide_foreign_screen_overlay_stays_in_native_viewport();
+    test_foreign_background_preserves_only_named_hud_bg_map_cells();
+    test_trusted_foreign_obj_focus_transforms_only_matching_objects();
     test_affine_reference_reload_overrides_scanline_accumulation();
     test_wide_affine_filter_is_selective_and_bilinear();
     test_latched_frame_immune_to_in_progress_scanlines();

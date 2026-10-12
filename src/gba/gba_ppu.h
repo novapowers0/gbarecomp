@@ -21,6 +21,7 @@
 #include <array>
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 namespace gbarecomp::debug { class SnapshotWriter; class SnapshotReader; }
 
@@ -42,6 +43,30 @@ public:
 
     GbaPpu();
     ~GbaPpu();
+
+    // Optional host-only mirror. Runs at the actual raster boundary with
+    // read-only device memory; never participates in timing or snapshots.
+    struct PresentationObserver {
+        virtual ~PresentationObserver() = default;
+        virtual void scanline(const GbaPpu&, uint32_t y, uint16_t dispcnt,
+                              const uint8_t* io, const uint8_t* vram,
+                              const uint8_t* oam, const uint8_t* pal) = 0;
+        virtual void frame_ready() = 0;
+        virtual void restored() noexcept = 0;
+    };
+    void set_presentation_observer(PresentationObserver* observer) { presentation_ = observer; }
+    PresentationObserver* presentation_observer() const { return presentation_; }
+    // Timing-only canonical consoles retain all PPU events/affine state and
+    // invoke their observer, but keep native pixel buffers zero. Every console
+    // in a network match uses this policy; only its host mirror draws pixels.
+    void set_rasterization_enabled(bool enabled);
+    bool rasterization_enabled() const { return rasterization_enabled_; }
+    // Compose a separate surface using the source's pre-scanline affine
+    // registers, including HBlank DMA reloads. Does not advance either PPU.
+    void render_presentation_scanline(const GbaPpu& source, uint32_t y,
+                                     uint16_t dispcnt, const uint8_t* io,
+                                     const uint8_t* vram, const uint8_t* oam,
+                                     const uint8_t* pal);
 
     // Events that fired during a tick. The caller routes these to
     // the IRQ controller (gating on the DISPSTAT enable bits the BIOS
@@ -97,18 +122,19 @@ public:
     // margin 0 the PPU runs the LITERAL vanilla path (render_scanline_internal),
     // so OFF-mode is byte-identical to the faithful build BY CONSTRUCTION — not
     // by algebraic equivalence (per the widescreen design review). Horizontal
-    // widening reuses each scanline's latched register state; VERTICAL widening
-    // would have to invent state for nonexistent scanlines (no VCOUNT / HBlank
-    // DMA / affine-ref / WIN_V), so kMaxExtraY is compile-capped at 0 for now —
-    // the API still accepts top/bottom (clamped to 0) so callers stay generic.
+    // widening reuses each scanline's latched register state. Vertical margins
+    // require authored providers: they run once at frame start and never
+    // advance VCOUNT, HBlank DMA, or affine scanline accumulators.
     // These margins are present-time host state and are NEVER serialized into
     // the snapshot (the save format is unchanged).
-    // Experimental horizontal envelope: 120 pixels per side gives an exact
-    // 480x160 maximum while the default remains the literal 240x160 path.
-    static constexpr uint32_t kMaxExtraX = 120;
-    static constexpr uint32_t kMaxExtraY = 0;    // vertical deferred; bump when invented-scanline path lands
-    static constexpr uint32_t kMaxRenderWidth  = kScreenWidth  + 2u * kMaxExtraX;  // 480
-    static constexpr uint32_t kMaxRenderHeight = kScreenHeight + 2u * kMaxExtraY;  // 160
+    // Horizontal capacity includes 32:9 (569x160) and 50:9 (889x160).
+    // Individual games still advertise their own ceilings (RunOptions
+    // max_view_width / max_resize_view_width, GbaNetplayViewPolicy::max_width);
+    // this is only the engine's storage capacity. Native remains the default.
+    static constexpr uint32_t kMaxExtraX = 328;
+    static constexpr uint32_t kMaxExtraY = 352;
+    static constexpr uint32_t kMaxRenderWidth  = kScreenWidth  + 2u * kMaxExtraX;  // 896
+    static constexpr uint32_t kMaxRenderHeight = kScreenHeight + 2u * kMaxExtraY;  // 864
     static constexpr std::size_t kMaxFramebufferBytes =
         static_cast<std::size_t>(kMaxRenderWidth) * kMaxRenderHeight * 3;
 
@@ -162,6 +188,9 @@ public:
     bool has_latched_framebuffer() const { return has_latched_fb_; }
 
 private:
+    friend class SimulationStateCodec;
+    PresentationObserver* presentation_ = nullptr; // borrowed; not serialized
+    bool rasterization_enabled_ = true; // host configuration, not serialized
     uint32_t scanline_        = 0;   // 0..227
     uint32_t dot_in_scanline_ = 0;   // 0..307 (in dots, not cycles)
     uint32_t cycle_in_dot_    = 0;   // 0..3
@@ -178,8 +207,8 @@ private:
     // directly produced a horizontal one-frame-stale tear band at whatever
     // scanline the guest happened to have rendered to (the Minish Cap
     // walk-scroll "warble").
-    std::array<uint8_t, kMaxFramebufferBytes> work_fb_{};
-    std::array<uint8_t, kMaxFramebufferBytes> latched_fb_{};
+    std::vector<uint8_t> work_fb_ = std::vector<uint8_t>(kMaxFramebufferBytes);
+    std::vector<uint8_t> latched_fb_ = std::vector<uint8_t>(kMaxFramebufferBytes);
     bool has_latched_fb_ = false;
 
     struct AffineLineState {
@@ -220,6 +249,11 @@ extern "C" int (*g_ws_bg_x_provider)(int bg, int output_x, int screen_y,
 // Bitmask of regular BG layers that may use g_ws_bg_x_provider. Defaults to
 // all layers; game adapters can narrow it to avoid per-pixel callback traffic.
 extern "C" unsigned g_ws_bg_x_provider_layers;
+// Optional 2D UI placement in native-relative coordinates, including signed
+// margin coordinates. Same -1/0/1 actions as the X hook. Remapped samples use
+// the source's window masks; the guest's tilemap and graphics stay untouched.
+extern "C" int (*g_ws_bg_xy_provider)(int bg, int x, int y, int* source_x, int* source_y);
+extern "C" unsigned g_ws_bg_xy_provider_layers;
 // Optional enhancement for affine backgrounds in expanded rendering. The
 // global switch is presentation configuration; the provider lets a game
 // authorize only known-safe layers and scenes.
@@ -229,6 +263,11 @@ extern "C" int (*g_ws_affine_filter_provider)(int bg, int screen_y);
 // established fail-closed window/savestate behavior. On lets provider-sourced
 // regular BG margins continue independently beside native HUD/dialog windows.
 extern "C" int g_ws_authored_margin_layers;
+// Host-only placement of native X=0 within an expanded canvas. Negative keeps
+// the configured left margin; otherwise clamped to [0, render_width - 240].
+// All BG, OBJ, window and authored-margin coordinates share this origin.
+// The native renderer ignores it; it is never serialized as guest state.
+extern "C" int g_ws_native_view_left;
 extern "C" int g_ws_pillarbox;  // Step C policy: black margins on non-field screens
 extern "C" int g_ws_pillarbox_left;
 extern "C" int g_ws_pillarbox_right;
@@ -243,5 +282,25 @@ extern "C" int (*g_ws_obj_attr_x_provider)(int oam_index,
                                             std::uint16_t attr1,
                                             std::uint16_t attr2,
                                             int* out_x);
+// Opt-in policy for expanded rendering: when nonzero, OBJ pixels are clipped
+// to the native 240px viewport so sprites the guest parked just off-screen
+// (signed 9-bit X idiom) never appear inside widescreen margins. The OBJ x
+// providers above run first and may re-place known-safe sprites. Default 0
+// keeps the established expanded-viewport OBJ test.
+extern "C" int g_ws_obj_native_clip;
+
+// Read-only, game-authored OBJ coverage for expanded margins. RGB555 bit 15
+// marks a transparent pixel. Priority uses the hardware 0..3 BG/OBJ order.
+// The PPU never consumes this layer inside the native 240x160 viewport.
+// g_ws_authored_margin_layers makes it independent of native window masks,
+// matching authored BG margins. DISPCNT, BG depth and color effects still apply.
+struct WsMarginObjPixel {
+    std::uint16_t color = 0x8000;
+    std::uint8_t priority = 3;
+    std::uint8_t order = 127;
+    bool semi_transparent = false;
+};
+extern "C" const WsMarginObjPixel* (*g_ws_obj_margin_provider)(
+    int screen_y, int* hardware_left, int* width);
 
 }  // namespace gba

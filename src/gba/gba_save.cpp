@@ -33,7 +33,7 @@ void GbaSave::sram_write(uint32_t off, uint8_t value) {
     std::size_t index = static_cast<std::size_t>(off) % sram_size_;
     if (sram_data_[index] != value) {
         sram_data_[index] = value;
-        dirty_ = true;
+        mark_dirty();
     }
 }
 
@@ -192,7 +192,7 @@ void GbaSave::finish_eeprom_write() {
                 (v << 1) | command_bits_[data_start + byte * 8u + bit]);
         }
         if (byte_offset + byte < eeprom_size_) {
-            if (eeprom_[byte_offset + byte] != v) dirty_ = true;
+            if (eeprom_[byte_offset + byte] != v) mark_dirty();
             eeprom_[byte_offset + byte] = v;
         }
     }
@@ -272,7 +272,9 @@ void GbaSave::configure_flash(std::size_t bytes) {
     flash_banks_ = static_cast<uint32_t>(bytes / kFlashBankBytes);
     if (flash_banks_ == 0) flash_banks_ = 1;
     flash_maker_ = 0xC2;   // Macronix
-    flash_device_ = 0x09;  // MX29L010 (1 Mbit); accepted by FLASH1M & 512K drivers
+    // The guest selects its flash driver by ID. 512-Kbit drivers (including
+    // Mario Kart: Super Circuit's) reject the 1-Mbit MX29L010 identity.
+    flash_device_ = bytes == 0x10000 ? 0x1C : 0x09;  // MX29L512 / MX29L010
     flash_state_ = FlashState::Idle;
     flash_id_mode_ = false;
     flash_bank_ = 0;
@@ -354,7 +356,7 @@ void GbaSave::flash_write(uint32_t off, uint8_t value) {
     case FlashState::EraseUnlock2: {
         if (off == 0x5555 && value == 0x10) {
             std::fill(flash_data_.begin(), flash_data_.end(), 0xFF);  // chip erase
-            dirty_ = true;
+            mark_dirty();
         } else if (value == 0x30) {
             // Sector erase: off is the 4 KB sector base within the bank.
             std::size_t base = static_cast<std::size_t>(flash_bank_) *
@@ -362,7 +364,7 @@ void GbaSave::flash_write(uint32_t off, uint8_t value) {
             for (uint32_t i = 0; i < 0x1000u; ++i) {
                 if (base + i < flash_data_.size()) flash_data_[base + i] = 0xFF;
             }
-            dirty_ = true;
+            mark_dirty();
         }
         flash_state_ = FlashState::Idle;
         break;
@@ -372,7 +374,7 @@ void GbaSave::flash_write(uint32_t off, uint8_t value) {
                               kFlashBankBytes + off;
         if (idx < flash_data_.size() && flash_data_[idx] != value) {
             flash_data_[idx] = value;
-            dirty_ = true;
+            mark_dirty();
         }
         flash_state_ = FlashState::Idle;
         break;

@@ -39,14 +39,161 @@ void appendf(std::string& out, const char* fmt, ...) {
     out.append(big.data(), static_cast<std::size_t>(n));
 }
 
+// Guest regions whose bytes cannot change after load: BIOS and the three
+// cartridge ROM wait-state mirrors.
+bool immutable_code_region(uint32_t pc) {
+    return pc < 0x00004000u || (pc >= 0x08000000u && pc < 0x0E000000u);
+}
+
+bool decode_image_instr(const uint8_t* image, std::size_t image_size,
+                        uint32_t image_base, uint32_t pc, bool thumb,
+                        armv4t::Instr* out) {
+    const uint32_t len = thumb ? 2u : 4u;
+    if (pc < image_base) return false;
+    const uint64_t off = static_cast<uint64_t>(pc - image_base);
+    if (off + len > image_size) return false;
+    const uint8_t* p = image + off;
+    if (thumb) {
+        *out = armv4t::ThumbDecoder::decode(
+            static_cast<uint16_t>(p[0] | (p[1] << 8)), pc);
+    } else {
+        *out = armv4t::ArmDecoder::decode(
+            static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+            (static_cast<uint32_t>(p[2]) << 16) |
+            (static_cast<uint32_t>(p[3]) << 24), pc);
+    }
+    return true;
+}
+
+enum class LinkUse { Reads, Writes, Neither, Unknown };
+
+bool op2_reads(const armv4t::Op2& op2, uint8_t reg) {
+    if (op2.kind != armv4t::Op2::Kind::Shifted) return false;
+    return op2.shifted.rm == reg ||
+           (op2.shifted.by_register && op2.shifted.imm_or_rs == reg);
+}
+
+// How one non-control-flow instruction uses LR. Writes only count when the
+// instruction executes unconditionally; a conditional write may not happen.
+LinkUse classify_link_use(const armv4t::Instr& ins) {
+    using armv4t::IrOp;
+    constexpr uint8_t lr = 14;
+    const bool always = ins.cond == armv4t::Cond::AL;
+    auto write = [&](bool writes) {
+        return writes && always ? LinkUse::Writes : LinkUse::Neither;
+    };
+    switch (ins.op) {
+        case IrOp::MOV: case IrOp::MVN:
+            if (op2_reads(ins.op2, lr)) return LinkUse::Reads;
+            return write(ins.rd == lr);
+        case IrOp::AND: case IrOp::EOR: case IrOp::SUB: case IrOp::RSB:
+        case IrOp::ADD: case IrOp::ADC: case IrOp::SBC: case IrOp::RSC:
+        case IrOp::ORR: case IrOp::BIC:
+            if (ins.rn == lr || op2_reads(ins.op2, lr)) return LinkUse::Reads;
+            return write(ins.rd == lr);
+        case IrOp::TST: case IrOp::TEQ: case IrOp::CMP: case IrOp::CMN:
+            return (ins.rn == lr || op2_reads(ins.op2, lr)) ? LinkUse::Reads
+                                                           : LinkUse::Neither;
+        case IrOp::LDR: case IrOp::LDRB: case IrOp::LDRH:
+        case IrOp::LDRSB: case IrOp::LDRSH:
+            if (ins.mem.rn == lr ||
+                (ins.mem.by_register && ins.mem.reg_offset.rm == lr))
+                return LinkUse::Reads;
+            return write(ins.rd == lr);
+        case IrOp::STR: case IrOp::STRB: case IrOp::STRH:
+            return (ins.rd == lr || ins.mem.rn == lr ||
+                    (ins.mem.by_register && ins.mem.reg_offset.rm == lr))
+                ? LinkUse::Reads : LinkUse::Neither;
+        case IrOp::LDM:
+            // User-bank transfers touch a different LR; be conservative.
+            if (ins.block.s_bit) return LinkUse::Unknown;
+            if (ins.block.rn == lr) return LinkUse::Reads;
+            return write((ins.block.reg_list & (1u << lr)) != 0);
+        case IrOp::STM:
+            if (ins.block.s_bit) return LinkUse::Unknown;
+            return (ins.block.rn == lr ||
+                    (ins.block.reg_list & (1u << lr)) != 0)
+                ? LinkUse::Reads : LinkUse::Neither;
+        case IrOp::SWP: case IrOp::SWPB:
+            if (ins.rn == lr || ins.rm == lr) return LinkUse::Reads;
+            return write(ins.rd == lr);
+        case IrOp::MUL: case IrOp::MLA: case IrOp::UMULL: case IrOp::UMLAL:
+        case IrOp::SMULL: case IrOp::SMLAL:
+            // Field roles differ per multiply form; any LR operand is live.
+            return (ins.rd == lr || ins.rn == lr || ins.rs == lr ||
+                    ins.rm == lr) ? LinkUse::Reads : LinkUse::Neither;
+        case IrOp::MRS:
+            return write(ins.rd == lr);
+        default:
+            return LinkUse::Unknown;
+    }
+}
+
+bool link_dead_from(const uint8_t* image, std::size_t image_size,
+                    uint32_t image_base, uint32_t pc, bool thumb,
+                    std::unordered_set<uint32_t>& visited, unsigned& budget) {
+    using armv4t::IrOp;
+    const uint32_t step = thumb ? 2u : 4u;
+    for (;;) {
+        // A path that loops back without reading LR never observes it.
+        if (!visited.insert(pc).second) return true;
+        if (budget == 0 || !immutable_code_region(pc)) return false;
+        --budget;
+        armv4t::Instr ins;
+        if (!decode_image_instr(image, image_size, image_base, pc, thumb, &ins))
+            return false;
+        if (ins.is_undefined || ins.op == IrOp::Undefined) return false;
+        switch (ins.op) {
+            case IrOp::BL_prefix:
+                return true;  // LR = PC + offset: written, never read
+            case IrOp::BL:
+                if (ins.cond == armv4t::Cond::AL) return true;
+                return false;
+            case IrOp::B:
+                if (ins.cond == armv4t::Cond::AL) {
+                    pc = ins.branch_target;
+                    continue;
+                }
+                return link_dead_from(image, image_size, image_base,
+                                      ins.branch_target, thumb, visited,
+                                      budget) &&
+                       link_dead_from(image, image_size, image_base,
+                                      pc + step, thumb, visited, budget);
+            default:
+                break;
+        }
+        // Every other PC write (BX, LDM/LDR/DP into PC) and SWI/MSR/BL_suffix
+        // is an unknown continuation or LR bank change.
+        if (ins.is_pc_writing || ins.is_branch || ins.op == IrOp::SWI ||
+            ins.op == IrOp::MSR || ins.op == IrOp::BL_suffix)
+            return false;
+        switch (classify_link_use(ins)) {
+            case LinkUse::Reads: case LinkUse::Unknown: return false;
+            case LinkUse::Writes: return true;
+            case LinkUse::Neither: break;
+        }
+        pc += step;
+    }
+}
+
 }  // namespace
+
+bool link_register_dead_at(const uint8_t* image, std::size_t image_size,
+                           uint32_t image_base, uint32_t target, bool thumb) {
+    if (!image || !immutable_code_region(target)) return false;
+    std::unordered_set<uint32_t> visited;
+    unsigned budget = 256;
+    return link_dead_from(image, image_size, image_base, target & ~1u, thumb,
+                          visited, budget);
+}
 
 std::string emit_function_body_str(
     const Function& fn, const uint8_t* rom, std::size_t rom_size,
     uint32_t rom_base,
     const std::unordered_map<uint64_t, std::string>& func_names_by_key,
     const std::unordered_set<uint32_t>*
-        alu_immediate_override_pcs) {
+        alu_immediate_override_pcs,
+    const std::unordered_set<uint64_t>* mod_function_hook_keys) {
     std::string out;
 
     const uint32_t step = (fn.mode == CpuMode::Thumb) ? 2u : 4u;
@@ -177,6 +324,7 @@ std::string emit_function_body_str(
     // instructions strictly before the current one.
     int64_t last_unsafe_pc = -1;
     std::unordered_set<uint32_t> bx_c_return_pcs;
+    std::unordered_map<uint32_t, uint32_t> link_branch_targets;
     bool lr_alias[16] = {};
     lr_alias[14] = true;
     armv4t::Instr prev_scan_ins{};
@@ -239,6 +387,38 @@ std::string emit_function_body_str(
                 idle_backedge_pcs.insert(scan_pc);
             }
         }
+        // Far-branch BLs: the link value is dead at the target, so no guest
+        // return can consume it. Lower them as branches so they never leave a
+        // host call-return frame behind (MKSC's per-frame main loops re-enter
+        // their loop head with `bl`; under suspended multiplayer dispatch
+        // each one leaked a call-return entry until the 1024-entry abort).
+        // Relocated bodies (source_addr != addr) keep call semantics: the
+        // target bytes are not in this image at the target's guest address.
+        if (fn_source_addr == fn.addr) {
+            bool is_bl = false;
+            uint32_t bl_target = 0;
+            if (scan_ins.op == armv4t::IrOp::BL) {
+                is_bl = true;
+                bl_target = scan_ins.branch_target;
+            } else if (scan_ins.op == armv4t::IrOp::BL_suffix) {
+                armv4t::Instr prefix;
+                if (decode_image_instr(rom, rom_size, rom_base, scan_pc - 2u,
+                                       true, &prefix) &&
+                    prefix.op == armv4t::IrOp::BL_prefix) {
+                    is_bl = true;
+                    bl_target = (prefix.branch_target + scan_ins.swi_imm) & ~1u;
+                }
+            }
+            const uint32_t link = scan_pc + step;
+            if (is_bl && bl_target != link &&
+                link_register_dead_at(rom, rom_size, rom_base, bl_target,
+                                      fn.mode == CpuMode::Thumb)) {
+                link_branch_targets[scan_pc] = bl_target;
+                if (bl_target >= fn.addr && bl_target < fn.end_addr &&
+                    bl_target < scan_pc)
+                    backward_targets.insert(bl_target);
+            }
+        }
         if (scan_ins.op == armv4t::IrOp::BX &&
             have_prev_scan_ins &&
             prev_scan_ins.op == armv4t::IrOp::LDM &&
@@ -285,6 +465,7 @@ std::string emit_function_body_str(
     }
 
     ctx.idle_backedge_pcs = &idle_backedge_pcs;
+    ctx.link_branch_targets = &link_branch_targets;
 
     uint32_t pc = fn.addr;
 
@@ -312,6 +493,19 @@ std::string emit_function_body_str(
         }
         appendf(out, "        default: break;\n");
         appendf(out, "        }\n    }\n");
+    }
+
+    // Reviewed mod replacement hook. Resume aliases deliberately skip it: an
+    // IRQ/SWI resume is not a fresh guest call. A handled callback owns the
+    // complete guest call and leaves g_cpu in its return-to-caller state.
+    const uint64_t mod_hook_key =
+        (static_cast<uint64_t>(fn.addr) << 1u) |
+        (fn.mode == CpuMode::Thumb ? 1u : 0u);
+    if (mod_function_hook_keys &&
+        mod_function_hook_keys->count(mod_hook_key) != 0) {
+        appendf(out,
+            "    if (gba_mod_function_entry(0x%08Xu, %du, &g_cpu)) return;\n",
+            fn.addr, fn.mode == CpuMode::Thumb ? 1 : 0);
     }
 
     // General function-entry hook (debug observability; see runtime_arm.h).
@@ -384,8 +578,7 @@ std::string emit_function_body_str(
     appendf(out,
         "    /* fall-through to 0x%08X */\n"
         "    g_cpu.R[15] = 0x%08Xu;\n"
-        "    runtime_dispatch(0x%08Xu);\n"
-        "    return;\n",
+        "    GBARECOMP_TAIL_DISPATCH(0x%08Xu);\n",
         fn.end_addr, fn.end_addr, fn.end_addr);
 
     return out;
@@ -396,10 +589,12 @@ void emit_function_body(
     std::size_t rom_size, uint32_t rom_base,
     const std::unordered_map<uint64_t, std::string>& func_names_by_key,
     const std::unordered_set<uint32_t>*
-        alu_immediate_override_pcs) {
+        alu_immediate_override_pcs,
+    const std::unordered_set<uint64_t>* mod_function_hook_keys) {
     std::string body = emit_function_body_str(fn, rom, rom_size, rom_base,
                                               func_names_by_key,
-                                              alu_immediate_override_pcs);
+                                              alu_immediate_override_pcs,
+                                              mod_function_hook_keys);
     std::fwrite(body.data(), 1, body.size(), f);
 }
 

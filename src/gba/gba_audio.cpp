@@ -25,10 +25,19 @@ constexpr uint8_t kDutyPatterns[4][8] = {
 
 constexpr std::size_t kRingSize = 1u << 14;  // 16384 samples ~ 0.5 s
 
+bool fifo_trace_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("GBARECOMP_AUDIO_FIFO_TRACE");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
 }  // namespace
 
 GbaAudio::GbaAudio() {
     ring_.assign(kRingSize, 0);
+    ring_rate_.assign(kRingSize, 0);
     cap_ring_.assign(kCapRingSize, CapSample{});
     reset();
 }
@@ -107,12 +116,14 @@ void GbaAudio::deserialize(gbarecomp::debug::SnapshotReader& r) {
     cycle_accumulator_ = r.u32();
     uint32_t ring_len = r.u32();
     ring_.assign(ring_len, 0);
+    ring_rate_.assign(ring_len, 0);
     if (ring_len) r.bytes(ring_.data(), ring_len * sizeof(int16_t));
     ring_head_         = static_cast<std::size_t>(r.u64());
     ring_tail_         = static_cast<std::size_t>(r.u64());
     samples_generated_ = r.u64();
     r.bytes(current_samples_, sizeof(current_samples_));
     sample_index_      = r.u32();
+    std::fill(std::begin(current_sample_rates_), std::end(current_sample_rates_), uint8_t{0});
 }
 
 void GbaAudio::reset() {
@@ -457,8 +468,9 @@ void GbaAudio::ch4_trigger() {
     }
 }
 
-void GbaAudio::ring_push(int16_t s) {
+void GbaAudio::ring_push(int16_t s, uint8_t rate_tag) {
     ring_[ring_head_] = s;
+    ring_rate_[ring_head_] = rate_tag;
     ring_head_ = (ring_head_ + 1) % kRingSize;
     if (ring_head_ == ring_tail_) {
         // Overrun — drop oldest by advancing tail.
@@ -489,6 +501,20 @@ std::size_t GbaAudio::query_capture(uint64_t start, std::size_t count,
         out[i] = cap_ring_[(start + i) % kCapRingSize];
     }
     out_first = start;
+    return n;
+}
+
+std::size_t GbaAudio::drain_sample_block(int16_t* out, std::size_t max, uint32_t& rate) {
+    while (ring_tail_ != ring_head_ && !ring_rate_[ring_tail_])
+        ring_tail_ = (ring_tail_ + 1) % kRingSize;
+    if (!max || ring_tail_ == ring_head_) return 0;
+    const uint8_t tag = ring_rate_[ring_tail_];
+    rate = 32768u << (tag - 1);
+    std::size_t n = 0;
+    while (n < max && ring_tail_ != ring_head_ && ring_rate_[ring_tail_] == tag) {
+        out[n++] = ring_[ring_tail_];
+        ring_tail_ = (ring_tail_ + 1) % kRingSize;
+    }
     return n;
 }
 
@@ -538,17 +564,20 @@ void GbaAudio::fifo_timer_step(DirectFifo& fifo, int fifo_id) {
     for (uint32_t i = start; i < slots; ++i) {
         fifo.samples[i] = sample;
     }
-    FifoTrace& trace = trace_[trace_write_];
-    trace.sample_base = samples_generated_;
-    trace.fifo_id = static_cast<uint8_t>(fifo_id);
-    trace.until_cycles = until_cycles;
-    trace.start_slot = start;
-    trace.slots = slots;
-    trace.count = fifo.count;
-    trace.bytes_remaining = fifo.bytes_remaining;
-    trace.sample = sample;
-    trace_write_ = (trace_write_ + 1u) % kFifoTraceSize;
-    if (trace_count_ < kFifoTraceSize) ++trace_count_;
+    if (fifo_trace_enabled()) {
+        if (trace_.empty()) trace_.resize(kFifoTraceSize);
+        FifoTrace& trace = trace_[trace_write_];
+        trace.sample_base = samples_generated_;
+        trace.fifo_id = static_cast<uint8_t>(fifo_id);
+        trace.until_cycles = until_cycles;
+        trace.start_slot = start;
+        trace.slots = slots;
+        trace.count = fifo.count;
+        trace.bytes_remaining = fifo.bytes_remaining;
+        trace.sample = sample;
+        trace_write_ = (trace_write_ + 1u) % kFifoTraceSize;
+        if (trace_count_ < kFifoTraceSize) ++trace_count_;
+    }
     if (fifo.bytes_remaining != 0) {
         fifo.shift_word >>= 8;
         --fifo.bytes_remaining;
@@ -590,8 +619,10 @@ GbaAudio::FifoDebugState GbaAudio::debug_fifo_state(int fifo_id) const {
     return out;
 }
 
+bool GbaAudio::debug_fifo_trace_enabled() { return fifo_trace_enabled(); }
+
 GbaAudio::FifoTrace GbaAudio::debug_trace_entry(uint32_t index) const {
-    if (index >= trace_count_) return FifoTrace{};
+    if (trace_.empty() || index >= trace_count_) return FifoTrace{};
     uint32_t start = (trace_write_ + kFifoTraceSize - trace_count_) %
         kFifoTraceSize;
     return trace_[(start + index) % kFifoTraceSize];
@@ -620,6 +651,7 @@ void GbaAudio::sample_until_current_time() {
     if (elapsed > slots) elapsed = slots;
     while (sample_index_ < elapsed) {
         current_samples_[sample_index_] = mix_one_sample(sample_index_);
+        current_sample_rates_[sample_index_] = 1 + ((soundbias_ >> 14) & 3);
         ++sample_index_;
     }
 }
@@ -972,6 +1004,7 @@ void GbaAudio::run_sample_event() {
             s = static_cast<int16_t>(o);
         }
         current_samples_[slot] = s;
+        current_sample_rates_[slot] = 1 + ((soundbias_ >> 14) & 3);
         caps[slot].mixed = s;
         caps[slot].ch[0] = tap.ch[0];
         caps[slot].ch[1] = tap.ch[1];
@@ -985,7 +1018,7 @@ void GbaAudio::run_sample_event() {
         // cap_push first (keyed by samples_generated_ pre-increment), then
         // ring_push which bumps samples_generated_ — keeps the two aligned.
         cap_push(caps[i]);
-        ring_push(current_samples_[i]);
+        ring_push(current_samples_[i], current_sample_rates_[i]);
     }
     sample_index_ = 0;
 

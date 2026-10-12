@@ -22,8 +22,28 @@
 #include <vector>
 
 #include "arm_ir.h"
+#include "gba_waitstates.h"
 #include "runtime_arm.h"
 #include "stubs.h"
+
+static RuntimeWaitTable power_on_waits() {
+    RuntimeWaitTable t{};
+    gba::waits_reset(t);
+    return t;
+}
+// Declared extern "C" in runtime_arm.h.
+RuntimeWaitTable g_runtime_waits = power_on_waits();
+
+namespace codegen_test {
+RuntimeWaitTable& g_waits = g_runtime_waits;
+}  // namespace codegen_test
+
+extern "C" uint32_t runtime_prefetch_stall_delta(uint32_t wait, uint32_t pc,
+                                                 uint32_t thumb) {
+    const int32_t w = static_cast<int32_t>(wait);
+    return static_cast<uint32_t>(
+        rwt_prefetch_stall(&codegen_test::g_waits, w, pc, thumb) - w);
+}
 
 namespace {
 
@@ -52,6 +72,8 @@ void bus_reset(uint32_t base, uint32_t size) {
     g_dispatch_called = false;
     g_last_swi_imm = 0;
     g_swi_called = false;
+    g_fellthrough = false;
+    g_named_sink_called = false;
     g_ticked_cycles = 0;
     g_cpsr_at_first_tick = UINT32_MAX;
     g_unimplemented_called = false;
@@ -98,6 +120,8 @@ uint32_t g_last_dispatch_target = 0;
 bool     g_dispatch_called      = false;
 uint32_t g_last_swi_imm         = 0;
 bool     g_swi_called           = false;
+bool     g_fellthrough          = false;
+bool     g_named_sink_called    = false;
 bool     g_unimplemented_called = false;
 const char* g_unimplemented_op  = nullptr;
 uint32_t g_unimplemented_pc     = 0;
@@ -200,6 +224,14 @@ extern "C" void bus_write_u32(uint32_t addr, uint32_t v) {
 // runtime_dispatch_miss below, which records and returns. SWI tests
 // then observe exception-entry state + that dispatch was called
 // for pc=0x08.
+
+extern "C" void tc_named_sink(void) {
+    codegen_test::g_named_sink_called = true;
+}
+
+extern "C" void codegen_test_fellthrough(void) {
+    codegen_test::g_fellthrough = true;
+}
 
 extern "C" void runtime_dispatch_miss(uint32_t target_pc) {
     codegen_test::g_dispatch_called = true;

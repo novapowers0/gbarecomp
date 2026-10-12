@@ -34,16 +34,18 @@
 namespace gbarecomp::debug { class SnapshotWriter; class SnapshotReader; }
 
 namespace gba {
+const char* dma_ram_implementation();
+class GbaSerialDevice;
 
 class GbaPpu;
 class GbaIrq;
 class GbaAudio;
 
-// ── Always-on MMIO write-trace ring (Axis 4 — accuracy burndown) ──────
-// A non-destructive, always-on ring recording every committed IO-register
-// write {cycle, addr, value, size, pc} so the mmio_cap TCP probe can QUERY a
-// [start,count] window without arming (ring-buffer discipline). The tap lives
-// at the GbaIo::write8/16/32 commit path and is zero-effect on write behavior.
+// ── Opt-in MMIO write-trace ring (Axis 4 — accuracy burndown) ──────────
+// A non-destructive ring recording committed IO-register writes {cycle, addr,
+// value, size, pc} when GBARECOMP_MMIO_CAP=1 or GBARECOMP_MMIO_DUMP=<path> is
+// set. The tap lives at the GbaIo::write8/16/32 commit path and is zero-effect
+// on write behavior.
 // cycle = g_runtime_cycles and pc = recomp g_cpu.R[15] (both meaningful in the
 // recompiled runtime; under the bios_smoke interpreter only addr/value/size are
 // meaningful — it drives its own CPUState and does not tick g_runtime_cycles).
@@ -55,6 +57,7 @@ struct MmioCapEntry {
     uint32_t pc;
 };
 constexpr std::size_t kMmioCapRingSize = 1u << 18;  // 262144 writes
+bool        gba_mmio_cap_enabled();  // true when MMIO capture is armed
 uint64_t    gba_mmio_cap_total();    // total writes ever recorded (monotonic)
 uint64_t    gba_mmio_cap_oldest();   // earliest absolute index still retained
 std::size_t gba_mmio_cap_query(uint64_t start, std::size_t count,
@@ -198,7 +201,19 @@ public:
     // Host-side input update. The low 10 bits are GBA KEYINPUT
     // (active-low: 1 = released, 0 = pressed). Stored directly into
     // the IO backing so the next CPU read sees the current state.
+    //
+    // The register is the AND of two host sources: the physical/host keys
+    // (keyboard, controller, touch pad, TCP, replay) and an optional
+    // game-policy synthesized mask (touch gestures translated to presses).
+    // Both default to 0x03FF, so a game without a policy sees exactly the
+    // host keys, as before.
     void set_keyinput(uint16_t keys);
+    void set_synthesized_keyinput(uint16_t keys);
+    uint16_t host_keyinput() const { return host_keyinput_; }
+    uint16_t synthesized_keyinput() const { return synth_keyinput_; }
+    uint16_t composed_keyinput() const {
+        return static_cast<uint16_t>(host_keyinput_ & synth_keyinput_ & 0x03FFu);
+    }
 
     // Advance hardware timers by CPU cycles. Timer overflows raise IRQs,
     // clock direct-sound FIFOs, and advance the Timer 1..3 count-up chain.
@@ -212,6 +227,8 @@ public:
     // handler re-kicks the transfer. (GBATEK § "SIO Normal Mode".)
     void tick_sio(uint32_t cycles);
     uint32_t cycles_until_next_sio_event() const;
+    void set_serial_device(GbaSerialDevice* device);
+    GbaSerialDevice* serial_device() const { return serial_device_; }
 
     // DMA cycle-stealing: a DMA transfer steals bus cycles from the CPU. The
     // DMA loops accumulate their GBATEK transfer cost here; the runtime drains
@@ -231,6 +248,8 @@ public:
     void deserialize(gbarecomp::debug::SnapshotReader& r);
 
 private:
+    friend class SimulationStateCodec;
+    GbaSerialDevice* serial_device_ = nullptr;
     GbaPpu*       ppu_   = nullptr;
     GbaIrq*       irq_   = nullptr;
     armv4t::Bus*  bus_   = nullptr;
@@ -241,6 +260,10 @@ private:
     std::array<uint8_t, kIoSize> io_{};
 
     bool halted_ = false;
+    // Host-side KEYINPUT sources (not guest-visible state; never serialized —
+    // the composed register value in io_ is what savestates capture).
+    uint16_t host_keyinput_ = 0x03FFu;
+    uint16_t synth_keyinput_ = 0x03FFu;
     std::size_t unmapped_count_ = 0;
     std::size_t dma_runs_[4]  = {0, 0, 0, 0};
     std::size_t dma_words_[4] = {0, 0, 0, 0};

@@ -1,6 +1,11 @@
 #include "mod_runtime.h"
+#include "mod_function_hooks.h"
+#include "asset_picker.h"
 
 #include "../gba/crc32.h"
+#include "../gba/foreign_presentation_internal.h"
+#include "../gba/mod_audio.h"
+#include "../gba/gba_ppu.h"
 #include "../gba/sha1.h"
 
 #if defined(GBARECOMP_MOD_UI)
@@ -26,9 +31,21 @@
 #include <utility>
 #include <vector>
 
+// Deliberately declared in this implementation file only.  This is the
+// runtime-to-engine linkage used around a selected activation callback, not a
+// mod API or an authorization mechanism that plugins can include.
+namespace gbarecomp::mod_audio_engine_private {
+void begin_stream_activation();
+void end_stream_activation();
+}  // namespace gbarecomp::mod_audio_engine_private
+
 namespace fs = std::filesystem;
 
 namespace gbarecomp {
+
+bool mod_runtime_commit_impl(const fs::path& rom_path, bool allow_picker,
+                             std::string* error);
+
 namespace {
 
 constexpr uint64_t kMaxArchiveBytes = 256ull * 1024ull * 1024ull;
@@ -74,6 +91,18 @@ struct Target {
     std::vector<std::string> rom_sha1s;
 };
 
+// A package never contains this file. It describes a user-owned source file
+// whose selected local path is retained only in mods/state.toml.
+struct RequiredAsset {
+    std::string feature_id;
+    std::string id;
+    std::string name;
+    std::string sha1;
+    uint64_t expected_size = 0;
+    std::vector<std::string> extensions;
+    std::string purpose;
+};
+
 struct Package {
     uint32_t format_version = 0;
     std::string id;
@@ -86,6 +115,7 @@ struct Package {
     std::vector<Target> targets;
     std::vector<Feature> features;
     std::vector<Option> options;
+    std::vector<RequiredAsset> required_assets;
 };
 
 struct FeatureSelection {
@@ -97,6 +127,9 @@ struct FeatureSelection {
 struct PackageSelection {
     std::string version;
     std::map<std::string, FeatureSelection> features;
+    // Package asset id -> absolute or user-selected local path. The source
+    // bytes stay outside the package and are never copied by this runtime.
+    std::map<std::string, std::string> asset_paths;
 };
 
 struct Diagnostic {
@@ -144,9 +177,14 @@ struct Runtime {
     std::map<std::string, PackageSelection> selections;
     Validation validation;
     Validation committed;
+    std::map<std::string, std::map<std::string, std::map<std::string, std::string>>>
+        committed_options;
+    std::map<std::string, std::map<std::string, std::string>>
+        committed_asset_paths;
     std::string error;
     bool initialized = false;
     bool adaptive_view_enabled = false;
+    int view_width = 0;
 };
 
 Runtime& state() {
@@ -265,6 +303,45 @@ bool parse_bool(const std::string& text, bool& out) {
     return false;
 }
 
+bool parse_string_array(const std::string& text,
+                        std::vector<std::string>& out) {
+    const std::string value = trim(text);
+    if (value.size() < 2 || value.front() != '[' || value.back() != ']')
+        return false;
+    out.clear();
+    std::string body = trim(value.substr(1, value.size() - 2));
+    if (body.empty()) return true;
+    while (!body.empty()) {
+        bool quoted = false;
+        bool escape = false;
+        size_t comma = std::string::npos;
+        for (size_t i = 0; i < body.size(); ++i) {
+            const char c = body[i];
+            if (escape) {
+                escape = false;
+                continue;
+            }
+            if (quoted && c == '\\') {
+                escape = true;
+                continue;
+            }
+            if (c == '"') quoted = !quoted;
+            if (!quoted && c == ',') {
+                comma = i;
+                break;
+            }
+        }
+        const std::string item = trim(body.substr(0, comma));
+        std::string parsed;
+        if (!parse_string(item, parsed)) return false;
+        out.push_back(std::move(parsed));
+        if (comma == std::string::npos) break;
+        body = trim(body.substr(comma + 1));
+        if (body.empty()) return false;
+    }
+    return true;
+}
+
 bool parse_int(const std::string& text, int64_t& out) {
     const std::string value = trim(text);
     if (value.empty()) return false;
@@ -292,6 +369,13 @@ bool valid_sha1(const std::string& value) {
     return value.size() == 40 &&
         std::all_of(value.begin(), value.end(), [](unsigned char c) {
             return std::isdigit(c) || (c >= 'a' && c <= 'f');
+        });
+}
+
+bool valid_extension(const std::string& value) {
+    return !value.empty() && value.size() <= 16 &&
+        std::all_of(value.begin(), value.end(), [](unsigned char c) {
+            return std::isalnum(c);
         });
 }
 
@@ -354,12 +438,14 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
         Option,
         Choice,
         Plugin,
+        Asset,
     };
     Section section = Section::Package;
     Target* target = nullptr;
     Feature* feature = nullptr;
     Option* option = nullptr;
     Choice* choice = nullptr;
+    RequiredAsset* asset = nullptr;
     std::string plugin_feature;
     std::string plugin_id;
     std::vector<std::string> target_rom_sha1;
@@ -410,6 +496,7 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
             feature = nullptr;
             option = nullptr;
             choice = nullptr;
+            asset = nullptr;
             if (name == "target") {
                 section = Section::Target;
                 out.targets.emplace_back();
@@ -433,6 +520,10 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
                 choice = &option->choices.back();
             } else if (name == "plugin") {
                 section = Section::Plugin;
+            } else if (name == "asset") {
+                section = Section::Asset;
+                out.required_assets.emplace_back();
+                asset = &out.required_assets.back();
             } else {
                 set_error(error, "unsupported manifest section [[" + name + "]]");
                 return false;
@@ -545,6 +636,24 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
                 else if (key == "id") parsed = string_field(plugin_id);
                 else known = false;
                 break;
+            case Section::Asset:
+                asset = out.required_assets.empty()
+                    ? nullptr : &out.required_assets.back();
+                if (!asset) parsed = false;
+                else if (key == "feature") parsed = string_field(asset->feature_id);
+                else if (key == "id") parsed = string_field(asset->id);
+                else if (key == "name") parsed = string_field(asset->name);
+                else if (key == "sha1") parsed = string_field(asset->sha1);
+                else if (key == "size") {
+                    parsed = parse_int(value, int_value) && int_value > 0;
+                    if (parsed)
+                        asset->expected_size = static_cast<uint64_t>(int_value);
+                } else if (key == "extensions") {
+                    parsed = parse_string_array(value, asset->extensions);
+                } else if (key == "purpose") {
+                    parsed = string_field(asset->purpose);
+                } else known = false;
+                break;
         }
         if (!known || !parsed) {
             set_error(error, "invalid or unsupported manifest field '" + key +
@@ -595,6 +704,22 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
                              return c.value.empty() || c.label.empty();
                          }))) {
             set_error(error, "choice option has no valid choices");
+            return false;
+        }
+    }
+    std::set<std::string> asset_ids;
+    for (const RequiredAsset& item : out.required_assets) {
+        if (!find_feature(out, item.feature_id) || !valid_id(item.id) ||
+            item.name.empty() ||
+            !valid_sha1(item.sha1) || item.expected_size == 0 ||
+            item.expected_size > std::numeric_limits<size_t>::max() ||
+            item.extensions.empty() || item.purpose.empty() ||
+            !asset_ids.insert(item.id).second ||
+            std::any_of(item.extensions.begin(), item.extensions.end(),
+                        [](const std::string& extension) {
+                            return !valid_extension(extension);
+                        })) {
+            set_error(error, "manifest has an invalid or duplicate required asset");
             return false;
         }
     }
@@ -652,6 +777,76 @@ bool target_matches(const Package& package, const Runtime& runtime) {
             }
             return false;
         });
+}
+
+struct RequiredAssetPickerSpec {
+    std::string display_name;
+    std::string dialog_filter;
+    std::string dialog_title;
+    AssetSpec spec;
+};
+
+RequiredAssetPickerSpec required_asset_spec(const RequiredAsset& asset) {
+    RequiredAssetPickerSpec result;
+    result.display_name = asset.name;
+    std::ostringstream patterns;
+    for (size_t i = 0; i < asset.extensions.size(); ++i) {
+        if (i) patterns << ';';
+        patterns << "*." << asset.extensions[i] << ";*.";
+        for (char c : asset.extensions[i])
+            patterns << static_cast<char>(std::toupper(
+                static_cast<unsigned char>(c)));
+    }
+    // OPENFILENAME requires a double-NUL terminated pair list. The picker
+    // copies this synchronously, so these strings remain valid for the call.
+    result.dialog_filter = asset.name + " (" + patterns.str() + ")";
+    result.dialog_filter.push_back('\0');
+    result.dialog_filter += patterns.str();
+    result.dialog_filter += "\0All Files (*.*)\0*.*\0";
+    result.dialog_title = "Select " + asset.name;
+    result.spec.cache_filename = "";
+    result.spec.expected_size = static_cast<size_t>(asset.expected_size);
+    result.spec.expected_sha1 = asset.sha1.c_str();
+    result.spec.hash_mismatch_is_error = true;
+    result.spec.persist_cache = false;
+    return result;
+}
+
+void bind_required_asset_spec(RequiredAssetPickerSpec* value) {
+    value->spec.display_name = value->display_name.c_str();
+    value->spec.dialog_filter = value->dialog_filter.c_str();
+    value->spec.dialog_title = value->dialog_title.c_str();
+}
+
+void validate_required_assets(Runtime& runtime, const Package& package,
+                              Validation* result) {
+    if (!target_matches(package, runtime)) return;
+    const PackageSelection& selection = package_selection(runtime, package);
+    for (const RequiredAsset& asset : package.required_assets) {
+        const Feature* owner = find_feature(package, asset.feature_id);
+        if (!owner || !feature_enabled(runtime, package, *owner)) continue;
+        const auto path = selection.asset_paths.find(asset.id);
+        if (path == selection.asset_paths.end() || path->second.empty()) {
+            result->ok = false;
+            result->diagnostics.push_back({
+                package.id, owner->id, {}, {}, "asset:" + asset.id,
+                "Required asset '" + asset.name + "' has not been selected. " +
+                    asset.purpose
+            });
+            continue;
+        }
+        RequiredAssetPickerSpec spec = required_asset_spec(asset);
+        bind_required_asset_spec(&spec);
+        const AssetResult checked = validate_asset_path(path->second, spec.spec);
+        if (!checked.ok) {
+            result->ok = false;
+            result->diagnostics.push_back({
+                package.id, owner->id, {}, {}, "asset:" + asset.id,
+                "Required asset '" + asset.name + "' is unavailable or invalid: " +
+                    checked.error
+            });
+        }
+    }
 }
 
 Validation validate(Runtime& runtime) {
@@ -713,6 +908,11 @@ Validation validate(Runtime& runtime) {
         (void)id;
         result.plugins.push_back(plugin);
     }
+    for (const auto& [id, versions] : runtime.packages) {
+        (void)versions;
+        const Package* package = selected_package(runtime, id);
+        if (package) validate_required_assets(runtime, *package, &result);
+    }
     return result;
 }
 
@@ -764,7 +964,7 @@ bool load_state(Runtime& runtime, std::string* error) {
         set_error(error, "cannot read mod state");
         return false;
     }
-    enum class Section { Root, Package, Feature, Values };
+    enum class Section { Root, Package, Feature, Values, Asset };
     Section section = Section::Root;
     std::string current_package;
     std::string current_feature;
@@ -786,6 +986,12 @@ bool load_state(Runtime& runtime, std::string* error) {
         }
         if (line == "[feature.values]") {
             section = Section::Values;
+            continue;
+        }
+        if (line == "[[asset]]") {
+            section = Section::Asset;
+            current_package.clear();
+            current_feature.clear();
             continue;
         }
         const size_t equals = line.find('=');
@@ -824,6 +1030,17 @@ bool load_state(Runtime& runtime, std::string* error) {
             !current_feature.empty() && parse_string(value, parsed)) {
             runtime.selections[current_package]
                 .features[current_feature].values[key] = parsed;
+        }
+        if (section == Section::Asset) {
+            if (key == "package_id" && parse_string(value, current_package)) {
+                runtime.selections[current_package];
+            } else if (key == "id" && !current_package.empty() &&
+                       parse_string(value, current_feature)) {
+                runtime.selections[current_package].asset_paths[current_feature];
+            } else if (key == "path" && !current_package.empty() &&
+                       !current_feature.empty() && parse_string(value, parsed)) {
+                runtime.selections[current_package].asset_paths[current_feature] = parsed;
+            }
         }
     }
     return true;
@@ -868,6 +1085,14 @@ bool save_state(Runtime& runtime, std::string* error) {
                 for (const auto& [key, value] : feature.values)
                     file << key << " = " << quote_toml(value) << "\n";
             }
+        }
+    }
+    for (const auto& [package_id, selection] : runtime.selections) {
+        for (const auto& [asset_id, path] : selection.asset_paths) {
+            if (path.empty()) continue;
+            file << "\n[[asset]]\npackage_id = " << quote_toml(package_id)
+                 << "\nid = " << quote_toml(asset_id)
+                 << "\npath = " << quote_toml(path) << "\n";
         }
     }
     file.close();
@@ -1563,8 +1788,8 @@ int provider_set_option(void*, const char*, const char*,
 
 int provider_commit(void*, const char* image_path) {
     std::string error;
-    if (!mod_runtime_commit(
-            image_path ? fs::path(image_path) : fs::path(), &error)) {
+    if (!mod_runtime_commit_impl(
+            image_path ? fs::path(image_path) : fs::path(), true, &error)) {
         state().error = error;
         return 0;
     }
@@ -1765,8 +1990,16 @@ bool mod_runtime_initialize(const fs::path& root,
                             const std::string& game_id,
                             const std::vector<std::string>& rom_sha1s,
                             std::string* error) {
+    // Reinitialization is an authorization boundary too.  A malformed or
+    // rejected new catalog cannot retain a prior plugin's producer callback or
+    // native-output policy while the runtime is deciding what is committed.
+    gba_mod_audio_reset();
     Runtime& runtime = state();
     runtime = {};
+    // Keep this explicit: an initialize failure must never leave a prior
+    // committed external-asset path reachable through the plugin API.
+    runtime.committed_asset_paths.clear();
+    runtime.committed_options.clear();
     runtime.root = root;
     runtime.game_id = game_id;
     runtime.rom_sha1s = rom_sha1s;
@@ -1787,9 +2020,47 @@ bool mod_runtime_initialize(const fs::path& root,
     return true;
 }
 
-bool mod_runtime_commit(const fs::path& rom_path, std::string* error) {
+bool resolve_required_assets(Runtime& runtime, bool allow_picker,
+                             std::string* error) {
+    for (const auto& [id, versions] : runtime.packages) {
+        (void)versions;
+        const Package* package = selected_package(runtime, id);
+        if (!package || !target_matches(*package, runtime))
+            continue;
+        PackageSelection& selection = package_selection(runtime, *package);
+        for (const RequiredAsset& asset : package->required_assets) {
+            const Feature* owner = find_feature(*package, asset.feature_id);
+            if (!owner || !feature_enabled(runtime, *package, *owner)) continue;
+            RequiredAssetPickerSpec spec = required_asset_spec(asset);
+            bind_required_asset_spec(&spec);
+            const auto prior = selection.asset_paths.find(asset.id);
+            const std::string path = prior == selection.asset_paths.end()
+                ? std::string{} : prior->second;
+            // persist_cache=false means this only uses state.toml. The dummy
+            // child path supplies the executable directory for the platform
+            // picker without creating a sidecar cache.
+            const fs::path picker_argv0 = runtime.root.parent_path() /
+                                          "gbarecomp-mod-asset-picker.exe";
+            AssetResult resolved = allow_picker
+                ? resolve_asset(path, spec.spec, picker_argv0.string())
+                : validate_asset_path(path, spec.spec);
+            if (!resolved.ok) {
+                set_error(error, "Required asset '" + asset.name +
+                                 "' was not accepted: " + resolved.error);
+                return false;
+            }
+            selection.asset_paths[asset.id] = resolved.path;
+        }
+    }
+    return true;
+}
+
+bool mod_runtime_commit_impl(const fs::path& rom_path, bool allow_picker,
+                             std::string* error) {
     Runtime& runtime = state();
     if (!runtime.initialized) return true;
+    runtime.committed_asset_paths.clear();
+    runtime.committed_options.clear();
     if (!rom_path.empty()) {
         std::string digest;
         if (!sha1_file(rom_path, digest, &runtime.error)) {
@@ -1806,6 +2077,12 @@ bool mod_runtime_commit(const fs::path& rom_path, std::string* error) {
             return false;
         }
     }
+    // Only the launcher provider's Commit action may open a picker. Normal
+    // runtime/headless commits remain noninteractive and fail closed.
+    if (!resolve_required_assets(runtime, allow_picker, &runtime.error)) {
+        set_error(error, runtime.error);
+        return false;
+    }
     runtime.validation = validate(runtime);
     if (!runtime.validation.ok) {
         runtime.error = "Resolve the highlighted mod conflicts before Play.";
@@ -1817,18 +2094,64 @@ bool mod_runtime_commit(const fs::path& rom_path, std::string* error) {
         return false;
     }
     runtime.committed = runtime.validation;
+    for (const auto& [id, versions] : runtime.packages) {
+        (void)versions;
+        const Package* package = selected_package(runtime, id);
+        if (!package || !target_matches(*package, runtime))
+            continue;
+        const PackageSelection& selection = package_selection(runtime, *package);
+        for (const Option& option : package->options) {
+            const Feature* owner = find_feature(*package, option.feature_id);
+            if (owner && feature_enabled(runtime, *package, *owner))
+                runtime.committed_options[package->id][owner->id][option.id] =
+                    option_value(runtime, *package, *owner, option);
+        }
+        for (const RequiredAsset& asset : package->required_assets) {
+            const Feature* owner = find_feature(*package, asset.feature_id);
+            if (!owner || !feature_enabled(runtime, *package, *owner)) continue;
+            const auto path = selection.asset_paths.find(asset.id);
+            if (path != selection.asset_paths.end())
+                runtime.committed_asset_paths[package->id][asset.id] = path->second;
+        }
+    }
     runtime.error.clear();
     return true;
+}
+
+bool mod_runtime_commit(const fs::path& rom_path, std::string* error) {
+    return mod_runtime_commit_impl(rom_path, false, error);
 }
 
 void mod_runtime_activate_plugins() {
     Runtime& runtime = state();
     if (!runtime.initialized) return;
     runtime.adaptive_view_enabled = false;
+    runtime.view_width = 0;
+    // Presentation belongs to the currently committed plugin set. Clear the
+    // old immutable buffer before reset callbacks so disabling/recommitting a
+    // package can never leave a stale foreign frame on screen.
+    gba::foreign_presentation_internal::clear();
+    // Registration alone must never alter guest behavior. Every activation
+    // pass starts from stock entry-hook state; selected trusted plugins opt in
+    // again from their activation callback.
+    gba_mod_disable_all_function_hooks();
+    // PCM registration is inert. Reset restores both its bounded voice pool
+    // and disabled-source state before the selected trusted plugin opts in.
+    gba_mod_audio_reset();
     for (GBAModActivationCallback callback : reset_callbacks())
         if (callback) callback();
-    for (const ResolvedPlugin& plugin : runtime.committed.plugins)
-        if (plugin.callback) plugin.callback();
+    for (const ResolvedPlugin& plugin : runtime.committed.plugins) {
+        if (!plugin.callback) continue;
+        // No plugin-facing header exposes this gate. The local destructor
+        // closes it on every callback exit path.
+        gbarecomp::mod_audio_engine_private::begin_stream_activation();
+        struct CloseStreamActivation {
+            ~CloseStreamActivation() {
+                gbarecomp::mod_audio_engine_private::end_stream_activation();
+            }
+        } close_stream_activation;
+        plugin.callback();
+    }
 }
 
 const RecompLauncherCModProvider* mod_runtime_launcher_provider() {
@@ -1837,6 +2160,15 @@ const RecompLauncherCModProvider* mod_runtime_launcher_provider() {
 #else
     return nullptr;
 #endif
+}
+
+const char* mod_runtime_required_asset_path(const std::string& package_id,
+                                            const std::string& asset_id) {
+    const Runtime& runtime = state();
+    const auto package = runtime.committed_asset_paths.find(package_id);
+    if (package == runtime.committed_asset_paths.end()) return nullptr;
+    const auto asset = package->second.find(asset_id);
+    return asset == package->second.end() ? nullptr : asset->second.c_str();
 }
 
 }  // namespace gbarecomp
@@ -1869,6 +2201,150 @@ extern "C" int gba_mod_set_adaptive_view_enabled(int enabled) {
 
 extern "C" int gba_mod_adaptive_view_enabled(void) {
     return gbarecomp::state().adaptive_view_enabled ? 1 : 0;
+}
+
+extern "C" int gba_mod_set_view_width(int width) {
+    if (width != 0 && (width < 240 || width > 65535)) return 0;
+    gbarecomp::state().view_width = width;
+    return 1;
+}
+
+extern "C" int gba_mod_view_width(void) {
+    return gbarecomp::state().view_width;
+}
+
+extern "C" const char* gba_mod_option_value(
+    const char* package_id, const char* feature_id, const char* option_id) {
+    if (!package_id || !feature_id || !option_id) return nullptr;
+    const auto& options = gbarecomp::state().committed_options;
+    const auto package = options.find(package_id);
+    if (package == options.end()) return nullptr;
+    const auto feature = package->second.find(feature_id);
+    if (feature == package->second.end()) return nullptr;
+    const auto option = feature->second.find(option_id);
+    return option == feature->second.end() ? nullptr : option->second.c_str();
+}
+
+extern "C" int gba_mod_publish_foreign_background(const char* plugin_id,
+                                                    const uint16_t* pixels) {
+    if (!plugin_id || !pixels || !gbarecomp::valid_id(plugin_id)) return 0;
+    const auto& plugins = gbarecomp::state().committed.plugins;
+    const auto found = std::find_if(plugins.begin(), plugins.end(),
+        [plugin_id](const gbarecomp::ResolvedPlugin& plugin) {
+            return plugin.id == plugin_id;
+        });
+    if (found == plugins.end()) return 0;
+    gba::foreign_presentation_internal::set_background(pixels);
+    return 1;
+}
+
+extern "C" void gba_mod_clear_foreign_background(void) {
+    gba::foreign_presentation_internal::set_background(nullptr);
+}
+
+extern "C" int gba_mod_publish_foreign_obj_focus(
+    const char* plugin_id, const GbaForeignObjFocusTransform* focus) {
+    if (!plugin_id || !focus || !gbarecomp::valid_id(plugin_id) ||
+        focus->abi_version != GBA_FOREIGN_OBJ_FOCUS_ABI_VERSION ||
+        focus->source_radius_x > gba::GbaPpu::kScreenWidth ||
+        focus->source_radius_y > gba::GbaPpu::kScreenHeight ||
+        (focus->source_obj_scale_q8_8 != 0 &&
+         (focus->source_obj_scale_q8_8 < GBA_FOREIGN_OBJ_FOCUS_SCALE_MIN_Q8_8 ||
+          focus->source_obj_scale_q8_8 > GBA_FOREIGN_OBJ_FOCUS_SCALE_MAX_Q8_8 ||
+          (focus->flags & GBA_FOREIGN_OBJ_FOCUS_SOURCE_TILE_RANGE) == 0)) ||
+        focus->reserved != 0 ||
+         focus->hud_bg_layer_mask > 0x0fu ||
+         focus->hud_bg_map_rect_count > GBA_FOREIGN_OBJ_FOCUS_MAX_HUD_BG_MAP_RECTS ||
+         focus->hud_bg_reserved != 0 ||
+         ((focus->hud_bg_map_rect_count == 0 &&
+           (focus->hud_bg_layer_mask != 0 ||
+            focus->hud_bg_map_tile_x != 0 || focus->hud_bg_map_tile_y != 0 ||
+            focus->hud_bg_map_tile_width != 0 || focus->hud_bg_map_tile_height != 0 ||
+            focus->hud_bg_output_x != 0 || focus->hud_bg_output_y != 0 ||
+            focus->hud_bg_output_width != 0 || focus->hud_bg_output_height != 0)) ||
+          (focus->hud_bg_map_rect_count == 1 &&
+           (focus->hud_bg_layer_mask == 0 ||
+            focus->hud_bg_map_tile_width == 0 || focus->hud_bg_map_tile_height == 0 ||
+            focus->hud_bg_map_tile_x >= 64 || focus->hud_bg_map_tile_y >= 64 ||
+            static_cast<unsigned>(focus->hud_bg_map_tile_x) + focus->hud_bg_map_tile_width > 64 ||
+            static_cast<unsigned>(focus->hud_bg_map_tile_y) + focus->hud_bg_map_tile_height > 64 ||
+            focus->hud_bg_output_width == 0 || focus->hud_bg_output_height == 0 ||
+            focus->hud_bg_output_x >= gba::GbaPpu::kScreenWidth ||
+            focus->hud_bg_output_y >= gba::GbaPpu::kScreenHeight ||
+            static_cast<unsigned>(focus->hud_bg_output_x) + focus->hud_bg_output_width > gba::GbaPpu::kScreenWidth ||
+            static_cast<unsigned>(focus->hud_bg_output_y) + focus->hud_bg_output_height > gba::GbaPpu::kScreenHeight))) ||
+        (focus->flags & ~(GBA_FOREIGN_OBJ_FOCUS_PRESERVE_UNFOCUSED |
+                          GBA_FOREIGN_OBJ_FOCUS_ORIGIN_ONLY |
+                          GBA_FOREIGN_OBJ_FOCUS_SOURCE_TILE_RANGE |
+                          GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_LARGE_NEARBY |
+                          GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_NEARBY_NONMATCHING |
+                          GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_NONMATCHING_EXCEPT_HUD_OAM)) != 0 ||
+        ((focus->flags &
+          GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_NONMATCHING_EXCEPT_HUD_OAM) != 0 &&
+         (focus->flags & GBA_FOREIGN_OBJ_FOCUS_SOURCE_TILE_RANGE) == 0) ||
+        ((focus->flags & GBA_FOREIGN_OBJ_FOCUS_SOURCE_TILE_RANGE) != 0 &&
+         (focus->source_obj_tile_count == 0 ||
+          focus->source_obj_tile_base >= 1024u ||
+          static_cast<unsigned>(focus->source_obj_tile_base) +
+              static_cast<unsigned>(focus->source_obj_tile_count) > 1024u ||
+          (focus->source_aux_obj_tile_count != 0 &&
+           (focus->source_aux_obj_tile_base >= 1024u ||
+            static_cast<unsigned>(focus->source_aux_obj_tile_base) +
+                static_cast<unsigned>(focus->source_aux_obj_tile_count) > 1024u))))) {
+        return 0;
+    }
+    const auto& plugins = gbarecomp::state().committed.plugins;
+    const auto found = std::find_if(plugins.begin(), plugins.end(),
+        [plugin_id](const gbarecomp::ResolvedPlugin& plugin) {
+            return plugin.id == plugin_id;
+        });
+    if (found == plugins.end()) return 0;
+    gba::foreign_presentation_internal::set_obj_focus(focus);
+    return 1;
+}
+
+extern "C" void gba_mod_clear_foreign_obj_focus(void) {
+    gba::foreign_presentation_internal::set_obj_focus(nullptr);
+}
+
+extern "C" int gba_mod_publish_foreign_screen_overlay(
+    const char* plugin_id, const GbaForeignScreenOverlay* overlay) {
+    if (!plugin_id || !overlay || !gbarecomp::valid_id(plugin_id) ||
+        overlay->abi_version != GBA_FOREIGN_SCREEN_OVERLAY_ABI_VERSION ||
+        !overlay->pixels || !overlay->alpha_q4 ||
+        overlay->width == 0 || overlay->height == 0 ||
+        overlay->width > GBA_FOREIGN_SCREEN_OVERLAY_MAX_WIDTH ||
+        overlay->height > GBA_FOREIGN_SCREEN_OVERLAY_MAX_HEIGHT ||
+        overlay->stride < overlay->width ||
+        overlay->stride > GBA_FOREIGN_SCREEN_OVERLAY_MAX_WIDTH ||
+        overlay->reserved16 != 0 ||
+        overlay->reserved32 != 0) {
+        return 0;
+    }
+    // Validate the complete bounded alpha plane at the authorization boundary.
+    // The PPU also skips a later corrupted texel so a plugin cannot turn a
+    // stale/mutable descriptor into an out-of-contract visible write.
+    for (std::uint32_t y = 0; y < overlay->height; ++y)
+        for (std::uint32_t x = 0; x < overlay->width; ++x)
+            if (overlay->alpha_q4[y * overlay->stride + x] > 16u) return 0;
+    const auto& plugins = gbarecomp::state().committed.plugins;
+    const auto found = std::find_if(plugins.begin(), plugins.end(),
+        [plugin_id](const gbarecomp::ResolvedPlugin& plugin) {
+            return plugin.id == plugin_id;
+        });
+    if (found == plugins.end()) return 0;
+    gba::foreign_presentation_internal::set_screen_overlay(overlay);
+    return 1;
+}
+
+extern "C" void gba_mod_clear_foreign_screen_overlay(void) {
+    gba::foreign_presentation_internal::set_screen_overlay(nullptr);
+}
+
+extern "C" const char* gba_mod_required_asset_path(
+    const char* package_id, const char* asset_id) {
+    if (!package_id || !asset_id) return nullptr;
+    return gbarecomp::mod_runtime_required_asset_path(package_id, asset_id);
 }
 
 extern "C" int gba_mod_runtime_initialize_c(

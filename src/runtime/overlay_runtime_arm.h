@@ -28,6 +28,8 @@ extern const GbaOverlayCallbacks* g_ovl;
 #define g_runtime_cycles (*g_ovl->runtime_cycles)
 #define g_runtime_break_pc (*g_ovl->runtime_break_pc)
 #define g_runtime_fn_entry_hook (*g_ovl->runtime_fn_entry_hook)
+#define g_runtime_trace_enabled (*g_ovl->runtime_trace_enabled)
+#define g_runtime_waits (*g_ovl->runtime_waits)
 
 // CPSR flag accessors (generated code uses cpsr_c for ADC/SBC carry-in).
 static inline uint32_t cpsr_n(void) { return (g_ovl->cpu->cpsr & CPSR_N_BIT) ? 1u : 0u; }
@@ -58,10 +60,22 @@ static inline void arm_set_nzcv_sbc(uint32_t a, uint32_t b, uint32_t ci, uint32_
 
 // ── Dispatch / call-return ──
 static inline void runtime_dispatch(uint32_t pc) { g_ovl->runtime_dispatch(pc); }
+static inline int gba_mod_function_entry(uint32_t pc, int thumb,
+                                         ArmCpuState* cpu) {
+    return g_ovl->gba_mod_function_entry(pc, thumb, cpu);
+}
 static inline void runtime_dispatch_with_exchange(uint32_t pc) { g_ovl->runtime_dispatch_with_exchange(pc); }
 static inline void runtime_call_push_return(uint32_t pc) { g_ovl->runtime_call_push_return(pc); }
 static inline int  runtime_call_should_return(uint32_t pc) { return g_ovl->runtime_call_should_return(pc); }
 static inline void runtime_call_cancel_return(uint32_t pc) { g_ovl->runtime_call_cancel_return(pc); }
+
+// Guaranteed tail transfers (see runtime_arm.h). Overlays are only ever built
+// natively (gcc as C++, tcc as C), so the shim carries the native expansion
+// alone: byte-for-byte the historical `call; return` text, through the thunks
+// above, with no new callback and no ABI change.
+#define GBARECOMP_TAIL_CALL(fn) fn(); return
+#define GBARECOMP_TAIL_DISPATCH(pc) runtime_dispatch(pc); return
+#define GBARECOMP_TAIL_DISPATCH_WITH_EXCHANGE(pc) runtime_dispatch_with_exchange(pc); return
 
 // ── Timing / scheduling ──
 static inline void runtime_tick(uint32_t c) { g_ovl->runtime_tick(c); }
@@ -69,10 +83,14 @@ static inline int  runtime_should_yield(void) { return g_ovl->runtime_should_yie
 static inline void runtime_idle_backedge(uint32_t pc) { g_ovl->runtime_idle_backedge(pc); }
 static inline uint32_t runtime_mem_cycles(uint32_t a, uint32_t w, uint32_t s) { return g_ovl->runtime_mem_cycles(a, w, s); }
 static inline uint32_t runtime_mul_cycles(uint32_t rs, uint32_t sv, uint32_t ex) { return g_ovl->runtime_mul_cycles(rs, sv, ex); }
+static inline uint32_t runtime_exception_return_refill(uint32_t pc) { return g_ovl->runtime_exception_return_refill(pc); }
+static inline uint32_t runtime_prefetch_stall_delta(uint32_t w, uint32_t pc, uint32_t t) { return g_ovl->runtime_prefetch_stall_delta(w, pc, t); }
+#include "runtime_wait_inline.h"  // runtime_refill_cycles, runtime_prefetch_adjust
 
 // ── Exceptions / PSR / mode ──
 static inline void runtime_swi(uint32_t imm) { g_ovl->runtime_swi(imm); }
 static inline void runtime_irq(uint32_t ret) { g_ovl->runtime_irq(ret); }
+#define GBARECOMP_TAIL_SWI(imm) runtime_swi(imm); return
 static inline uint32_t runtime_mrs_cpsr(void) { return g_ovl->runtime_mrs_cpsr(); }
 static inline uint32_t runtime_mrs_spsr(void) { return g_ovl->runtime_mrs_spsr(); }
 static inline void runtime_msr_cpsr(uint32_t v, uint32_t m) { g_ovl->runtime_msr_cpsr(v, m); }
@@ -84,5 +102,6 @@ static inline void runtime_restore_cpsr_from_spsr(void) { g_ovl->runtime_restore
 
 // ── Instrumentation ──
 static inline void runtime_insn_fp(void) { g_ovl->runtime_insn_fp(); }
+static inline int runtime_trace_enabled(void) { return g_runtime_trace_enabled != 0u; }
 static inline void runtime_trace_event(uint32_t k, uint32_t pc, uint32_t a, uint32_t v, uint32_t aux) { g_ovl->runtime_trace_event(k, pc, a, v, aux); }
 static inline void runtime_unimplemented_op(const char* op, uint32_t pc) { g_ovl->runtime_unimplemented_op(op, pc); }

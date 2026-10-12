@@ -9,8 +9,31 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 namespace gbarecomp {
+struct GbaNetplayLaunch;
+
+struct TouchFrameInfo;   // touch_input.h
+class HostOverlay;       // host_overlay.h
+
+// Read-only state published to an opted-in game's extended-view policy once
+// per emulated frame. The shared runtime owns the wider surface; the game owns
+// the decision about whether the current scene has authentic margin content.
+// Keeping this view deliberately small avoids exposing mutable bus internals.
+struct ExtendedViewFrameInfo {
+    std::uint64_t frame_count = 0;
+    std::uint32_t view_width = 240;
+    std::uint32_t extra_left = 0;
+    std::uint32_t extra_right = 0;
+    std::uint32_t view_height = 160;
+    std::uint32_t extra_top = 0;
+    std::uint32_t extra_bottom = 0;
+    const std::uint8_t* io = nullptr;
+    std::size_t io_size = 0;
+    // Changes on restoration, not on multiplayer instance switches.
+    std::uint64_t state_epoch = 0;
+};
 
 // Per-game built-in defaults baked into a game runner at compile time.
 // Lets a standalone release .exe (e.g. MinishCapRecomp.exe) ship
@@ -22,6 +45,8 @@ namespace gbarecomp {
 // constants from GbaBios, empty ROM hash that forces the user to
 // provide --config or --rom-sha1).
 struct RunOptions {
+    // Optional adapter installed by games that link gbarecomp_netplay.
+    std::shared_ptr<GbaNetplayLaunch> netplay;
     const char*   builtin_game_name = nullptr;
     const char*   builtin_rom_sha1  = nullptr;
     // Additional accepted ROM identities. SHA-1 is the cartridge gate; the
@@ -38,8 +63,9 @@ struct RunOptions {
     // Packages target this stable ID plus builtin_rom_sha1 and may activate
     // only trusted callbacks statically registered by the game executable.
     const char* mod_game_id = nullptr;
-    // Make an adaptive-view feature authoritative over legacy TOML, CLI, and
-    // environment inputs. Games with unrelated catalogs leave this false.
+    // Make a view feature authoritative over legacy TOML, CLI, and environment
+    // inputs, including its fixed/initial width request. Games with unrelated
+    // catalogs leave this false.
     bool mod_owns_adaptive_view = false;
 
     // Extended horizontal view is a game-owned enhancement capability, not a
@@ -54,7 +80,60 @@ struct RunOptions {
     // --resize-view; an accompanying --view-width may seed the initial
     // windowed aspect, while adaptive fullscreen follows the host display.
     std::uint16_t max_resize_view_width = 240;
+    // Vertical margins require game-authored scenery/OBJ providers. This
+    // independent opt-in leaves every existing game's height at 160.
+    std::uint16_t max_resize_view_height = 160;
     bool resize_driven_view = false;
+
+    // How a resize-driven view picks its logical size from the drawable.
+    //   Aspect  — keep 160 lines, widen with the window aspect (desktop; the
+    //             established behaviour).
+    //   Density — keep a physical logical-pixel size (touch devices), growing
+    //             BOTH axes on large screens (see density_driven_view_geometry).
+    // --view-density / GBARECOMP_VIEW_DENSITY force Density for development.
+    enum class ViewSizing : std::uint8_t { Aspect = 0, Density = 1 };
+    ViewSizing resize_view_sizing = ViewSizing::Aspect;
+    float density_mm_per_logical_px = 0.30f;
+
+    // Per-present presentation request from the game's scene policy. Scenes
+    // without authored margins (battles, full-screen menus) can ask for the
+    // exact native 240x160 view so it is drawn as large as possible, and, in
+    // portrait, anchored to the top of the screen so host-drawn controls get
+    // the space below. Null keeps the resize-driven geometry for every scene.
+    struct PresentationRequest {
+        bool native_view = false;
+        bool anchor_top = false;
+    };
+    void (*presentation_request)(PresentationRequest* request) = nullptr;
+
+    // Resume the suspend state written when the OS backgrounded the app, if
+    // the process was killed before returning to the foreground (mobile).
+    bool resume_suspend_state_on_launch = false;
+
+    // Device orientation policy on platforms that rotate (Android). Landscape
+    // is the historical default; Any follows the sensor with live re-layout.
+    enum class Orientation : std::uint8_t { Landscape = 0, Portrait = 1, Any = 2 };
+    Orientation orientation = Orientation::Landscape;
+
+    // Host-window presentation policy, independent of extended guest view.
+    // When true the player may freely reshape a window while SDL keeps the
+    // native game image aspect-correct with letter/pillar boxing.
+    bool freely_resizable_window = false;
+
+    // Player-facing diagnostics. The counter reports actual presents per
+    // second in the native window title; games may ship it enabled while
+    // retaining the shared hotkey/menu toggle.
+    bool show_fps_by_default = false;
+
+    // Optional shared Assist Tools surface. Games opt into the menu and choose
+    // its resource bounds; the implementation remains engine-owned and
+    // reusable. Slot hotkeys continue to cover 1-9, while menus can reach 10.
+    bool expose_assist_tools = false;
+    bool assist_tools_enabled_by_default = true;
+    std::uint8_t assist_fast_forward_multiplier_default = 4;
+    std::uint8_t save_state_slot_count = 9;
+    std::uint8_t rewind_history_seconds = 0;
+    std::uint8_t rewind_capture_interval_frames = 15;
 
     // Optional game-owned content initializer. Called exactly once, after the
     // first non-native view has been authorized and applied. For a fixed view
@@ -63,6 +142,53 @@ struct RunOptions {
     // the generated function-entry fast path too.
     void (*extended_view_init)(std::uint32_t extra_left,
                                std::uint32_t extra_right) = nullptr;
+
+    // Optional game-owned per-frame margin policy. It runs at the start of an
+    // emulated frame, before scanline 0 is composed, and again immediately
+    // after a live adaptive resize. Games may use the read-only PPU registers
+    // above to select shared margin providers/pillarboxing. Null leaves the
+    // established renderer behavior unchanged.
+    void (*extended_view_frame)(const ExtendedViewFrameInfo* frame) = nullptr;
+
+    // ---- game-owned touch input policy (touch_input.h) ----------------------
+    // Called once per emulated frame at VBlank start — before the VBlank IRQ
+    // is raised, so the guest's input read for that frame observes the
+    // result — with the frame's touch events, recognized gestures and live
+    // pointers. Returns an ACTIVE-LOW KEYINPUT mask that is ANDed with the
+    // host keys (0x03FF = synthesize nothing). Runs on the guest thread, so
+    // it may read guest memory, but it must only STEER through the returned
+    // keys: guest state is never written by the policy. Null leaves the
+    // established input path byte-identical. Suspended during input replay
+    // (the recorded trace already contains the composed keys).
+    std::uint16_t (*input_frame)(const TouchFrameInfo* frame) = nullptr;
+
+    // Gestures the game's policy owns (TouchClaim bits). An unclaimed
+    // long-press still opens the runtime settings menu; a three-finger tap
+    // always does.
+    std::uint32_t touch_gesture_claims = 0;
+
+    // Virtual gamepad overlay default when config.ini has no saved choice:
+    // -1 = platform default (on for Android, off on desktop), 0 = off, 1 = on.
+    // The player toggles it with the corner button; the choice persists.
+    int touch_pad_default = -1;
+
+    // Optional host-drawn presentation layer (host_overlay.h). Called on every
+    // present after the game image, before the settings menu; guest thread.
+    void (*host_overlay)(HostOverlay* overlay) = nullptr;
+
+    // Optional game-owned debug TCP commands (JSON line in, JSON line out).
+    // Return non-zero when the request was handled and `reply` was written
+    // through `write` (may be called repeatedly to stream a large reply).
+    int (*tcp_command)(const char* request,
+                       void (*write)(void* ctx, const char* data, std::size_t len),
+                       void* write_ctx) = nullptr;
+
+    // Optional game-owned rings for session diagnostics: write one JSON value
+    // through `write`. The runtime persists it, with the engine touch rings,
+    // to diagnostics/session-*.json whenever the app is backgrounded or exits,
+    // so an untethered (no adb/TCP) session can be analysed afterwards.
+    void (*diagnostics_snapshot)(void (*write)(void* ctx, const char* data, std::size_t len),
+                                 void* write_ctx) = nullptr;
 
     // This cartridge carries a solar sensor. Unlike the RTC there is no ROM
     // signature to detect one from, so it has to be declared. Games that leave
@@ -146,6 +272,17 @@ struct RunOptions {
     const char* launcher_save_path = nullptr;   // explicit save file (game.toml
                                                 // [save].path); null => <rom>.sav
                                                 // derived from the seeded ROM
+    // Opt into recomp-ui's verified IPS/IPS32/BPS source-ROM patch surface.
+    // Patched images are generated under the executable's mods/rom-patches
+    // cache; the original ROM and patch file are never modified.
+    bool launcher_enable_rom_patches = false;
+    const char* launcher_rom_patch_note = nullptr;
+    // Translation-specific builds can verify a stock source independently
+    // from builtin_rom_sha1 (the target image the generated corpus expects).
+    const char* launcher_source_rom_sha1 = nullptr;
+    // Lowercase SHA-1 of the only accepted patched output for a corpus built
+    // against one translation release. Null leaves data-only patches open.
+    const char* launcher_required_patch_sha1 = nullptr;
     // Keep an implemented extended-view mode out of the public launcher while
     // it is still being profiled. Explicit CLI/TOML opt-ins remain available.
     // Defaults true so existing games (including MMZ) retain today's UI.

@@ -67,6 +67,13 @@ public:
     // the number actually written. Used by the host audio backend
     // and by the TCP audio_samples command.
     std::size_t drain_samples(int16_t* out, std::size_t max);
+    // Drop host playback only; preserve deterministic mixer/FIFO state.
+    void discard_output() { ring_tail_ = ring_head_; }
+
+    // Playback-only rate tags are deliberately absent from serialized state.
+    // Unknown restored tags are discarded by this API, never guessed.
+    std::size_t drain_sample_block(int16_t* out, std::size_t max, uint32_t& rate);
+    void discard_playback() { ring_tail_ = ring_head_; }
 
     uint32_t sample_rate() const { return kSystemHz / cycles_per_sample_; }
 
@@ -129,6 +136,8 @@ public:
         int8_t sample = 0;
     };
     static constexpr uint32_t kFifoTraceSize = 1024u;
+    // Opt-in FIFO timer trace, enabled by GBARECOMP_AUDIO_FIFO_TRACE=1.
+    static bool debug_fifo_trace_enabled();
     uint32_t debug_trace_count() const { return trace_count_; }
     FifoTrace debug_trace_entry(uint32_t index) const;
 
@@ -158,6 +167,7 @@ public:
     void deserialize(gbarecomp::debug::SnapshotReader& r);
 
 private:
+    friend class SimulationStateCodec;
     // ── Channel 1: square wave with frequency sweep ──────────────
     struct Sound1 {
         bool     active = false;
@@ -288,6 +298,7 @@ private:
     // Output ring. Mono int16_t samples at kSampleRate. The host
     // audio backend pulls from this in chunks.
     std::vector<int16_t> ring_;
+    std::vector<uint8_t> ring_rate_;
     std::size_t ring_head_ = 0;
     std::size_t ring_tail_ = 0;
     uint64_t    samples_generated_ = 0;
@@ -297,12 +308,13 @@ private:
     std::vector<CapSample> cap_ring_;
     void cap_push(const CapSample& s);
     int16_t current_samples_[kMaxSamplesPerEvent] = {};
+    uint8_t current_sample_rates_[kMaxSamplesPerEvent] = {};
     uint32_t sample_index_ = 0;
-    FifoTrace trace_[kFifoTraceSize] = {};
+    std::vector<FifoTrace> trace_;
     uint32_t trace_write_ = 0;
     uint32_t trace_count_ = 0;
 
-    void ring_push(int16_t s);
+    void ring_push(int16_t s, uint8_t rate_tag);
     void fifo_push_word(DirectFifo& fifo, uint32_t word);
     void fifo_clear_queue(DirectFifo& fifo);
     void fifo_reset(DirectFifo& fifo);

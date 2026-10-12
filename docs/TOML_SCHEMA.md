@@ -75,6 +75,11 @@ note  = "Observed interruptible hot function"
 addr = 0x08002010                # exact THUMB ALU-immediate instruction PC
 note = "Opt-in game enhancement constant"
 
+[[mod_function_hook]]
+addr = 0x08003000                 # exact guest subroutine entry
+mode = "thumb"                   # arm | thumb
+note = "Trusted mod replacement seam"
+
 [[data_range]]
 start = 0x000001A0
 end   = 0x000001C0              # [start, end) — exclusive upper bound
@@ -183,6 +188,32 @@ per-game allowlist, so an opted-in site must be present in the static corpus.
 | `0x100 thumb`   | (nothing)         | One entry from finder. |
 | (nothing)       | `0x100 thumb`     | One entry from manual. |
 | `0x100 thumb`   | `0x100 arm`       | **Error** — mode mismatch. Hand-resolve. |
+
+### `[[mod_function_hook]]` (zero or more)
+
+Declares one reviewed ARM or THUMB function entry that generated code may hand
+to a trusted native mod callback. Codegen emits the guard only when the exact
+`addr` + `mode` pair matches an emitted function root:
+
+```cpp
+if (gba_mod_function_entry(0x08003000u, 1, &g_cpu)) return;
+```
+
+Callbacks start disabled, may decline a call, and on handling one must author
+the post-call `ArmCpuState` (including the caller return PC). The original body
+then does not execute. Badly targeted entries are rejected structurally
+(alignment, image/copy span, data-range, or exclude-function conflict). An
+otherwise valid declaration that matches no static root is a hard codegen
+error, preventing address drift from silently disabling a mod. Self-healed
+and force-interpreted dynamic code use the separately trusted registration
+allowlist described in `MOD_PACKAGES.md`; static ROM roots always require this
+TOML declaration.
+
+| key | type | required | meaning |
+|-----|------|----------|---------|
+| `addr` | int hex | yes | Exact function entry PC. ARM must be word-aligned; THUMB halfword-aligned. |
+| `mode` | string | yes | `"arm"` or `"thumb"`; part of the allowlist identity. |
+| `note` | string | no | Free-form review documentation. |
 
 ### `[[data_range]]` (zero or more)
 
@@ -320,10 +351,55 @@ walk), name the address here to remove it from the dispatch table.
 they conflict; declaring both at the same address is a hard error
 (contradictory intent).
 
+## Overlay configs (`--config` more than once)
+
+`--config` is repeatable. The **first** path is the base config described
+above: it owns `[program]` and `[identity]`, and its hash is verified against
+the actual bytes before anything else runs. Every **later** path is an
+*overlay* — a supplemental config merged on top of the base.
+
+An overlay exists so that machine-generated configuration can compose with a
+hand-authored `game.toml` instead of replacing it. The generated decomp symbol
+overlay (see `SYMBOL_OVERLAY.md`) is the motivating case: it contributes
+hundreds of `[[data_range]]` entries derived from the decomp's own link
+layout, while the game's reviewed `[[extra_func]]`, `[[code_copy]]`,
+`[[jump_table]]` and immediate-override entries — each carrying a `note` that
+records the evidence for it — stay exactly where they are. No tool ever writes
+`game.toml`.
+
+Rules:
+
+| Rule | Behaviour |
+|---|---|
+| `[program]` in an overlay | **abort.** Only the base may define the program. |
+| `[identity]` in an overlay | optional; when present its `sha1` **must equal the base's**, else abort. This binds a generated overlay to the exact binary it was derived from. |
+| `[[extra_func]]` at an (addr, mode) the base already declares | overlay entry **dropped**; the base keeps its name and note. |
+| overlay `[[extra_func]]` the base `[[exclude_func]]`s | dropped, with a warning naming the base's exclusion reason. |
+| overlay `[[extra_func]]` inside a base `[[data_range]]` | dropped, with a warning. |
+| base `[[extra_func]]` inside an overlay `[[data_range]]` | **abort** (ordinary structural validation). Reviewed evidence and the decomp's link layout genuinely disagree; resolve it rather than suppress it. |
+| duplicate `[[data_range]]` / `[[code_copy]]` / `[[jump_table]]` / `[[exclude_func]]` | redundant duplicate dropped, base's copy kept. |
+| everything else | appended. |
+
+The base always wins, which is the same precedence the function finder applies
+downstream: base seeds are registered first and the first seed for an
+(addr, mode) supplies the name.
+
+Structural validation re-runs over the merged result, so an overlay cannot
+smuggle in a contradiction the base alone would have rejected.
+
+Each overlay prints its own summary:
+
+```
+[gba_recompile overlay: symbols\AMKE_symbols.toml]
+  extra_func:  +0 (base wins 0, excluded 0, in base data_range 0)
+  data_range:  +132   code_copy: +0   jump_table: +0
+```
+
 ## Precedence and conflict resolution
 
 In order of evaluation:
 
+0. **Overlay merge** — later `--config` files folded into the base as above.
 1. **Identity check** — SHA-1 (and optional MD5) verified against the binary. Mismatch → abort.
 2. **Structural validation** — overlapping `extra_func` + `data_range`, mode disagreements within the TOML, `exclude_func` colliding with `extra_func`. Any → abort with diagnostic.
 3. **Data ranges** registered. Finder will refuse to walk into them.

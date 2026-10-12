@@ -21,6 +21,15 @@
 
 namespace gbarecomp {
 
+// True when every path from `target` overwrites LR before anything reads it,
+// i.e. a BL to `target` is a far branch whose link value can never be
+// returned through (compilers use THUMB BL for jumps beyond B's +/-2 KB).
+// Conservative: any indirect transfer, SWI, MSR, undecodable or out-of-image
+// instruction, or an exhausted budget answers false. Only immutable
+// cartridge ROM / BIOS targets are analysed; RAM code always answers false.
+bool link_register_dead_at(const uint8_t* image, std::size_t image_size,
+                           uint32_t image_base, uint32_t target, bool thumb);
+
 // Body text for `fn` (the inside of `void <name>(void) { ... }`).
 // `names_by_key` maps (addr<<1)|thumb → function name for resolving direct
 // B/BL targets to C calls; an EMPTY map lowers every B/BL to
@@ -31,7 +40,9 @@ std::string emit_function_body_str(
     uint32_t rom_base,
     const std::unordered_map<uint64_t, std::string>& names_by_key,
     const std::unordered_set<uint32_t>*
-        alu_immediate_override_pcs = nullptr);
+        alu_immediate_override_pcs = nullptr,
+    const std::unordered_set<uint64_t>*
+        mod_function_hook_keys = nullptr);
 
 // Thin FILE* wrapper: emit_function_body_str + fputs. Used by the offline
 // tool's write_body() so its output stays byte-identical.
@@ -40,6 +51,8 @@ void emit_function_body(
     std::size_t rom_size, uint32_t rom_base,
     const std::unordered_map<uint64_t, std::string>& names_by_key,
     const std::unordered_set<uint32_t>*
-        alu_immediate_override_pcs = nullptr);
+        alu_immediate_override_pcs = nullptr,
+    const std::unordered_set<uint64_t>*
+        mod_function_hook_keys = nullptr);
 
 }  // namespace gbarecomp

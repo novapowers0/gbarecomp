@@ -6,6 +6,9 @@
 // before any recompiled cart code executes.
 
 #include "../armv4t/runtime_arm.h"
+#include "../armv4t/runtime_context.h"
+#include "runtime_bus_bridge.h"
+#include "multiplayer_slice.h"
 #include "../armv4t/arm_ir.h"
 #include "../armv4t/symbol_lookup.h"
 #include "../gba/gba_bus.h"
@@ -63,6 +66,14 @@ extern "C" unsigned long long g_prof_scanline_count = 0;
 // guest input. It keeps a window responsive while one emulated frame spends a
 // long time in translated software-rendering or decode code.
 std::function<void()> g_host_service_hook;
+// Optional game-owned extended-view policy. It runs on the emulation thread at
+// the exact frame boundary, before scanline 0 of the next frame is composed.
+// Null preserves the established renderer path for every existing game.
+std::function<void()> g_frame_start_hook;
+// Optional host input policy (touch -> synthesized keys). Runs at VBlank start,
+// before the VBlank IRQ is requested, so the guest's per-frame input read sees
+// the policy's answer for this frame. Null preserves the established path.
+std::function<void()> g_vblank_input_hook;
 static const bool g_phase_prof = [] {
     const char* e = std::getenv("GBARECOMP_PHASE_PROF");
     bool on = (e != nullptr) && !(e[0] == '0' && e[1] == '\0');
@@ -81,6 +92,10 @@ static const bool g_phase_prof = [] {
     return on;
 }();
 static unsigned long long g_runtime_yielded_vblank_start = 0;
+static bool g_session_execution = false;
+static bool g_session_instruction_started = false;
+static bool g_session_slice = false, g_session_slice_stopped = false;
+static std::uint64_t g_session_slice_deadline = 0;
 // Live IRQ-handler nesting depth (defined in armv4t/runtime_arm.cpp: ++ on IRQ
 // entry, -- after the handler unwinds). Used by the vblank-yield guard below to
 // avoid yielding while an IRQ handler is on the host stack.
@@ -121,6 +136,17 @@ static unsigned long long g_vcount_spin_progress = 0;
 // Default 0 → normal play / the gcc path are untouched.
 extern "C" unsigned          g_runtime_shadow_tick   = 0;
 extern "C" unsigned long long g_runtime_shadow_cycles = 0;
+
+// Opcode-fetch wait-state table read by generated code (runtime_arm.h): the
+// live copy of the active bus's table (GbaBus::bind_wait_table), power-on
+// values while no bus is active.
+static RuntimeWaitTable power_on_waits() {
+    RuntimeWaitTable t{};
+    gba::waits_reset(t);
+    return t;
+}
+// Declared extern "C" in runtime_arm.h.
+RuntimeWaitTable g_runtime_waits = power_on_waits();
 
 namespace gbarecomp {
 
@@ -203,7 +229,10 @@ static void sampler_loop() {
 }
 
 static void start_sampler() {
-    if (!std::getenv("GBARECOMP_SAMPLE")) return;
+    // Binding an instance is a hot path. Read this launch-time diagnostic
+    // option once: Windows getenv scans/locks the environment on every call.
+    static const bool enabled = std::getenv("GBARECOMP_SAMPLE") != nullptr;
+    if (!enabled) return;
     if (g_sampling.exchange(true)) return;  // start once
     g_sampler = std::thread(sampler_loop);
     std::atexit([] {
@@ -218,7 +247,7 @@ bool should_trace_unmapped_read(uint32_t addr) {
 }
 
 void trace_unmapped_read(uint32_t addr, uint32_t value, uint32_t width) {
-    if (should_trace_unmapped_read(addr)) {
+    if (runtime_trace_enabled() && should_trace_unmapped_read(addr)) {
         runtime_trace_event(RUNTIME_TRACE_MEM_READ, g_cpu.R[15], addr, value,
                             width);
     }
@@ -235,6 +264,12 @@ void sync_bios_access() {
 
 void set_active_bus(gba::GbaBus* bus) {
     g_active_bus = bus;
+    if (bus) {
+        bus->bind_wait_table(&g_runtime_waits);
+    } else if (gba::GbaBus* owner = gba::GbaBus::wait_table_owner()) {
+        owner->bind_wait_table(nullptr);
+        gba::waits_reset(g_runtime_waits);
+    }
     start_sampler();  // no-op unless GBARECOMP_SAMPLE is set
 }
 
@@ -478,6 +513,16 @@ extern "C" uint32_t runtime_mem_cycles(uint32_t addr, uint32_t width,
                : 1u;
 }
 
+extern "C" uint32_t runtime_prefetch_stall_delta(uint32_t wait, uint32_t pc,
+                                                 uint32_t thumb) {
+    const int32_t w = static_cast<int32_t>(wait);
+    if (g_runtime_shadow_tick) {
+        RuntimeWaitTable scratch = g_runtime_waits;
+        return static_cast<uint32_t>(rwt_prefetch_stall(&scratch, w, pc, thumb) - w);
+    }
+    return static_cast<uint32_t>(rwt_prefetch_stall(&g_runtime_waits, w, pc, thumb) - w);
+}
+
 extern "C" uint32_t runtime_mul_cycles(uint32_t rs_value,
                                        uint32_t signed_variant,
                                        uint32_t extra) {
@@ -553,6 +598,10 @@ static void tick_devices(gba::GbaBus* bus, gba::GbaPpu* ppu, uint32_t cycles) {
             ppu->mark_framebuffer_latched();
             ++g_runtime_vblank_starts;
             bus->io().run_timed_dma(1);   // VBlank-timed DMA
+            if (!g_session_execution && g_vblank_input_hook) g_vblank_input_hook();
+        }
+        if (!g_session_execution && events.frame_completed && g_frame_start_hook) {
+            g_frame_start_hook();
         }
         if (events.vblank_started && (ds & 0x0008u)) {
             bus->io().request_irq(gba::GbaIo::IrqVBlank);
@@ -644,6 +693,7 @@ static inline void drain_dma_steal(gba::GbaBus* bus, gba::GbaPpu* ppu) {
 // already accounts for these cycles (runtime_tick debited it as they accrued),
 // so it is left unchanged here.
 extern "C" void runtime_mmio_catch_up(void) {
+    if (g_session_execution) return; // owner has already advanced all devices
     // A shadow/transactional re-run must not materialize the real machine's
     // pending time. The bus observer will reject or diagnose the MMIO access;
     // flushing here first would irreversibly advance PPU/audio/timers despite
@@ -659,6 +709,7 @@ extern "C" void runtime_mmio_catch_up(void) {
 // Recompute the next-event horizon after a config-changing MMIO write (timer
 // reload/control, DISPSTAT, DMA registers, etc. move the next event).
 extern "C" void runtime_resync_horizon(void) {
+    if (g_session_execution) return; // DMA cycle debt is collected by the owner
     // Device stores are suppressed by the shadow transaction's bus observer.
     // Do not drain DMA or rewrite the real scheduler horizon for that rejected
     // store. This also keeps the established shadow-tick promise symmetric with
@@ -675,6 +726,7 @@ extern "C" void runtime_resync_horizon(void) {
 }
 
 extern "C" void runtime_tick(uint32_t cycles) {
+    if (g_session_execution) { g_runtime_cycles += cycles; return; }
     // P6 shadow-tick: a healed shard's validation re-run only accumulates its
     // cycle cost (for the cycle diff); the interpreter pass already pumped the
     // devices / delivered IRQs for this window, so do nothing else here.
@@ -775,6 +827,9 @@ namespace {
 struct IdleSite {
     uint32_t regs[15];                 // R0-R14 at the previous back-edge
     uint32_t cpsr;                     // full CPSR at the previous back-edge
+    // GamePak prefetch-buffer position: part of the timing state, so a loop
+    // is only a fixed point when every iteration starts from the same one.
+    uint32_t prefetched_pc;
     unsigned long long last_cycles;    // g_runtime_cycles at previous back-edge
     unsigned long long last_epoch;     // g_idle_disturb_epoch at previous edge
     unsigned long long period;         // measured per-iteration cycle cost
@@ -801,6 +856,7 @@ static const bool g_idle_elision_on = [] {
 }  // namespace
 
 extern "C" void runtime_idle_backedge(uint32_t header_pc) {
+    if (g_session_execution) return;
     if (!g_idle_elision_on) return;
     if (g_runtime_shadow_tick) return;  // never alter time during a shadow re-run
 
@@ -819,7 +875,8 @@ extern "C" void runtime_idle_backedge(uint32_t header_pc) {
     const bool vcount_only_disturbance =
         vcount_poll && s.valid && epoch == (s.last_epoch + 1ull);
 
-    bool regs_match = s.valid && s.cpsr == g_cpu.cpsr;
+    bool regs_match = s.valid && s.cpsr == g_cpu.cpsr &&
+                      s.prefetched_pc == g_runtime_waits.last_prefetched_pc;
     if (regs_match) {
         for (int i = 0; i < 15; ++i) {
             if (s.regs[i] != g_cpu.R[i]) { regs_match = false; break; }
@@ -873,6 +930,7 @@ extern "C" void runtime_idle_backedge(uint32_t header_pc) {
     // period.
     for (int i = 0; i < 15; ++i) s.regs[i] = g_cpu.R[i];
     s.cpsr = g_cpu.cpsr;
+    s.prefetched_pc = g_runtime_waits.last_prefetched_pc;
     s.last_cycles = g_runtime_cycles;
     s.last_epoch  = g_idle_disturb_epoch;
     s.valid = true;
@@ -892,6 +950,27 @@ std::function<bool()> g_frame_present_hook;
 // runner — one return only frees one frame. Cleared when a hook is (re)set.
 bool g_frame_present_quit = false;
 
+// Present-in-place deliberately preserves the generated host call chain across
+// frames, but some guest script engines keep a call active for thousands of
+// frames. Periodically unwind at a completed VBlank before the fixed generated
+// call-return stack reaches its hard limit. The runner immediately redispatches
+// the already-published PC, so guest execution is unchanged.
+constexpr uint32_t kPresentInPlaceCallDepthLimit = 512u;
+
+uint32_t present_in_place_call_depth_limit() {
+    static const uint32_t limit = [] {
+        const char* value = std::getenv(
+            "GBARECOMP_PRESENT_IN_PLACE_CALL_DEPTH");
+        if (!value || value[0] == '\0')
+            return kPresentInPlaceCallDepthLimit;
+        const unsigned long parsed = std::strtoul(value, nullptr, 0);
+        return parsed > 0u && parsed < 1024u
+            ? static_cast<uint32_t>(parsed)
+            : kPresentInPlaceCallDepthLimit;
+    }();
+    return limit;
+}
+
 void runtime_set_frame_present_hook(std::function<bool()> h) {
     g_frame_present_hook = std::move(h);
     g_frame_present_quit = false;
@@ -901,7 +980,29 @@ void runtime_set_host_service_hook(std::function<void()> h) {
     g_host_service_hook = std::move(h);
 }
 
+void runtime_set_frame_start_hook(std::function<void()> h) {
+    g_frame_start_hook = std::move(h);
+}
+
+void runtime_set_vblank_input_hook(std::function<void()> h) {
+    g_vblank_input_hook = std::move(h);
+}
+
 extern "C" bool runtime_should_yield(void) {
+    if (g_session_execution) {
+        if (gbarecomp::runtime_dispatch_suspended()) return true;
+        auto* bus = gbarecomp::g_active_bus;
+        const bool safe = g_session_slice && bus && gbarecomp::multiplayer_slice_safe(*bus,g_cpu);
+        if (g_session_instruction_started && (!g_session_slice || g_session_slice_stopped ||
+            !safe || g_runtime_cycles >= g_session_slice_deadline))
+            return gbarecomp::runtime_suspend_dispatch();
+        if (bus && bus->io().irq_pending() && !(g_cpu.cpsr & CPSR_I_BIT)) {
+            runtime_irq(g_cpu.R[15]);
+            if (gbarecomp::runtime_dispatch_suspended()) return true;
+        }
+        g_session_instruction_started = true;
+        if (!safe) g_session_slice_stopped = true;
+    }
     auto* bus = gbarecomp::g_active_bus;
 
     // ── BIOS open-bus prefetch latch (MC-HP-002) ─────────────────────────
@@ -915,6 +1016,7 @@ extern "C" bool runtime_should_yield(void) {
     // BIOS. See gba_bus.cpp prefetch_word / the open-bus read paths.
     if (bus && g_cpu.R[15] < 0x00004000u)
         bus->latch_bios_prefetch(g_cpu.R[15], (g_cpu.cpsr & CPSR_T_BIT) != 0);
+    if (g_session_execution) return false;
 
     // Generated direct calls can enter mutable/self-modifying code without
     // crossing runtime_dispatch. Unwind stale AOT at its per-instruction
@@ -961,8 +1063,28 @@ extern "C" bool runtime_should_yield(void) {
             // quit. With no hook (headless/TCP), keep the original unwind path.
             if (g_frame_present_hook) {
                 bool quit = g_frame_present_hook();
-                if (quit) g_frame_present_quit = true;  // sticky: full unwind
-                return quit;
+                if (quit) {
+                    g_frame_present_quit = true;  // sticky: full unwind
+                    return true;
+                }
+                const uint32_t call_depth = runtime_call_stack_depth();
+                const uint32_t call_depth_limit =
+                    present_in_place_call_depth_limit();
+                if (call_depth >= call_depth_limit) {
+                    static unsigned long long forced_unwinds = 0;
+                    ++forced_unwinds;
+                    // Keep the diagnostic useful without flooding stderr in a
+                    // guest that repeatedly builds long-lived script chains.
+                    if ((forced_unwinds & (forced_unwinds - 1u)) == 0u) {
+                        std::fprintf(stderr,
+                            "runtime: present-in-place call-depth unwind "
+                            "depth=%u limit=%u count=%llu pc=0x%08X\n",
+                            call_depth, call_depth_limit, forced_unwinds,
+                            g_cpu.R[15]);
+                    }
+                    return true;
+                }
+                return false;
             }
             return true;
         }
@@ -974,11 +1096,11 @@ extern "C" bool runtime_should_yield(void) {
     // still ticks, so frame counters keep advancing — "no frames" is the
     // wrong signal; "no HALT" is the right one). If we go many seconds of
     // wall-clock with no HALT, snapshot the live M4A state ONCE and keep
-    // running (observation, not a fix). Disable with
-    // GBARECOMP_HANG_WATCHDOG=0; tune seconds with GBARECOMP_HANG_SECONDS.
+    // running (observation, not a fix). Enable with
+    // GBARECOMP_HANG_WATCHDOG=1; tune seconds with GBARECOMP_HANG_SECONDS.
     static const bool wd_on = [] {
         const char* e = std::getenv("GBARECOMP_HANG_WATCHDOG");
-        return !(e && e[0] == '0' && e[1] == '\0');
+        return e && e[0] != '\0' && e[0] != '0';
     }();
     if (wd_on) {
         static const long long wd_secs = [] {
@@ -1015,3 +1137,55 @@ extern "C" bool runtime_should_yield(void) {
     }
     return halted;
 }
+
+namespace gbarecomp {
+void runtime_capture_timing_context(RuntimeTimingContext& out) {
+    out.cycles = g_runtime_cycles;
+    out.vblank_starts = g_runtime_vblank_starts;
+    out.yielded_vblank = g_runtime_yielded_vblank_start;
+    out.pending_cycles = g_pending_cycles;
+    out.event_budget = g_event_budget;
+}
+void runtime_restore_timing_context(const RuntimeTimingContext& in) {
+    g_runtime_cycles = in.cycles;
+    g_runtime_vblank_starts = in.vblank_starts;
+    g_runtime_yielded_vblank_start = in.yielded_vblank;
+    g_pending_cycles = in.pending_cycles;
+    g_event_budget = in.event_budget;
+    // These are speculative idle proofs, not guest state. Invalidating them
+    // on rebinding prevents one machine's proof being applied to another.
+    g_idle_sites.clear();
+    g_last_mmio_read_addr = g_last_mmio_read_width = g_last_mmio_read_pc = 0;
+    g_vcount_spin_progress = 0;
+    ++g_idle_disturb_epoch;
+    ++g_runtime_state_epoch;
+}
+void runtime_session_execution(bool enabled) {
+    g_session_execution = enabled;
+    g_session_instruction_started = false;
+    g_session_slice = false;
+}
+void runtime_session_begin_instruction() {
+    g_session_instruction_started = false; g_session_slice = false;
+}
+void runtime_session_begin_slice(std::uint64_t deadline) {
+    g_session_instruction_started = false; g_session_slice = true;
+    g_session_slice_stopped = false; g_session_slice_deadline = deadline;
+}
+void runtime_session_ram_dispatch_boundary(std::uint32_t pc) {
+    if (!g_session_execution) return;
+    if (g_session_instruction_started) {
+        // The generated caller already installed any return continuation.
+        // Resume at its target after every machine's devices pay the caller's
+        // cycle debt, before even the callback's validation reads take place.
+        g_cpu.R[15]=pc;
+        throw RuntimeDispatchYield{};
+    }
+    // A callback is trusted native coverage, but not decoded by the batching
+    // classifier. Its generated body runs through the reference safe points.
+    g_session_slice=false;
+}
+void runtime_session_tick_devices(std::uint32_t cycles) {
+    if (g_active_bus && g_active_ppu) tick_devices(g_active_bus, g_active_ppu, cycles);
+}
+} // namespace gbarecomp

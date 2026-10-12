@@ -68,4 +68,16 @@ extern const std::size_t kTestCasesCount;
 // Emitted by generated/test_funcs.cpp. One entry per kTestCases slot.
 using TestFn = void (*)(void);
 extern "C" const TestFn       kTestFns[];
+// Same cases re-emitted with the direct branch target resolved to a named
+// function (tc_named_sink), so B emits GBARECOMP_TAIL_CALL and BL a named
+// call. nullptr for cases without a static, non-self branch target.
+extern "C" const TestFn       kNamedTestFns[];
 extern "C" const unsigned     kTestFnsCount;
+
+// The same corpus relocated into cartridge ROM, where fetch wait states and
+// the prefetch buffer apply (one entry per kTestCases slot, emitted at
+// rom_relocated_pc(pc)). Data addresses stay put, below the cartridge.
+inline uint32_t rom_relocated_pc(uint32_t pc) {
+    return pc < 0x08000000u ? pc + 0x08000000u : pc;
+}
+extern "C" const TestFn       kRomTestFns[];

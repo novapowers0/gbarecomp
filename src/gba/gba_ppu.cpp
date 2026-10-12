@@ -1,7 +1,9 @@
 // gba_ppu.cpp — see gba_ppu.h.
 
 #include "gba_ppu.h"
+#include "foreign_presentation_internal.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -22,9 +24,12 @@ extern "C" int (*g_ws_tilemap_provider)(int bg, int hw_x, int screen_y,
 extern "C" int (*g_ws_bg_x_provider)(int bg, int output_x, int screen_y,
                                      int* out_hw_x) = nullptr;
 extern "C" unsigned g_ws_bg_x_provider_layers = 0xFu;
+extern "C" int (*g_ws_bg_xy_provider)(int, int, int, int*, int*) = nullptr;
+extern "C" unsigned g_ws_bg_xy_provider_layers = 0xFu;
 extern "C" int g_ws_affine_filter_enabled = 0;
 extern "C" int (*g_ws_affine_filter_provider)(int, int) = nullptr;
 extern "C" int g_ws_authored_margin_layers = 0;
+extern "C" int g_ws_native_view_left = -1;
 
 // Widescreen pillarbox (Step C policy): when nonzero, the wide path renders the
 // margin columns (outside the central 240) as solid black instead of extended
@@ -37,6 +42,45 @@ extern "C" int (*g_ws_obj_x_provider)(int, int*) = nullptr;
 extern "C" int (*g_ws_obj_attr_x_provider)(int, std::uint16_t,
                                             std::uint16_t, std::uint16_t,
                                             int*) = nullptr;
+// Opt-in OBJ margin policy: clip OBJ pixels to the native 240px viewport in
+// expanded rendering. Games routinely park sprites just past the visible edge
+// (signed 9-bit OAM X, or Y-wrapped); without this clip those parked sprites
+// become visible inside widescreen margins. Default off preserves each
+// established per-game behavior. g_ws_obj_attr_x_provider/g_ws_obj_x_provider
+// still run first, so a game can re-place known-safe HUD sprites and clip the
+// rest.
+extern "C" int g_ws_obj_native_clip = 0;
+extern "C" const WsMarginObjPixel* (*g_ws_obj_margin_provider)(int, int*, int*) = nullptr;
+
+namespace {
+
+// These pointers have no C linkage and are deliberately not declared by the
+// public PPU header. Only the engine-internal seam below can publish them.
+const std::uint16_t* g_foreign_background = nullptr;
+const GbaForeignObjFocusTransform* g_foreign_obj_focus = nullptr;
+const GbaForeignScreenOverlay* g_foreign_screen_overlay = nullptr;
+
+}  // namespace
+
+namespace foreign_presentation_internal {
+
+void set_background(const std::uint16_t* pixels) { g_foreign_background = pixels; }
+const std::uint16_t* background() { return g_foreign_background; }
+void set_obj_focus(const GbaForeignObjFocusTransform* focus) {
+    g_foreign_obj_focus = focus;
+}
+const GbaForeignObjFocusTransform* obj_focus() { return g_foreign_obj_focus; }
+void set_screen_overlay(const GbaForeignScreenOverlay* overlay) {
+    g_foreign_screen_overlay = overlay;
+}
+const GbaForeignScreenOverlay* screen_overlay() { return g_foreign_screen_overlay; }
+void clear() {
+    g_foreign_background = nullptr;
+    g_foreign_obj_focus = nullptr;
+    g_foreign_screen_overlay = nullptr;
+}
+
+}  // namespace foreign_presentation_internal
 
 GbaPpu::GbaPpu()  = default;
 GbaPpu::~GbaPpu() = default;
@@ -62,7 +106,7 @@ void GbaPpu::serialize(gbarecomp::debug::SnapshotWriter& w) const {
         const std::size_t center_x = extra_left_ * 3u;
         for (std::size_t y = 0; y < kScreenHeight; ++y) {
             std::memcpy(center.data() + y * kNativeStride,
-                        latched_fb_.data() + y * wide_stride + center_x,
+                        latched_fb_.data() + (y + extra_top_) * wide_stride + center_x,
                         kNativeStride);
         }
         w.bytes(center.data(), center.size());
@@ -70,6 +114,9 @@ void GbaPpu::serialize(gbarecomp::debug::SnapshotWriter& w) const {
 }
 
 void GbaPpu::deserialize(gbarecomp::debug::SnapshotReader& r) {
+    // Foreign presentation is intentionally not save-state data.  A selected
+    // trusted mod must explicitly republish a newly valid buffer after load.
+    foreign_presentation_internal::clear();
     scanline_        = r.u32();
     dot_in_scanline_ = r.u32();
     cycle_in_dot_    = r.u32();
@@ -101,7 +148,7 @@ void GbaPpu::deserialize(gbarecomp::debug::SnapshotReader& r) {
         const std::size_t wide_stride = render_width() * 3u;
         const std::size_t center_x = extra_left_ * 3u;
         for (std::size_t y = 0; y < kScreenHeight; ++y) {
-            std::memcpy(work_fb_.data() + y * wide_stride + center_x,
+            std::memcpy(work_fb_.data() + (y + extra_top_) * wide_stride + center_x,
                         native_latch.data() + y * kNativeStride,
                         kNativeStride);
         }
@@ -119,6 +166,7 @@ void GbaPpu::deserialize(gbarecomp::debug::SnapshotReader& r) {
 }
 
 void GbaPpu::reset() {
+    foreign_presentation_internal::clear();
     scanline_ = 0;
     dot_in_scanline_ = 0;
     cycle_in_dot_ = 0;
@@ -132,9 +180,8 @@ void GbaPpu::reset() {
 
 void GbaPpu::set_view_margins(uint32_t left, uint32_t right,
                               uint32_t top, uint32_t bottom) {
-    // Clamp each side to its compile-time max. kMaxExtraY is 0 for now, so
-    // top/bottom are forced to 0 (vertical expansion deferred) — the params
-    // stay in the API so callers remain generic.
+    // Geometry alone cannot authorize vertical content. The compositor also
+    // requires authored providers; otherwise those rows stay black.
     const uint32_t next_left = left > kMaxExtraX ? kMaxExtraX : left;
     const uint32_t next_right = right > kMaxExtraX ? kMaxExtraX : right;
     const uint32_t next_top = top > kMaxExtraY ? kMaxExtraY : top;
@@ -221,6 +268,220 @@ constexpr int kSpriteWH[3][4][2] = {
     // vertical
     {{8, 16}, {8, 32}, {16, 32}, {32, 64}},
 };
+
+// Keep the descriptor bounded to the visible native PPU domain. This limits
+// the trusted presentation input without imposing game-specific coordinates.
+bool valid_foreign_obj_focus(const GbaForeignObjFocusTransform* focus) {
+    return focus &&
+           focus->abi_version == GBA_FOREIGN_OBJ_FOCUS_ABI_VERSION &&
+           focus->source_radius_x <= GbaPpu::kScreenWidth &&
+           focus->source_radius_y <= GbaPpu::kScreenHeight &&
+           (focus->source_obj_scale_q8_8 == 0 ||
+            (focus->source_obj_scale_q8_8 >=
+                 GBA_FOREIGN_OBJ_FOCUS_SCALE_MIN_Q8_8 &&
+             focus->source_obj_scale_q8_8 <=
+                 GBA_FOREIGN_OBJ_FOCUS_SCALE_MAX_Q8_8 &&
+             (focus->flags & GBA_FOREIGN_OBJ_FOCUS_SOURCE_TILE_RANGE) != 0)) &&
+           focus->reserved == 0 &&
+           focus->hud_bg_layer_mask <= 0x0fu &&
+           focus->hud_bg_map_rect_count <= GBA_FOREIGN_OBJ_FOCUS_MAX_HUD_BG_MAP_RECTS &&
+           focus->hud_bg_reserved == 0 &&
+           ((focus->hud_bg_map_rect_count == 0 &&
+             focus->hud_bg_layer_mask == 0 &&
+             focus->hud_bg_map_tile_x == 0 && focus->hud_bg_map_tile_y == 0 &&
+             focus->hud_bg_map_tile_width == 0 &&
+             focus->hud_bg_map_tile_height == 0 &&
+             focus->hud_bg_output_x == 0 && focus->hud_bg_output_y == 0 &&
+             focus->hud_bg_output_width == 0 &&
+             focus->hud_bg_output_height == 0) ||
+            (focus->hud_bg_map_rect_count == 1 &&
+             focus->hud_bg_layer_mask != 0 &&
+             focus->hud_bg_map_tile_width != 0 &&
+             focus->hud_bg_map_tile_height != 0 &&
+             focus->hud_bg_map_tile_x < 64 && focus->hud_bg_map_tile_y < 64 &&
+             static_cast<unsigned>(focus->hud_bg_map_tile_x) +
+                     focus->hud_bg_map_tile_width <= 64 &&
+             static_cast<unsigned>(focus->hud_bg_map_tile_y) +
+                     focus->hud_bg_map_tile_height <= 64 &&
+             focus->hud_bg_output_width != 0 &&
+             focus->hud_bg_output_height != 0 &&
+             focus->hud_bg_output_x < GbaPpu::kScreenWidth &&
+             focus->hud_bg_output_y < GbaPpu::kScreenHeight &&
+             static_cast<unsigned>(focus->hud_bg_output_x) +
+                     focus->hud_bg_output_width <= GbaPpu::kScreenWidth &&
+             static_cast<unsigned>(focus->hud_bg_output_y) +
+                     focus->hud_bg_output_height <= GbaPpu::kScreenHeight)) &&
+           (focus->flags & ~(GBA_FOREIGN_OBJ_FOCUS_PRESERVE_UNFOCUSED |
+                             GBA_FOREIGN_OBJ_FOCUS_ORIGIN_ONLY |
+                             GBA_FOREIGN_OBJ_FOCUS_SOURCE_TILE_RANGE |
+                             GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_LARGE_NEARBY |
+                             GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_NEARBY_NONMATCHING |
+                             GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_NONMATCHING_EXCEPT_HUD_OAM)) == 0 &&
+           ((focus->flags &
+             GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_NONMATCHING_EXCEPT_HUD_OAM) == 0 ||
+            (focus->flags & GBA_FOREIGN_OBJ_FOCUS_SOURCE_TILE_RANGE) != 0) &&
+           ((focus->flags & GBA_FOREIGN_OBJ_FOCUS_SOURCE_TILE_RANGE) == 0 ||
+            (focus->source_obj_tile_count != 0 &&
+             focus->source_obj_tile_base < 1024u &&
+             static_cast<unsigned>(focus->source_obj_tile_base) +
+                 static_cast<unsigned>(focus->source_obj_tile_count) <= 1024u &&
+             (focus->source_aux_obj_tile_count == 0 ||
+              (focus->source_aux_obj_tile_base < 1024u &&
+               static_cast<unsigned>(focus->source_aux_obj_tile_base) +
+                   static_cast<unsigned>(focus->source_aux_obj_tile_count) <= 1024u))));
+}
+
+// Keep the portal/effect input small enough to be independently reviewable
+// and to bound all per-scanline pointer arithmetic. Pointer lifetime remains
+// owned by the trusted publishing plugin, just as it does for the existing
+// foreign background/focus descriptors.
+bool valid_foreign_screen_overlay(const GbaForeignScreenOverlay* overlay) {
+    return overlay &&
+           overlay->abi_version == GBA_FOREIGN_SCREEN_OVERLAY_ABI_VERSION &&
+           overlay->pixels && overlay->alpha_q4 &&
+           overlay->width != 0 && overlay->height != 0 &&
+           overlay->width <= GBA_FOREIGN_SCREEN_OVERLAY_MAX_WIDTH &&
+           overlay->height <= GBA_FOREIGN_SCREEN_OVERLAY_MAX_HEIGHT &&
+           overlay->stride >= overlay->width &&
+           overlay->stride <= GBA_FOREIGN_SCREEN_OVERLAY_MAX_WIDTH &&
+           overlay->reserved16 == 0 && overlay->reserved32 == 0;
+}
+
+bool focus_contains(const GbaForeignObjFocusTransform& focus, int x, int y) {
+    const int min_x = static_cast<int>(focus.source_link_feet_x) -
+                      static_cast<int>(focus.source_radius_x);
+    const int max_x = static_cast<int>(focus.source_link_feet_x) +
+                      static_cast<int>(focus.source_radius_x);
+    const int min_y = static_cast<int>(focus.source_link_feet_y) -
+                      static_cast<int>(focus.source_radius_y);
+    const int max_y = static_cast<int>(focus.source_link_feet_y) +
+                      static_cast<int>(focus.source_radius_y);
+    return x >= min_x && x <= max_x && y >= min_y && y <= max_y;
+}
+
+bool foreign_hud_bg_map_contains(const GbaForeignObjFocusTransform* focus,
+                                 uint32_t layer, uint32_t tile_x,
+                                 uint32_t tile_y, uint32_t output_x,
+                                 uint32_t output_y) {
+    return valid_foreign_obj_focus(focus) &&
+           focus->hud_bg_map_rect_count != 0 && layer < 4 &&
+           (focus->hud_bg_layer_mask & (1u << layer)) != 0 &&
+           tile_x >= focus->hud_bg_map_tile_x &&
+           tile_y >= focus->hud_bg_map_tile_y &&
+           tile_x < static_cast<uint32_t>(focus->hud_bg_map_tile_x) +
+                        focus->hud_bg_map_tile_width &&
+           tile_y < static_cast<uint32_t>(focus->hud_bg_map_tile_y) +
+                        focus->hud_bg_map_tile_height &&
+           output_x >= focus->hud_bg_output_x &&
+           output_y >= focus->hud_bg_output_y &&
+           output_x < static_cast<uint32_t>(focus->hud_bg_output_x) +
+                          focus->hud_bg_output_width &&
+           output_y < static_cast<uint32_t>(focus->hud_bg_output_y) +
+                          focus->hud_bg_output_height;
+}
+
+// Presentation-only translation. It reads a trusted immutable descriptor and
+// operates on decoded local coordinates; guest OAM and memory stay untouched.
+enum class ForeignObjFocusAction { kKeep, kTranslate, kSuppress };
+
+struct ForeignObjFocusResult {
+    ForeignObjFocusAction action = ForeignObjFocusAction::kKeep;
+    int scale_q8_8 = GBA_FOREIGN_OBJ_FOCUS_SCALE_IDENTITY_Q8_8;
+};
+
+int round_scaled_offset(int offset, int scale_q8_8) {
+    const int scaled = offset * scale_q8_8;
+    return scaled >= 0 ?
+        (scaled + GBA_FOREIGN_OBJ_FOCUS_SCALE_IDENTITY_Q8_8 / 2) /
+            GBA_FOREIGN_OBJ_FOCUS_SCALE_IDENTITY_Q8_8 :
+        -((-scaled + GBA_FOREIGN_OBJ_FOCUS_SCALE_IDENTITY_Q8_8 / 2) /
+          GBA_FOREIGN_OBJ_FOCUS_SCALE_IDENTITY_Q8_8);
+}
+
+int scaled_extent(int extent, int scale_q8_8) {
+    const int scaled = (extent * scale_q8_8 +
+                        static_cast<int>(GBA_FOREIGN_OBJ_FOCUS_SCALE_IDENTITY_Q8_8) / 2) /
+                       static_cast<int>(GBA_FOREIGN_OBJ_FOCUS_SCALE_IDENTITY_Q8_8);
+    return std::max(1, scaled);
+}
+
+int nearest_source_pixel(int destination_pixel, int source_extent,
+                         int destination_extent) {
+    // Map pixel centers, rather than tile origins, so a nearest-neighbor
+    // downscale retains both edges of an 8x8 source tile.
+    return ((destination_pixel * 2 + 1) * source_extent) /
+           (destination_extent * 2);
+}
+
+ForeignObjFocusResult apply_foreign_obj_focus(int* sx, int* sy, int width,
+                                              int height, uint32_t tile_num,
+                                              bool scale_non_affine,
+                                              uint32_t oam_index) {
+    const GbaForeignObjFocusTransform* focus =
+        foreign_presentation_internal::obj_focus();
+    if (!sx || !sy || width <= 0 || height <= 0 ||
+        !valid_foreign_obj_focus(focus)) {
+        return {};
+    }
+    const bool origin_matches = focus_contains(*focus, *sx, *sy);
+    const bool center_matches =
+        focus_contains(*focus, *sx + width / 2, *sy + height / 2);
+    const bool in_main_range =
+        tile_num >= focus->source_obj_tile_base &&
+        tile_num < static_cast<uint32_t>(focus->source_obj_tile_base) +
+                       focus->source_obj_tile_count;
+    const bool in_aux_range = focus->source_aux_obj_tile_count != 0 &&
+        tile_num >= focus->source_aux_obj_tile_base &&
+        tile_num < static_cast<uint32_t>(focus->source_aux_obj_tile_base) +
+                       focus->source_aux_obj_tile_count;
+    const bool tile_matches =
+        (focus->flags & GBA_FOREIGN_OBJ_FOCUS_SOURCE_TILE_RANGE) == 0 ||
+        in_main_range || in_aux_range;
+    if (!tile_matches) {
+        if ((focus->flags &
+             GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_NONMATCHING_EXCEPT_HUD_OAM) != 0) {
+            // The plugin's exact bit is derived from current gHUD metadata and
+            // this OAM entry, so a playfield OBJ cannot survive by sharing a
+            // broad native priority class with a heart or button glyph.
+            const bool is_hud = oam_index < 64u
+                ? (focus->hud_oam_mask_lo & (UINT64_C(1) << oam_index)) != 0
+                : (focus->hud_oam_mask_hi & (UINT64_C(1) << (oam_index - 64u))) != 0;
+            if (is_hud) return {};
+            return {ForeignObjFocusAction::kSuppress};
+        }
+        const bool nearby = origin_matches || center_matches;
+        const bool suppress_any =
+            (focus->flags & GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_NEARBY_NONMATCHING) != 0;
+        const bool suppress_large =
+            (focus->flags & GBA_FOREIGN_OBJ_FOCUS_SUPPRESS_LARGE_NEARBY) != 0 &&
+            (width >= 32 || height >= 32);
+        if (nearby && (suppress_any || suppress_large)) {
+            return {ForeignObjFocusAction::kSuppress};
+        }
+        return {};
+    }
+    if (!origin_matches &&
+        ((focus->flags & GBA_FOREIGN_OBJ_FOCUS_ORIGIN_ONLY) != 0 ||
+         !center_matches)) {
+        return {};
+    }
+    // Scaling needs the same explicit, bounded source allocation that selects
+    // Link's composite body/shadow. A geometry-only focus may translate but
+    // cannot accidentally resample a nearby guest OBJ.
+    const bool has_bounded_source_tiles =
+        (focus->flags & GBA_FOREIGN_OBJ_FOCUS_SOURCE_TILE_RANGE) != 0;
+    const int scale_q8_8 =
+        scale_non_affine && has_bounded_source_tiles &&
+            focus->source_obj_scale_q8_8 != 0 ?
+        focus->source_obj_scale_q8_8 : GBA_FOREIGN_OBJ_FOCUS_SCALE_IDENTITY_Q8_8;
+    *sx = static_cast<int>(focus->destination_link_feet_x) +
+        round_scaled_offset(*sx - static_cast<int>(focus->source_link_feet_x),
+                            scale_q8_8);
+    *sy = static_cast<int>(focus->destination_link_feet_y) +
+        round_scaled_offset(*sy - static_cast<int>(focus->source_link_feet_y),
+                            scale_q8_8);
+    return {ForeignObjFocusAction::kTranslate, scale_q8_8};
+}
 
 // Convert 16-bit GBA color (0BBBBBGGGGGRRRRR) to 24-bit RGB888.
 inline void to_rgb888(uint16_t c, uint8_t* out) {
@@ -473,7 +734,9 @@ void render_scanline_internal(uint8_t* rgb,
     }
 
     struct PixelCandidate {
+#if !defined(GBARECOMP_SCANLINE_HLE)
         uint8_t rgb[3] = {0, 0, 0};
+#endif
         uint16_t color = 0;
         int key = 0x7FFFFFFF;
         uint8_t layer = 5;
@@ -527,11 +790,30 @@ void render_scanline_internal(uint8_t* rgb,
             return static_cast<uint16_t>((winout >> 8) & 0x3Fu);
         return static_cast<uint16_t>(winout & 0x3Fu);
     };
+#if defined(GBARECOMP_SCANLINE_HLE)
+    // The caller gives an immutable row snapshot. Resolve windows once, not
+    // once per candidate/layer. No cross-row state or VRAM cache is retained.
+    uint8_t row_control[GbaPpu::kScreenWidth];
+    for (uint32_t x = 0; x < kScreenWidth; ++x)
+        row_control[x] = static_cast<uint8_t>(window_control(x));
+#endif
     auto layer_enabled = [&](uint32_t x, uint32_t layer_bit) -> bool {
-        return (window_control(x) & (1u << layer_bit)) != 0;
+        return (
+#if defined(GBARECOMP_SCANLINE_HLE)
+                row_control[x]
+#else
+                window_control(x)
+#endif
+                & (1u << layer_bit)) != 0;
     };
     auto blend_enabled = [&](uint32_t x) -> bool {
-        return (window_control(x) & (1u << 5)) != 0;
+        return (
+#if defined(GBARECOMP_SCANLINE_HLE)
+                row_control[x]
+#else
+                window_control(x)
+#endif
+                & (1u << 5)) != 0;
     };
 
     uint16_t bldcnt = static_cast<uint16_t>(io[0x50] | (io[0x51] << 8));
@@ -542,13 +824,24 @@ void render_scanline_internal(uint8_t* rgb,
 
     PixelCandidate top[GbaPpu::kScreenWidth];
     PixelCandidate second[GbaPpu::kScreenWidth];
+    // This is deliberately a per-layer candidate, not a copy of `top`: a
+    // room BG with higher priority may cover the HUD's BG0 cells. Capturing
+    // only the explicitly declared source map cells keeps that room terrain
+    // out of the foreign frame.
+    PixelCandidate foreign_hud_bg[GbaPpu::kScreenWidth] = {};
+    const GbaForeignObjFocusTransform* foreign_focus =
+        foreign_presentation_internal::obj_focus();
     const uint16_t backdrop_color = load_u16_le(&pal[0]);
+#if !defined(GBARECOMP_SCANLINE_HLE)
     uint8_t backdrop_rgb[3];
     to_rgb888(backdrop_color, backdrop_rgb);
+#endif
     for (uint32_t x = 0; x < kScreenWidth; ++x) {
+#if !defined(GBARECOMP_SCANLINE_HLE)
         top[x].rgb[0] = backdrop_rgb[0];
         top[x].rgb[1] = backdrop_rgb[1];
         top[x].rgb[2] = backdrop_rgb[2];
+#endif
         top[x].color = backdrop_color;
         top[x].key = 0x70000000;
         top[x].layer = 5;
@@ -564,7 +857,9 @@ void render_scanline_internal(uint8_t* rgb,
                       bool target2) {
         PixelCandidate cand;
         cand.color = color;
+#if !defined(GBARECOMP_SCANLINE_HLE)
         to_rgb888(color, cand.rgb);
+#endif
         cand.key = key;
         cand.layer = layer;
         cand.target1 = target1;
@@ -602,6 +897,51 @@ void render_scanline_internal(uint8_t* rgb,
         uint32_t height_px = height_tiles * 8u;
         uint32_t block_cols = width_tiles / 32u;
 
+#if defined(GBARECOMP_SCANLINE_HLE)
+        const uint32_t tex_y = (y + vofs) & (height_px - 1u);
+        const uint32_t tile_y = tex_y >> 3;
+        const uint32_t map_row = screen_base + (tile_y >> 5) * block_cols * 0x800u +
+                                 (tile_y & 31u) * 64u;
+        const int key = static_cast<int>(bg_priority * 256u + 128u + layer);
+        const bool target1 = (first_targets & (1u << layer)) != 0;
+        const bool target2 = (second_targets & (1u << layer)) != 0;
+        for (uint32_t x = 0; x < kScreenWidth;) {
+            const uint32_t tex_x = (x + hofs) & (width_px - 1u);
+            const uint32_t tile_x = tex_x >> 3;
+            const uint32_t begin = tex_x & 7u;
+            const uint32_t count = std::min(8u - begin, kScreenWidth - x);
+            const uint32_t map_off = map_row + (tile_x >> 5) * 0x800u +
+                                     (tile_x & 31u) * 2u;
+            if (map_off + 1u >= 96u * 1024u) { x += count; continue; }
+            const uint16_t entry = load_u16_le(&vram[map_off]);
+            const uint32_t py = (entry & 0x0800u) ? 7u - (tex_y & 7u) : tex_y & 7u;
+            const uint32_t tile_row = char_base + (entry & 0x03FFu) *
+                (color256 ? 64u : 32u) + py * (color256 ? 8u : 4u);
+            const uint32_t palette_bank = (entry >> 12) & 15u;
+            for (uint32_t j = 0; j < count; ++j) {
+                const uint32_t screen_x = x + j;
+                if (!layer_enabled(screen_x, layer)) continue;
+                const uint32_t px = (entry & 0x0400u) ? 7u - (begin + j) : begin + j;
+                const uint32_t addr = tile_row + (color256 ? px : px >> 1);
+                if (addr >= 96u * 1024u) continue;
+                const uint8_t packed = vram[addr];
+                uint32_t index = color256 ? packed : ((px & 1u) ? packed >> 4 : packed & 15u);
+                if (!index) continue;
+                if (!color256) index |= palette_bank << 4;
+                const uint16_t color = load_u16_le(&pal[index * 2]);
+                const bool t1 = blend_enabled(screen_x) && target1;
+                if (foreign_hud_bg_map_contains(foreign_focus, layer, tile_x,
+                                                tile_y, screen_x, y)) {
+                    PixelCandidate& hud = foreign_hud_bg[screen_x];
+                    hud.color = color; hud.key = key;
+                    hud.layer = static_cast<uint8_t>(layer);
+                    hud.target1 = t1; hud.target2 = target2; hud.valid = true;
+                }
+                submit(screen_x, color, key, static_cast<uint8_t>(layer), t1, target2);
+            }
+            x += count;
+        }
+#else
         for (uint32_t x = 0; x < kScreenWidth; ++x) {
             if (!layer_enabled(x, layer)) continue;
             uint32_t tex_x = (x + hofs) & (width_px - 1u);
@@ -640,12 +980,27 @@ void render_scanline_internal(uint8_t* rgb,
             if ((pal_idx & (color256 ? 0xFFu : 0x0Fu)) == 0) continue;
 
             const uint16_t color = load_u16_le(&pal[pal_idx * 2]);
+            if (foreign_hud_bg_map_contains(foreign_focus, layer, tile_x,
+                                            tile_y, x, y)) {
+                PixelCandidate& hud = foreign_hud_bg[x];
+                hud.color = color;
+#if !defined(GBARECOMP_SCANLINE_HLE)
+                to_rgb888(color, hud.rgb);
+#endif
+                hud.key = static_cast<int>(bg_priority * 256u + 128u + layer);
+                hud.layer = static_cast<uint8_t>(layer);
+                hud.target1 = blend_enabled(x) &&
+                    ((first_targets & (1u << layer)) != 0);
+                hud.target2 = (second_targets & (1u << layer)) != 0;
+                hud.valid = true;
+            }
             submit(x, color,
                    static_cast<int>(bg_priority * 256u + 128u + layer),
                    static_cast<uint8_t>(layer),
                    blend_enabled(x) && ((first_targets & (1u << layer)) != 0),
                    (second_targets & (1u << layer)) != 0);
         }
+#endif
     };
 
     auto render_affine_bg = [&](uint32_t layer,
@@ -784,6 +1139,91 @@ void render_scanline_internal(uint8_t* rgb,
         render_bitmap_bg();
     }
 
+    // A bounded host-owned overlay is intentionally a native-world-only
+    // presentation layer. It is composed after every guest BG candidate has
+    // resolved but before the normal guest OBJ pass, so Link/HUD objects remain
+    // in front without any guest OAM/VRAM writes. It retains the synthetic
+    // BG2 identity for native WIN0/WIN1/OBJ-window and color-effect routing,
+    // so room-authored masks and fades still apply. A full foreign background
+    // is authoritative and therefore suppresses this overlay automatically.
+    if (foreign_presentation_internal::background() == nullptr) {
+        if (const auto* overlay = foreign_presentation_internal::screen_overlay();
+            valid_foreign_screen_overlay(overlay)) {
+            const int left = overlay->x;
+            const int top_y = overlay->y;
+            for (unsigned oy = 0; oy < overlay->height; ++oy) {
+                const int screen_y = top_y + static_cast<int>(oy);
+                if (screen_y != static_cast<int>(y)) continue;
+                for (unsigned ox = 0; ox < overlay->width; ++ox) {
+                    const int screen_x = left + static_cast<int>(ox);
+                    if (screen_x < 0 || screen_x >= static_cast<int>(kScreenWidth))
+                        continue;
+                    const unsigned x = static_cast<unsigned>(screen_x);
+                    // This is a native presentation layer, not a window
+                    // bypass. Honor the current BG2 mask at the output pixel.
+                    if (!layer_enabled(x, 2)) continue;
+                    const std::size_t source =
+                        static_cast<std::size_t>(oy) * overlay->stride + ox;
+                    const std::uint8_t alpha = overlay->alpha_q4[source];
+                    // A mutable/corrupt descriptor must fail closed at the
+                    // texel boundary as well as at publish time.
+                    if (alpha == 0 || alpha > 16) continue;
+                    const PixelCandidate old_top = top[x];
+                    PixelCandidate cand;
+                    cand.color = blend_alpha_gba555(overlay->pixels[source],
+                                                     old_top.color, alpha,
+                                                     16u - alpha);
+#if !defined(GBARECOMP_SCANLINE_HLE)
+                    to_rgb888(cand.color, cand.rgb);
+#endif
+                    // Same synthetic BG2 identity as a full foreign frame;
+                    // regular guest OBJ keys are always in front of 0x10000.
+                    cand.key = 0x10000;
+                    cand.layer = 2;
+                    cand.target1 = blend_enabled(x) &&
+                        ((first_targets & (1u << 2)) != 0);
+                    cand.target2 = (second_targets & (1u << 2)) != 0;
+                    cand.valid = true;
+                    top[x] = cand;
+                    second[x] = old_top;
+                }
+            }
+        }
+    }
+
+    // The foreign background is consumed as immutable data, never through a
+    // mod callback.  It replaces all native guest BG/backdrop candidates at
+    // the last safe point before OBJ composition.  A deliberately back-most
+    // key keeps every guest OBJ visible while preserving authentic OBJ order,
+    // OBJ-window masking, and the normal BLDCNT effects pipeline.  Treat it
+    // as BG2 for color-effect target bits so authored fades still apply.
+    // Unlike a guest BG2, a committed foreign frame is intentionally opaque
+    // to native BG/window state: keeping a room-authored window mask here
+    // leaked screen-fixed house/door tiles over later foreign rooms. Guest
+    // OBJ composition (including the focused Link OBJ) still happens below.
+    if (const uint16_t* foreign = foreign_presentation_internal::background()) {
+        for (uint32_t x = 0; x < kScreenWidth; ++x) {
+            if (foreign_hud_bg[x].valid) {
+                top[x] = foreign_hud_bg[x];
+                second[x] = PixelCandidate{};
+                continue;
+            }
+            PixelCandidate cand;
+            cand.color = foreign[y * GbaPpu::kScreenWidth + x];
+#if !defined(GBARECOMP_SCANLINE_HLE)
+            to_rgb888(cand.color, cand.rgb);
+#endif
+            cand.key = 0x10000;
+            cand.layer = 2;
+            cand.target1 = blend_enabled(x) &&
+                ((first_targets & (1u << 2)) != 0);
+            cand.target2 = (second_targets & (1u << 2)) != 0;
+            cand.valid = true;
+            top[x] = cand;
+            second[x] = PixelCandidate{};
+        }
+    }
+
     if (dispcnt & 0x1000u) {
         constexpr uint32_t obj_tile_base = 0x10000u;
         bool obj_1d_mapping = (dispcnt & 0x0040u) != 0;
@@ -863,6 +1303,9 @@ void render_scanline_internal(uint8_t* rgb,
             if (rot_scale) {
                 int bw = disable_or_double ? sw * 2 : sw;
                 int bh = disable_or_double ? sh * 2 : sh;
+                if (apply_foreign_obj_focus(&sx, &sy, bw, bh, tile_num,
+                                            false, static_cast<uint32_t>(idx)).action ==
+                    ForeignObjFocusAction::kSuppress) continue;
                 int j = static_cast<int>(y) - sy;
                 if (j < 0 || j >= bh) continue;
                 int affine_group = (attr1 >> 9) & 0x1Fu;
@@ -886,21 +1329,28 @@ void render_scanline_internal(uint8_t* rgb,
                 }
                 continue;
             }
+            const ForeignObjFocusResult focus_result =
+                apply_foreign_obj_focus(&sx, &sy, sw, sh, tile_num, true,
+                                        static_cast<uint32_t>(idx));
+            if (focus_result.action == ForeignObjFocusAction::kSuppress) continue;
+            const int draw_w = scaled_extent(sw, focus_result.scale_q8_8);
+            const int draw_h = scaled_extent(sh, focus_result.scale_q8_8);
             int line = static_cast<int>(y) - sy;
-            if (line < 0 || line >= sh) continue;
+            if (line < 0 || line >= draw_h) continue;
             bool hflip = (attr1 & 0x1000u) != 0;
             bool vflip = (attr1 & 0x2000u) != 0;
-            int ty = line >> 3;
-            int py = line & 7;
+            const int source_y = nearest_source_pixel(line, sh, draw_h);
+            int ty = source_y >> 3;
+            int py = source_y & 7;
             int src_ty = vflip ? (tiles_h - 1 - ty) : ty;
             int src_py = vflip ? (7 - py) : py;
-            for (int tx = 0; tx < tiles_w; ++tx) {
+            for (int dx = 0; dx < draw_w; ++dx) {
+                const int source_x = nearest_source_pixel(dx, sw, draw_w);
+                const int tx = source_x >> 3;
                 int src_tx = hflip ? (tiles_w - 1 - tx) : tx;
-                for (int px = 0; px < 8; ++px) {
-                    int src_px = hflip ? (7 - px) : px;
-                    emit_obj(src_tx * 8 + src_px, src_ty * 8 + src_py,
-                             sx + tx * 8 + px);
-                }
+                const int px = source_x & 7;
+                int src_px = hflip ? (7 - px) : px;
+                emit_obj(src_tx * 8 + src_px, src_ty * 8 + src_py, sx + dx);
             }
         }
     }
@@ -931,9 +1381,13 @@ void render_scanline_internal(uint8_t* rgb,
                 : darken_gba555(top[x].color, bldy);
             to_rgb888(adjusted, dst);
         } else {
+#if defined(GBARECOMP_SCANLINE_HLE)
+            to_rgb888(top[x].color, dst);
+#else
             dst[0] = top[x].rgb[0];
             dst[1] = top[x].rgb[1];
             dst[2] = top[x].rgb[2];
+#endif
         }
     }
     return;
@@ -950,21 +1404,28 @@ void render_scanline_internal(uint8_t* rgb,
 // falls outside [X1,X2) so it naturally resolves to WINOUT (the conservative
 // policy for columns the game never authored). OAM X keeps its 9-bit signed
 // decode and is tested against the expanded viewport, so wrapped-negative sprites
-// (left) and x>=240 sprites (right) both appear in the margins. Vertical is not
-// expanded here (extra_top/bottom are forced 0), so `y` is the hardware scanline.
-void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
+// (left) and x>=240 sprites (right) both appear in the margins. Signed `y`
+// addresses authored vertical rows, where raw OAM/affine/bitmap extrapolation
+// is prohibited; only validated game providers may contribute content.
+void render_scanline_wide(uint8_t* rgb, int y, uint16_t dispcnt,
                           const uint8_t* io, const uint8_t* vram,
                           const uint8_t* oam, const uint8_t* pal,
-                          uint32_t out_w, uint32_t ox) {
+                          uint32_t out_w, uint32_t ox, uint32_t oy = 0) {
     constexpr uint32_t kVanW = GbaPpu::kScreenWidth;   // 240
     constexpr uint32_t kVanH = GbaPpu::kScreenHeight;  // 160
-    if (y >= kVanH) return;
-
-    uint8_t* row = rgb + y * out_w * 3;
+    if (g_ws_native_view_left >= 0)
+        ox = std::min(static_cast<uint32_t>(g_ws_native_view_left), out_w - kVanW);
+    const bool native_row = y >= 0 && y < static_cast<int>(kVanH);
+    uint8_t* row = rgb + (y + static_cast<int>(oy)) * out_w * 3;
+    if (!native_row && (!g_ws_authored_margin_layers || !g_ws_tilemap_provider || g_ws_pillarbox)) {
+        std::memset(row, 0, out_w * 3); return;
+    }
     if (dispcnt & 0x0080u) { std::memset(row, 0xFF, out_w * 3); return; }
 
     struct PixelCandidate {
+#if !defined(GBARECOMP_SCANLINE_HLE)
         uint8_t rgb[3] = {0, 0, 0};
+#endif
         uint16_t color = 0;
         int key = 0x7FFFFFFF;
         uint8_t layer = 5;
@@ -979,11 +1440,11 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
     const bool any_window = win0_en || win1_en || objwin_en;
     uint16_t winin  = static_cast<uint16_t>(io[0x48] | (io[0x49] << 8));
     uint16_t winout = static_cast<uint16_t>(io[0x4A] | (io[0x4B] << 8));
-    auto win_v_row = [&](uint32_t vreg) -> bool {
+    auto win_v_row = [&](uint32_t vreg, int sample_y) -> bool {
         uint32_t v  = static_cast<uint32_t>(io[vreg] | (io[vreg + 1] << 8));
         uint32_t y1 = (v >> 8) & 0xFFu, y2 = v & 0xFFu;
         if (y2 > kVanH || y1 > y2) y2 = kVanH;
-        return y >= y1 && y < y2;
+        return sample_y >= static_cast<int>(y1) && sample_y < static_cast<int>(y2);
     };
     auto win_h_in = [&](uint32_t hreg, int hx) -> bool {
         uint32_t h  = static_cast<uint32_t>(io[hreg] | (io[hreg + 1] << 8));
@@ -991,13 +1452,13 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
         if (x2 > static_cast<int>(kVanW) || x1 > x2) x2 = static_cast<int>(kVanW);
         return hx >= x1 && hx < x2;
     };
-    const bool win0_row = win0_en && win_v_row(0x44);
-    const bool win1_row = win1_en && win_v_row(0x46);
+    const bool win0_row = win0_en && win_v_row(0x44, y);
+    const bool win1_row = win1_en && win_v_row(0x46, y);
     // OBJ-window stencil is built in vanilla 240-space; margin columns (hx
     // outside [0,240)) get no OBJ-window (WINOUT), consistent with WIN0/1.
     bool obj_window_storage[GbaPpu::kScreenWidth] = {};
     bool* obj_window_mask = nullptr;
-    if (objwin_en) {
+    if (objwin_en && native_row) {
         mark_obj_window_scanline(obj_window_storage, y, dispcnt, vram, oam,
                                  kVanW, kVanH);
         obj_window_mask = obj_window_storage;
@@ -1010,6 +1471,14 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             obj_window_mask[hx])
             return static_cast<uint16_t>((winout >> 8) & 0x3Fu);
         return static_cast<uint16_t>(winout & 0x3Fu);
+    };
+    auto window_control_at_xy = [&](int hx, int sy) -> uint16_t {
+        if (sy == y) return window_control_at_hx(hx);
+        if (!any_window) return 0x3Fu;
+        if (win0_en && win_v_row(0x44, sy) && win_h_in(0x40, hx)) return winin & 0x3Fu;
+        if (win1_en && win_v_row(0x46, sy) && win_h_in(0x42, hx)) return (winin >> 8) & 0x3Fu;
+        // Do not invent an OBJ-window stencil for a different scanline.
+        return objwin_en ? 0u : static_cast<uint16_t>(winout & 0x3Fu);
     };
     // A guest-authored window has no defined continuation beyond the native
     // 240-pixel scanline. Extend it into the margins only when every authentic
@@ -1065,12 +1534,16 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
     PixelCandidate top[GbaPpu::kMaxRenderWidth];
     PixelCandidate second[GbaPpu::kMaxRenderWidth];
     const uint16_t backdrop_color = load_u16_le(&pal[0]);
+#if !defined(GBARECOMP_SCANLINE_HLE)
     uint8_t backdrop_rgb[3];
     to_rgb888(backdrop_color, backdrop_rgb);
+#endif
     for (uint32_t x = 0; x < out_w; ++x) {
+#if !defined(GBARECOMP_SCANLINE_HLE)
         top[x].rgb[0] = backdrop_rgb[0];
         top[x].rgb[1] = backdrop_rgb[1];
         top[x].rgb[2] = backdrop_rgb[2];
+#endif
         top[x].color = backdrop_color;
         top[x].key = 0x70000000;
         top[x].layer = 5;
@@ -1082,7 +1555,9 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
                       bool target1, bool target2) {
         PixelCandidate cand;
         cand.color = color;
+#if !defined(GBARECOMP_SCANLINE_HLE)
         to_rgb888(color, cand.rgb);
+#endif
         cand.key = key;
         cand.layer = layer;
         cand.target1 = target1;
@@ -1114,26 +1589,49 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
         for (uint32_t x = 0; x < out_w; ++x) {
             int hx = static_cast<int>(x) - static_cast<int>(ox);
             const bool authored_margin = g_ws_authored_margin_layers &&
-                (hx < 0 || hx >= static_cast<int>(kVanW));
+                (!native_row || hx < 0 || hx >= static_cast<int>(kVanW));
             // Minish supplies room-map entries for margins independently of
             // the native 240px WIN0/WIN1 HUD/dialog masks. Ignore only their
             // regular-BG layer gate there; unsupported UI BGs still fail in
             // the provider below, so they cannot repeat.
-            if (!layer_enabled(x, layer) && !authored_margin) continue;
             int sample_hx = hx;
+            int sample_y = y;
+            bool remapped = false;
+            bool xy_remapped = false;
+            if (g_ws_bg_xy_provider && (g_ws_bg_xy_provider_layers & (1u << layer))) {
+                int provided_x = hx, provided_y = y;
+                const int action = g_ws_bg_xy_provider(layer, hx, y, &provided_x, &provided_y);
+                if (action < 0) continue;
+                if (action > 0) {
+                    sample_hx = provided_x; sample_y = provided_y;
+                    remapped = xy_remapped = true;
+                }
+            }
+            if (!layer_enabled(x, layer) && !authored_margin && !xy_remapped) continue;
             if (g_ws_bg_x_provider &&
-                (g_ws_bg_x_provider_layers & (1u << layer))) {
+                (g_ws_bg_x_provider_layers & (1u << layer)) && !remapped) {
                 int provided_hx = hx;
                 const int action = g_ws_bg_x_provider(
                     static_cast<int>(layer), static_cast<int>(x),
                     static_cast<int>(y), &provided_hx);
                 if (action < 0) continue;
-                if (action > 0) sample_hx = provided_hx;
+                if (action > 0) { sample_hx = provided_hx; remapped = true; }
             }
+            // A remapped margin sample continues an authentic viewport
+            // column, so gate it by that column's own window control instead
+            // of the margin's WINOUT fallback. Otherwise reflected
+            // continuations vanish exactly when a guest window covers the
+            // scenery they mirror (e.g. battle arenas whose WINOUT drops the
+            // world layer behind HUD windows). Non-remapped margins keep the
+            // established WINOUT/fail-closed behavior.
+            if (remapped && (xy_remapped || hx < 0 || hx >= static_cast<int>(kVanW)) &&
+                sample_hx >= 0 && sample_hx < static_cast<int>(kVanW) &&
+                (window_control_at_xy(sample_hx, sample_y) & (1u << layer)) == 0)
+                continue;
             uint32_t tex_x = static_cast<uint32_t>(
                                  sample_hx + static_cast<int>(hofs)) &
                              (width_px - 1u);
-            uint32_t tex_y = (y + vofs) & (height_px - 1u);
+            uint32_t tex_y = (sample_y + vofs) & (height_px - 1u);
             uint32_t tile_x = tex_x >> 3;
             uint32_t tile_y = tex_y >> 3;
             uint32_t block = (tile_x >> 5) + (tile_y >> 5) * block_cols;
@@ -1146,12 +1644,12 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             // the true off-screen world tile, use it; if it's armed but has no
             // data, leave the pixel transparent (no seam) rather than draw the
             // wrap. With no sidecar, keep vanilla wide behavior.
-            if (sample_hx < 0 || sample_hx >= 240) {
+            if (sample_hx < 0 || sample_hx >= 240 || sample_y < 0 || sample_y >= 160) {
                 if (g_ws_tilemap_provider) {
                     uint16_t ext;
                     const int action = g_ws_tilemap_provider(
                         static_cast<int>(layer), sample_hx,
-                        static_cast<int>(y), &ext);
+                        sample_y, &ext);
                     if (action == kWsTilemapReplace) {
                         entry = ext;
                     } else if (action != kWsTilemapKeepWrapped) {
@@ -1182,15 +1680,19 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             }
             if ((pal_idx & (color256 ? 0xFFu : 0x0Fu)) == 0) continue;
             const uint16_t color = load_u16_le(&pal[pal_idx * 2]);
+            const bool sample_blend = xy_remapped
+                ? (window_control_at_xy(sample_hx, sample_y) & 0x20) != 0
+                : blend_enabled(x);
             submit(x, color,
                    static_cast<int>(bg_priority * 256u + 128u + layer),
                    static_cast<uint8_t>(layer),
-                   blend_enabled(x) && ((first_targets & (1u << layer)) != 0),
+                   sample_blend && ((first_targets & (1u << layer)) != 0),
                    (second_targets & (1u << layer)) != 0);
         }
     };
     auto render_affine_bg = [&](uint32_t layer, uint32_t cnt_off,
                                 uint32_t param_off) {
+        if (!native_row) return;
         if ((dispcnt & (0x0100u << layer)) == 0) return;
         uint16_t bgcnt = static_cast<uint16_t>(io[cnt_off] | (io[cnt_off + 1] << 8));
         uint32_t char_base   = ((bgcnt >> 2) & 0x3u) * 0x4000u;
@@ -1296,6 +1798,7 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
     // pre-advance by -ox places the bitmap exactly where it belongs and the
     // margins fall outside its bounds, staying backdrop.
     auto render_bitmap_bg = [&]() {
+        if (!native_row) return;
         if ((dispcnt & 0x0400u) == 0) return;   // DISPCNT bit10 = BG2 enable
         constexpr uint32_t layer = 2;
         uint16_t bgcnt = static_cast<uint16_t>(io[0x0C] | (io[0x0D] << 8));
@@ -1362,7 +1865,52 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
         render_bitmap_bg();
     }
 
-    if (dispcnt & 0x1000u) {
+    // Keep the bounded native-screen overlay in the centered hardware
+    // viewport when adaptive view expansion is active. It deliberately does
+    // not extend into either margin: its coordinates are still the canonical
+    // 240x160 GBA screen domain. As in the faithful path, it is synthetic BG2
+    // for window/effect handling, is below guest OBJ, and disappears whenever
+    // a full foreign background has been published.
+    if (foreign_presentation_internal::background() == nullptr) {
+        if (const auto* overlay = foreign_presentation_internal::screen_overlay();
+            valid_foreign_screen_overlay(overlay)) {
+            const int left = static_cast<int>(ox) + overlay->x;
+            const int top_y = overlay->y;
+            for (unsigned oy = 0; oy < overlay->height; ++oy) {
+                const int screen_y = top_y + static_cast<int>(oy);
+                if (screen_y != static_cast<int>(y)) continue;
+                for (unsigned ix = 0; ix < overlay->width; ++ix) {
+                    const int screen_x = left + static_cast<int>(ix);
+                    if (screen_x < 0 || screen_x >= static_cast<int>(out_w))
+                        continue;
+                    const unsigned x = static_cast<unsigned>(screen_x);
+                    if (!layer_enabled(x, 2)) continue;
+                    const std::size_t source =
+                        static_cast<std::size_t>(oy) * overlay->stride + ix;
+                    const std::uint8_t alpha = overlay->alpha_q4[source];
+                    if (alpha == 0 || alpha > 16) continue;
+                    const PixelCandidate old_top = top[x];
+                    PixelCandidate cand;
+                    cand.color = blend_alpha_gba555(overlay->pixels[source],
+                                                     old_top.color, alpha,
+                                                     16u - alpha);
+#if !defined(GBARECOMP_SCANLINE_HLE)
+                    to_rgb888(cand.color, cand.rgb);
+#endif
+                    cand.key = 0x10000;
+                    cand.layer = 2;
+                    cand.target1 = blend_enabled(x) &&
+                        ((first_targets & (1u << 2)) != 0);
+                    cand.target2 = (second_targets & (1u << 2)) != 0;
+                    cand.valid = true;
+                    top[x] = cand;
+                    second[x] = old_top;
+                }
+            }
+        }
+    }
+
+    if (native_row && (dispcnt & 0x1000u)) {
         constexpr uint32_t obj_tile_base = 0x10000u;
         bool obj_1d_mapping = (dispcnt & 0x0040u) != 0;
         const uint8_t* obj_pal = pal + 0x200;
@@ -1400,6 +1948,8 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
                     sx -= 0x200;
                 }
             };
+            const bool obj_focus_active =
+                valid_foreign_obj_focus(foreign_presentation_internal::obj_focus());
             bool color256 = (attr0 & 0x2000u) != 0;
             uint32_t tile_num = attr2 & 0x3FFu;
             if (bg_mode >= 3 && tile_num < 512u) continue;
@@ -1419,6 +1969,13 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             bool obj_target2 = (second_targets & (1u << 4)) != 0;
             auto emit_obj = [&](int tex_x, int tex_y, int screen_x) {
                 if (screen_x < 0 || screen_x >= static_cast<int>(out_w)) return;
+                // Opt-in policy: hardware-faithful OBJ placement only within
+                // the native viewport; margin columns never show sprites the
+                // guest believed were off-screen.
+                if (g_ws_obj_native_clip &&
+                    (screen_x < static_cast<int>(ox) ||
+                     screen_x >= static_cast<int>(ox) + static_cast<int>(kVanW)))
+                    return;
                 if (!layer_enabled(static_cast<uint32_t>(screen_x), 4)) return;
                 int tile_x_in_sprite = tex_x >> 3;
                 int tile_y_in_sprite = tex_y >> 3;
@@ -1455,9 +2012,18 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             if (rot_scale) {
                 int bw = disable_or_double ? sw * 2 : sw;
                 int bh = disable_or_double ? sh * 2 : sh;
+                // Preserve the existing callback timing exactly while focus
+                // is inactive. When active, resolve the game-owned widened X
+                // first, then apply pure data-only focus before clipping.
+                if (obj_focus_active) {
+                    resolve_sx();
+                    if (apply_foreign_obj_focus(&sx, &sy, bw, bh, tile_num,
+                                                false, static_cast<uint32_t>(idx)).action ==
+                        ForeignObjFocusAction::kSuppress) continue;
+                }
                 int j = static_cast<int>(y) - sy;
                 if (j < 0 || j >= bh) continue;
-                resolve_sx();
+                if (!obj_focus_active) resolve_sx();
                 int affine_group = (attr1 >> 9) & 0x1Fu;
                 const uint8_t* ag = oam + affine_group * 0x20u;
                 int32_t pa = read_s16(ag, 0x06);
@@ -1479,28 +2045,61 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
                 }
                 continue;
             }
+            ForeignObjFocusResult focus_result;
+            if (obj_focus_active) {
+                resolve_sx();
+                focus_result =
+                    apply_foreign_obj_focus(&sx, &sy, sw, sh, tile_num, true,
+                                            static_cast<uint32_t>(idx));
+                if (focus_result.action == ForeignObjFocusAction::kSuppress) continue;
+            }
+            const int draw_w = scaled_extent(sw, focus_result.scale_q8_8);
+            const int draw_h = scaled_extent(sh, focus_result.scale_q8_8);
             int line = static_cast<int>(y) - sy;
-            if (line < 0 || line >= sh) continue;
-            resolve_sx();
+            if (line < 0 || line >= draw_h) continue;
+            if (!obj_focus_active) resolve_sx();
             bool hflip = (attr1 & 0x1000u) != 0;
             bool vflip = (attr1 & 0x2000u) != 0;
-            int ty = line >> 3;
-            int py = line & 7;
+            const int source_y = nearest_source_pixel(line, sh, draw_h);
+            int ty = source_y >> 3;
+            int py = source_y & 7;
             int src_ty = vflip ? (tiles_h - 1 - ty) : ty;
             int src_py = vflip ? (7 - py) : py;
-            for (int tx = 0; tx < tiles_w; ++tx) {
+            for (int dx = 0; dx < draw_w; ++dx) {
+                const int source_x = nearest_source_pixel(dx, sw, draw_w);
+                const int tx = source_x >> 3;
                 int src_tx = hflip ? (tiles_w - 1 - tx) : tx;
-                for (int px = 0; px < 8; ++px) {
-                    int src_px = hflip ? (7 - px) : px;
-                    emit_obj(src_tx * 8 + src_px, src_ty * 8 + src_py,
-                             sx + tx * 8 + px + static_cast<int>(ox));
-                }
+                const int px = source_x & 7;
+                int src_px = hflip ? (7 - px) : px;
+                emit_obj(src_tx * 8 + src_px, src_ty * 8 + src_py,
+                         sx + dx + static_cast<int>(ox));
             }
         }
     }
 
     uint32_t bldy = static_cast<uint32_t>(io[0x54] | (io[0x55] << 8)) & 0x1Fu;
     if (bldy > 16u) bldy = 16u;
+    if ((dispcnt & 0x1000u) && g_ws_obj_margin_provider && !g_ws_pillarbox) {
+        int left = 0, width = 0;
+        const auto* pixels = g_ws_obj_margin_provider(static_cast<int>(y), &left, &width);
+        if (pixels && width > 0 && width <= static_cast<int>(GbaPpu::kMaxRenderWidth) &&
+            left >= -static_cast<int>(GbaPpu::kMaxRenderWidth) &&
+            left <= static_cast<int>(GbaPpu::kMaxRenderWidth)) {
+            for (int i = 0; i < width; ++i) {
+                const int hx = left + i, x = hx + static_cast<int>(ox);
+                if ((native_row && hx >= 0 && hx < 240) || x < 0 || x >= static_cast<int>(out_w)) continue;
+                const auto& pixel = pixels[i];
+                // Authored world margins are independent of native HUD/window
+                // rectangles, just like the regular-BG providers above. A
+                // game's WINOUT often disables OBJ beyond the stock screen.
+                if ((pixel.color & 0x8000) || pixel.priority > 3 ||
+                    (!layer_enabled(x, 4) && !g_ws_authored_margin_layers)) continue;
+                submit(x, pixel.color, pixel.priority * 256 + (pixel.order & 127), 4,
+                       pixel.semi_transparent && blend_enabled(x),
+                       (second_targets & (1u << 4)) != 0);
+            }
+        }
+    }
     for (uint32_t x = 0; x < out_w; ++x) {
         uint8_t* dst = row + x * 3;
         // OBJ-only presentations (notably the real GBA BIOS logo) author the
@@ -1540,9 +2139,13 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
                 : darken_gba555(top[x].color, bldy);
             to_rgb888(adjusted, dst);
         } else {
+#if defined(GBARECOMP_SCANLINE_HLE)
+            to_rgb888(top[x].color, dst);
+#else
             dst[0] = top[x].rgb[0];
             dst[1] = top[x].rgb[1];
             dst[2] = top[x].rgb[2];
+#endif
         }
     }
 }
@@ -1564,8 +2167,8 @@ void GbaPpu::render(uint8_t* rgb,
         return;
     }
     const uint32_t ow = render_width();
-    for (uint32_t y = 0; y < kScreenHeight; ++y) {
-        render_scanline_wide(rgb, y, dispcnt, io, vram, oam, pal, ow, extra_left_);
+    for (int y = -static_cast<int>(extra_top_); y < static_cast<int>(kScreenHeight + extra_bottom_); ++y) {
+        render_scanline_wide(rgb, y, dispcnt, io, vram, oam, pal, ow, extra_left_, extra_top_);
     }
 }
 
@@ -1827,6 +2430,7 @@ void GbaPpu::render_scanline(uint32_t y,
                              const uint8_t* vram,
                              const uint8_t* oam,
                              const uint8_t* pal) {
+    if (presentation_) presentation_->scanline(*this, y, dispcnt, io, vram, oam, pal);
     // BG2/BG3 affine coordinates are backed by hidden current-reference
     // registers. With constant PB/PD, ref + y*delta is equivalent. Mario Kart
     // HBlank-DMAs PA/PB/PC/PD/X/Y for every road scanline, however: each X/Y
@@ -1862,14 +2466,24 @@ void GbaPpu::render_scanline(uint32_t y,
         state.y += pd;
     }
 
+    if (!rasterization_enabled_) return;
     if (!view_expanded()) {
         render_scanline_internal(work_fb_.data(), y, dispcnt,
                                  affine_io.data(), vram, oam, pal,
                                  kScreenWidth, kScreenHeight);
         return;
     }
+    // Host-authored extra rows use this frame's published state once, at
+    // scanline zero. They never run emulated scanline timing or affine updates.
+    if (y == 0 && (extra_top_ || extra_bottom_)) {
+        for (int sy = -static_cast<int>(extra_top_); sy < static_cast<int>(kScreenHeight + extra_bottom_); ++sy) {
+            if (sy >= 0 && sy < static_cast<int>(kScreenHeight)) continue;
+            render_scanline_wide(work_fb_.data(), sy, dispcnt, io, vram, oam, pal,
+                                 render_width(), extra_left_, extra_top_);
+        }
+    }
     render_scanline_wide(work_fb_.data(), y, dispcnt, affine_io.data(),
-                         vram, oam, pal, render_width(), extra_left_);
+                         vram, oam, pal, render_width(), extra_left_, extra_top_);
 }
 
 void GbaPpu::note_affine_reference_write(unsigned bg, bool y_axis) {
@@ -1877,6 +2491,14 @@ void GbaPpu::note_affine_reference_write(unsigned bg, bool y_axis) {
     AffineLineState& state = affine_line_[bg - 2];
     if (y_axis) state.reload_y = true;
     else state.reload_x = true;
+}
+
+void GbaPpu::render_presentation_scanline(const GbaPpu& source, uint32_t y,
+                                          uint16_t dispcnt, const uint8_t* io,
+                                          const uint8_t* vram, const uint8_t* oam,
+                                          const uint8_t* pal) {
+    affine_line_ = source.affine_line_;
+    render_scanline(y, dispcnt, io, vram, oam, pal);
 }
 
 void GbaPpu::latch_framebuffer(uint16_t dispcnt,
@@ -1889,8 +2511,18 @@ void GbaPpu::latch_framebuffer(uint16_t dispcnt,
 }
 
 void GbaPpu::mark_framebuffer_latched() {
-    std::memcpy(latched_fb_.data(), work_fb_.data(), render_bytes());
+    if (rasterization_enabled_)
+        std::memcpy(latched_fb_.data(), work_fb_.data(), render_bytes());
     has_latched_fb_ = true;
+    if (presentation_) presentation_->frame_ready();
+}
+
+void GbaPpu::set_rasterization_enabled(bool enabled) {
+    rasterization_enabled_ = enabled;
+    if (!enabled) {
+        std::fill(work_fb_.begin(),work_fb_.end(),0);
+        std::fill(latched_fb_.begin(),latched_fb_.end(),0);
+    }
 }
 
 }  // namespace gba

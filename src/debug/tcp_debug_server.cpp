@@ -373,7 +373,9 @@ void cmd_audio_trace(gba::GbaBus& bus, std::string_view req,
         max_entries = gba::GbaAudio::kFifoTraceSize;
     }
     uint32_t start = available - static_cast<uint32_t>(max_entries);
-    out = "{\"ok\":true,\"entries\":[";
+    out = gba::GbaAudio::debug_fifo_trace_enabled()
+        ? "{\"ok\":true,\"enabled\":true,\"entries\":["
+        : "{\"ok\":true,\"enabled\":false,\"entries\":[";
     for (uint32_t i = 0; i < max_entries; ++i) {
         auto tr = bus.audio().debug_trace_entry(start + i);
         if (i) out += ",";
@@ -414,8 +416,10 @@ void cmd_runtime_trace(const TcpDebugServer::Context& ctx,
     uint32_t n = ctx.runtime_trace_copy(
         entries.data(), static_cast<uint32_t>(entries.size()));
 
-    char hdr[80];
-    std::snprintf(hdr, sizeof(hdr), "{\"ok\":true,\"count\":%u,\"entries\":[",
+    char hdr[104];
+    std::snprintf(hdr, sizeof(hdr),
+                  "{\"ok\":true,\"enabled\":%s,\"count\":%u,\"entries\":[",
+                  runtime_trace_enabled() ? "true" : "false",
                   static_cast<unsigned>(n));
     out = hdr;
     for (uint32_t i = 0; i < n; ++i) {
@@ -524,10 +528,12 @@ void cmd_irq_cap(std::string_view req, std::string& out) {
 }
 
 // ── MMIO write-trace ring query (Axis 4) ───────────────────────────────
-// {"cmd":"mmio_cap","count":C,"start":S?} -> {ok,total,oldest,first,count,
+// {"cmd":"mmio_cap","count":C,"start":S?} -> {ok,enabled,total,oldest,first,count,
 // entries:[{cycle,addr,value,size,pc}...]}. Non-destructive window query of the
-// always-on IO write-trace ring (gba_io.cpp). Default returns the most recent
-// `count` writes; `start` requests an absolute index window.
+// opt-in IO write-trace ring (gba_io.cpp). Default returns the most recent
+// `count` writes; `start` requests an absolute index window. enabled=false means
+// GBARECOMP_MMIO_CAP/GBARECOMP_MMIO_DUMP was not set, distinct from an enabled
+// ring with zero entries.
 void cmd_mmio_cap(std::string_view req, std::string& out) {
     uint64_t count = 4096, parsed = 0;
     if (extract_uint(req, "\"count\"", parsed) ||
@@ -546,10 +552,11 @@ void cmd_mmio_cap(std::string_view req, std::string& out) {
     std::vector<gba::MmioCapEntry> buf(static_cast<std::size_t>(count));
     uint64_t first = 0;
     std::size_t n = gba::gba_mmio_cap_query(start, buf.size(), buf.data(), first);
-    char hdr[176];
+    char hdr[200];
     std::snprintf(hdr, sizeof(hdr),
-                  "{\"ok\":true,\"total\":%llu,\"oldest\":%llu,\"first\":%llu,"
+                  "{\"ok\":true,\"enabled\":%s,\"total\":%llu,\"oldest\":%llu,\"first\":%llu,"
                   "\"count\":%llu,\"entries\":[",
+                  gba::gba_mmio_cap_enabled() ? "true" : "false",
                   static_cast<unsigned long long>(total),
                   static_cast<unsigned long long>(oldest),
                   static_cast<unsigned long long>(first),
@@ -612,6 +619,8 @@ void cmd_state_hash(const TcpDebugServer::Context& ctx, std::string& out) {
 void dispatch(const TcpDebugServer::Context& ctx, std::string_view req,
               std::string& out, bool& want_quit, bool& step_failed) {
     out.clear();
+
+    if (ctx.extension && ctx.extension(std::string(req), out)) return;
 
     auto contains = [&](const char* tok) {
         return req.find(tok) != std::string_view::npos;
@@ -883,18 +892,32 @@ void dispatch(const TcpDebugServer::Context& ctx, std::string_view req,
         }
         uint32_t off = 0;
         const char* name = gba_symbol_lookup(static_cast<uint32_t>(addr), &off);
-        char buf[256];
+        // Also resolve against the imported data-symbol map, so one query
+        // answers "what code is here" and "what variable is here". The
+        // function fields keep their existing meaning; the data fields are
+        // additive and are null when no data map is linked (or the address
+        // falls in no symbol's extent).
+        uint32_t data_off = 0;
+        const char* data_name =
+            gba_data_symbol_lookup(static_cast<uint32_t>(addr), &data_off);
+        char namebuf[128], databuf[128];
         if (name) {
-            std::snprintf(buf, sizeof(buf),
-                          "{\"ok\":true,\"addr\":%llu,\"name\":\"%s\","
-                          "\"offset\":%u}",
-                          static_cast<unsigned long long>(addr), name, off);
+            std::snprintf(namebuf, sizeof(namebuf),
+                          "\"%s\",\"offset\":%u", name, off);
         } else {
-            std::snprintf(buf, sizeof(buf),
-                          "{\"ok\":true,\"addr\":%llu,\"name\":null,"
-                          "\"offset\":0}",
-                          static_cast<unsigned long long>(addr));
+            std::snprintf(namebuf, sizeof(namebuf), "null,\"offset\":0");
         }
+        if (data_name) {
+            std::snprintf(databuf, sizeof(databuf),
+                          "\"%s\",\"data_offset\":%u", data_name, data_off);
+        } else {
+            std::snprintf(databuf, sizeof(databuf), "null,\"data_offset\":0");
+        }
+        char buf[384];
+        std::snprintf(buf, sizeof(buf),
+                      "{\"ok\":true,\"addr\":%llu,\"name\":%s,"
+                      "\"data_name\":%s}",
+                      static_cast<unsigned long long>(addr), namebuf, databuf);
         out = buf;
         return;
     }
@@ -1195,13 +1218,21 @@ bool TcpDebugServer::run(int port, const Context& ctx) {
 
     std::printf("native: tcp_debug_server listening on 127.0.0.1:%d\n", port);
     std::fflush(stdout);
+    listen_sock_.store(static_cast<std::intptr_t>(srv));
+    if (stop_.load()) {
+        if (listen_sock_.exchange(-1) != -1) CLOSESOCK(srv);
+    }
 
     bool quit_server = false;
-    while (!quit_server) {
+    while (!quit_server && !stop_.load()) {
         sockaddr_in cli{};
         socklen_t clen = sizeof(cli);
         socket_t c = ::accept(srv, reinterpret_cast<sockaddr*>(&cli), &clen);
-        if (c == INVALID_SOCKET) continue;
+        if (c == INVALID_SOCKET) {
+            if (stop_.load()) break;
+            continue;
+        }
+        client_sock_.store(static_cast<std::intptr_t>(c));
 
         std::string inbuf;
         std::string resp;
@@ -1236,20 +1267,40 @@ bool TcpDebugServer::run(int port, const Context& ctx) {
                 }
                 inbuf.erase(0, nl + 1);
             }
-            if (inbuf.size() > 8192) {
+            // Structured commands (touch scripts) can be long; keep a bound.
+            if (inbuf.size() > 262144) {
                 std::string err = "{\"ok\":false,\"error\":\"line too long\"}\n";
                 ::send(c, err.data(), static_cast<int>(err.size()), 0);
                 break;
             }
         }
+        client_sock_.store(-1);
         CLOSESOCK(c);
     }
 
-    CLOSESOCK(srv);
+    if (listen_sock_.exchange(-1) != -1) CLOSESOCK(srv);
 #ifdef _WIN32
     WSACleanup();
 #endif
     return true;
+}
+
+void TcpDebugServer::stop() {
+    stop_.store(true);
+    const std::intptr_t client = client_sock_.load();
+    if (client != -1) {
+        // Unblocks recv(); run() closes the socket itself.
+#ifdef _WIN32
+        ::shutdown(static_cast<socket_t>(client), SD_BOTH);
+#else
+        ::shutdown(static_cast<socket_t>(client), SHUT_RDWR);
+#endif
+    }
+    const std::intptr_t listener = listen_sock_.exchange(-1);
+    if (listener != -1) {
+        // Closing the listener is what unblocks accept() on every platform.
+        CLOSESOCK(static_cast<socket_t>(listener));
+    }
 }
 
 }  // namespace gbarecomp::debug
