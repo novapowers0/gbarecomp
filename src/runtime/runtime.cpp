@@ -251,6 +251,33 @@ struct Args {
 #define GBARECOMP_UI_KEY_FAST_FORWARD_SPEED "assist.fast_forward_speed"
 #define GBARECOMP_UI_KEY_REWIND          "assist.rewind"
 
+// Small endian-explicit memory accessors for the in-game Editor rows. They go
+// through the same bus-backed CheatMemory the cheats use.
+uint32_t editor_mem_read(const CheatMemory& m, uint32_t addr, uint8_t size) {
+    if (size == 8) return m.read8 ? m.read8(m.ctx, addr) : 0u;
+    if (size == 32) {
+        if (!m.read16) return 0u;
+        return static_cast<uint32_t>(m.read16(m.ctx, addr)) |
+               (static_cast<uint32_t>(m.read16(m.ctx, addr + 2)) << 16);
+    }
+    return m.read16 ? m.read16(m.ctx, addr) : 0u;
+}
+
+void editor_mem_write(const CheatMemory& m, uint32_t addr, uint8_t size,
+                      uint32_t v) {
+    if (size == 8) {
+        if (m.write8) m.write8(m.ctx, addr, static_cast<uint8_t>(v));
+    } else if (size == 32) {
+        if (m.write32) m.write32(m.ctx, addr, v);
+        else if (m.write16) {
+            m.write16(m.ctx, addr, static_cast<uint16_t>(v));
+            m.write16(m.ctx, addr + 2, static_cast<uint16_t>(v >> 16));
+        }
+    } else if (m.write16) {
+        m.write16(m.ctx, addr, static_cast<uint16_t>(v));
+    }
+}
+
 struct RuntimeUiContext {
     HostWindow* window = nullptr;
     RecompRuntimeUi* ui = nullptr;
@@ -272,6 +299,8 @@ struct RuntimeUiContext {
     const RunOptions* opts = nullptr;
     // Optional cheat engine owned by run_game; its rows use keys "cheat.<n>".
     CheatEngine* cheats = nullptr;
+    // Bus-backed guest memory for the Editor rows (keys "edit.<n>").
+    const CheatMemory* mem = nullptr;
 };
 
 int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
@@ -301,6 +330,16 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
         const long ci = std::strtol(item->key + 6, nullptr, 10);
         *out = (ci >= 0 &&
                 c->cheats->enabled(static_cast<std::size_t>(ci))) ? 1 : 0;
+    }
+    else if (c->mem && c->opts && c->opts->edit_fields &&
+             std::strncmp(item->key, "edit.", 5) == 0) {
+        const long ei = std::strtol(item->key + 5, nullptr, 10);
+        if (ei < 0 ||
+            static_cast<std::size_t>(ei) >= c->opts->edit_field_count) {
+            return 0;
+        }
+        const GbaEditField& f = c->opts->edit_fields[ei];
+        *out = static_cast<int>(editor_mem_read(*c->mem, f.addr, f.size));
     }
     else if (c->opts && c->opts->ui_get) return c->opts->ui_get(item->key, out);
     else return 0;
@@ -344,6 +383,19 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
         const long ci = std::strtol(item->key + 6, nullptr, 10);
         if (ci >= 0) c->cheats->set_enabled(static_cast<std::size_t>(ci),
                                             value != 0);
+    }
+    else if (c->mem && c->opts && c->opts->edit_fields &&
+             std::strncmp(item->key, "edit.", 5) == 0) {
+        const long ei = std::strtol(item->key + 5, nullptr, 10);
+        if (ei < 0 ||
+            static_cast<std::size_t>(ei) >= c->opts->edit_field_count) {
+            return 0;
+        }
+        const GbaEditField& f = c->opts->edit_fields[ei];
+        int v = value;
+        if (v < f.min) v = f.min;
+        if (v > f.max) v = f.max;
+        editor_mem_write(*c->mem, f.addr, f.size, static_cast<uint32_t>(v));
     }
     else if (c->opts && c->opts->ui_set) return c->opts->ui_set(item->key, value);
     else return 0;
@@ -1849,6 +1901,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     RuntimeUiContext runtime_ui_context;
     runtime_ui_context.opts = &opts;
     runtime_ui_context.cheats = &cheat_engine;
+    runtime_ui_context.mem = &cheat_mem;
     runtime_ui_context.view_mode = resize_view_enabled
         ? RECOMP_RUNTIME_UI_VIEW_ADAPTIVE
         : args.view_width > 240 ? RECOMP_RUNTIME_UI_VIEW_FIXED_16_9
@@ -1860,6 +1913,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // Stable key strings for the Cheats rows (recomp-ui keeps the pointers).
     std::vector<std::string> cheat_menu_keys;
     cheat_menu_keys.reserve(opts.cheat_preset_count);
+    std::vector<std::string> editor_menu_keys;
+    editor_menu_keys.reserve(opts.edit_field_count);
 #endif
     if (args.resize_view && !args.quiet) {
         std::fprintf(stderr,
@@ -3405,6 +3460,23 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 cheat_item.description = cheat_engine.preset_description(ci);
                 cheat_item.type        = RECOMP_RUNTIME_UI_BOOL;
                 runtime_ui_extras.push_back(cheat_item);
+            }
+        }
+
+        if (opts.expose_editor && opts.edit_fields) {
+            for (std::size_t ei = 0; ei < opts.edit_field_count; ++ei) {
+                const GbaEditField& f = opts.edit_fields[ei];
+                editor_menu_keys.push_back("edit." + std::to_string(ei));
+                RecompRuntimeUiItem edit_item{};
+                edit_item.key         = editor_menu_keys.back().c_str();
+                edit_item.section     = "Editor";
+                edit_item.label       = f.name;
+                edit_item.description = f.description;
+                edit_item.type        = RECOMP_RUNTIME_UI_INT;
+                edit_item.minimum     = f.min;
+                edit_item.maximum     = f.max;
+                edit_item.step        = f.step > 0 ? f.step : 1;
+                runtime_ui_extras.push_back(edit_item);
             }
         }
 

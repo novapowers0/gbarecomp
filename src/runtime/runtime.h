@@ -46,6 +46,20 @@ struct ExtendedViewFrameInfo {
 // the runtime keeps whatever it would have used otherwise (BIOS
 // constants from GbaBios, empty ROM hash that forces the user to
 // provide --config or --rom-sha1).
+// A read/write numeric field exposed in the in-game "Editor" section: the
+// player can read and change a value in guest memory (money, stats, ...).
+// `size` is 8, 16 or 32 bits; the menu reads the live value and writes a new
+// one once when changed (never re-asserted every frame).
+struct GbaEditField {
+    const char* name = nullptr;
+    const char* description = nullptr;
+    std::uint32_t addr = 0;
+    std::uint8_t size = 16;
+    std::int32_t min = 0;
+    std::int32_t max = 65535;
+    std::int32_t step = 1;
+};
+
 struct RunOptions {
     // Optional adapter installed by games that link gbarecomp_netplay.
     std::shared_ptr<GbaNetplayLaunch> netplay;
@@ -158,6 +172,13 @@ struct RunOptions {
     bool expose_cheats = false;
     const CheatPreset* cheat_presets = nullptr;
     std::size_t cheat_preset_count = 0;
+
+    // Optional in-game "Editor" section: numeric fields (money, stats, ...) the
+    // player can read and change directly. Each row reads the live value and
+    // writes a new one once when changed.
+    bool expose_editor = false;
+    const GbaEditField* edit_fields = nullptr;
+    std::size_t edit_field_count = 0;
 
     // Optional game-owned content initializer. Called exactly once, after the
     // first non-native view has been authorized and applied. For a fixed view
