@@ -199,7 +199,8 @@ int run(const GbaNetplayLaunch& launch,const GbaNetplayBoot& boot) {
                 window.set_view_margins((width-240)/2,(width-240)-(width-240)/2,0,0);
                 window.present(pixels);
             }
-            window.push_audio_samples(output.audio.data(),output.audio.size());
+            window.push_audio_block(output.audio.data(),output.audio.size(),
+                                    output.audio_rate);
         }
         if (step==GbaNetplayMatch::Step::Idle) pacer.idle();
     }

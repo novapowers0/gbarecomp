@@ -243,6 +243,7 @@ bool GbaNetplayHost::take_output(std::size_t seat,GbaNetplayOutput& out) {
     out.tick=next_tick_-1; out.machine=machine.descriptor.id;
     std::copy_n(machine.ppu.latched_framebuffer(),out.rgb888.size(),out.rgb888.begin());
     out.audio.clear();
+    out.audio_rate=machine.bus.audio().sample_rate();
     std::array<std::int16_t,1024> samples;
     while (const auto count=machine.bus.audio().drain_samples(samples.data(),samples.size()))
         out.audio.insert(out.audio.end(),samples.begin(),samples.begin()+count);

@@ -32,6 +32,9 @@ struct GbaNetplayOutput {
     GbaMachineId machine = 0;
     std::array<std::uint8_t,gba::GbaPpu::kFramebufferBytes> rgb888{};
     std::vector<std::int16_t> audio;
+    // The mixer rate the samples were produced at (SOUNDBIAS-driven, typically
+    // 32768). The host must re-tune its resampler to this, not assume 65536.
+    std::uint32_t audio_rate = 32768;
 };
 // Engine callbacks for the shared episode driver. The runner owns transport,
 // lobby/startup agreement, and the driver lifetime. No serial data crosses this
