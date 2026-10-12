@@ -407,6 +407,7 @@ bool HostWindow::linear_filter()const{return impl_&&backend(impl_)->shared.contr
 void HostWindow::set_resize_driven_view(bool v){if(impl_)backend(impl_)->resize=v;}
 bool HostWindow::assist_tools_enabled()const{return impl_&&backend(impl_)->assist;}
 int HostWindow::fast_forward_multiplier()const{return impl_?backend(impl_)->turbo:4;}
+void HostWindow::set_menu_combo_start_select(bool){}
 
 // ---- touch (touch_input.h) -------------------------------------------------
 void HostWindow::configure_touch(bool policy,std::uint32_t claims,int pad_default,bool emulate) {

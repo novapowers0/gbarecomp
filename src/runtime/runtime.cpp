@@ -3234,8 +3234,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                          observe_port);
         }
         if (args.fullscreen) win.set_fullscreen(args.fullscreen);
-        win.set_volume(args.volume);
-        win.set_fps_readout(opts.show_fps_by_default);
+    win.set_volume(args.volume);
+    win.set_fps_readout(opts.show_fps_by_default);
+    win.set_menu_combo_start_select(opts.in_game_menu_start_select);
 #if defined(GBARECOMP_RUNTIME_UI)
         runtime_ui_context.window = &win;
         runtime_ui_context.gyro_sensitivity = &args.gyro_sensitivity;

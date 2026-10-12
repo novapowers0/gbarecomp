@@ -948,9 +948,15 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     };
     gi.has_assist_tools = opts.expose_assist_tools ? 1 : 0;
     gi.assist_tools_note =
-        "Rewind returns to a recent point kept in memory. Fast-forward runs "
-        "without the normal frame limiter. Keyboard and controller controls "
-        "can be changed below.";
+        opts.in_game_menu_start_select
+            ? "Press Start + Select together in game to open the in-game menu "
+              "(cheats, save states, fast-forward and rewind). Rewind returns "
+              "to a recent point kept in memory; fast-forward runs without the "
+              "normal frame limiter. Keyboard and controller controls can be "
+              "changed below."
+            : "Rewind returns to a recent point kept in memory. Fast-forward "
+              "runs without the normal frame limiter. Keyboard and controller "
+              "controls can be changed below.";
     gi.assist_binding_labels = kAssistBindings;
     gi.assist_binding_count = opts.expose_assist_tools ? 2 : 0;
     gi.assist_default_key_bind = kAssistDefaultKeys;

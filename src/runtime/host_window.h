@@ -148,6 +148,10 @@ public:
     bool assist_tools_enabled() const;
     int  fast_forward_multiplier() const;
 
+    // When on, pressing Start+Select together opens the runtime menu (cheats,
+    // save states, fast-forward, rewind). Game opt-in; off by default.
+    void set_menu_combo_start_select(bool on);
+
     // Upload one base_w x base_h RGB888 frame (the dimensions passed to open())
     // and present.
     void present(const uint8_t* rgb888);

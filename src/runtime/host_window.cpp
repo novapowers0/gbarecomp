@@ -457,6 +457,11 @@ struct Backend {
     int          assist_fast_forward_multiplier = 4;
     bool         assist_rewind_was_down = false;
     Uint32       assist_rewind_repeat_at = 0;
+    // Start+Select opens the runtime menu (game opt-in): convenient in-game
+    // access to save states, fast-forward and cheats. `_ss_down` latches the
+    // edge so a held combo opens the menu only once.
+    bool         menu_combo_start_select = false;
+    bool         menu_combo_ss_down = false;
     int          scale = 3;             // current integer window scale
     int          fullscreen = 0;        // 0 windowed, 1 borderless, 2 exclusive
     int          volume = 100;          // 0..100 gain on pushed samples
@@ -2728,6 +2733,11 @@ bool HostWindow::fps_readout() const {
     return static_cast<const Backend*>(impl_)->fps_readout;
 }
 
+void HostWindow::set_menu_combo_start_select(bool on) {
+    if (!open_ || !impl_) return;
+    static_cast<Backend*>(impl_)->menu_combo_start_select = on;
+}
+
 void HostWindow::service_events() {
     if (!open_ || !impl_) return;
     SDL_PumpEvents();
@@ -3009,6 +3019,19 @@ HostWindow::Events HostWindow::pump() {
         const uint16_t touch_buttons = active_touch_buttons(b);
         keys &= static_cast<uint16_t>(~touch_buttons);
     }
+    // Start+Select (GBA bits 2 and 3, active low) opens the runtime menu when
+    // the game opts in. The combo is a host shortcut: it opens the menu on the
+    // press edge only and is not leaked to the guest.
+    if (b->menu_combo_start_select) {
+        const bool ss_down = (keys & 0x0Cu) == 0;
+        if (ss_down && !b->menu_combo_ss_down) {
+#if defined(GBARECOMP_RUNTIME_UI)
+            open_runtime_menu_from_touch(b);
+#endif
+        }
+        b->menu_combo_ss_down = ss_down;
+        if (ss_down) keys |= 0x0Cu;
+    }
     ev.keyinput = keys;
 #if defined(GBARECOMP_RUNTIME_UI)
     if (b->runtime_ui && recomp_runtime_ui_is_open(b->runtime_ui))
@@ -3162,6 +3185,7 @@ void host_haptic_pulse(int, float) {}
 void host_request_settings_menu() {}
 void HostWindow::set_fps_readout(bool /*on*/) {}
 bool HostWindow::fps_readout() const { return false; }
+void HostWindow::set_menu_combo_start_select(bool /*on*/) {}
 bool HostWindow::assist_tools_enabled() const { return true; }
 int HostWindow::fast_forward_multiplier() const { return 4; }
 

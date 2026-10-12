@@ -137,6 +137,11 @@ struct RunOptions {
     std::uint8_t rewind_history_seconds = 0;
     std::uint8_t rewind_capture_interval_frames = 15;
 
+    // When true, pressing Start+Select together in game opens the runtime
+    // settings menu (cheats, save states, fast-forward, rewind). The combo is
+    // consumed as a host shortcut and never reaches the guest. Off by default.
+    bool in_game_menu_start_select = false;
+
     // Desktop autosave crash guard: when > 0 and the game runs in a window,
     // snapshot the machine state to the suspend-state file every N seconds and
     // leave a crash marker; a launch after an unclean exit resumes it (needs
