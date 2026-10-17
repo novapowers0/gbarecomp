@@ -1774,6 +1774,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     for (std::size_t ci = 0; ci < opts.cheat_preset_count; ++ci) {
         if (opts.cheat_presets) cheat_engine.add_preset(opts.cheat_presets[ci]);
     }
+    // Optional gain multipliers (XP/Zenie x2, ...) share the same menu,
+    // enablement and once-per-frame apply path as the presets above.
+    for (std::size_t mi = 0; mi < opts.cheat_multiplier_count; ++mi) {
+        if (opts.cheat_multipliers)
+            cheat_engine.add_multiplier(opts.cheat_multipliers[mi]);
+    }
     const bool cheats_active =
         opts.expose_cheats && cheat_engine.preset_count() > 0;
     const CheatMemory cheat_mem = make_bus_cheat_memory(bus);
@@ -1862,6 +1868,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             std::printf("force-interp: main-thread instructions interpreted "
                         "(recomp backend disabled)\n");
     }
+    if (const char* fiw = std::getenv("GBARECOMP_FORCE_INTERP_IWRAM"))
+        g_runtime_force_interp_iwram = (fiw[0] && fiw[0] != '0') ? 1 : 0;
+    if (g_runtime_force_interp_iwram)
+        std::fprintf(stderr, "force_interp_iwram=ENABLED (0x03000000-0x03007FFF)\n");
 
 #ifdef GBA_COSIM
     // Start the first-divergence oracle TCP server before the guest runs. The
@@ -2262,7 +2272,17 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                                     ? skip_default
                                     : (args.bios_skip_intro != 0);
     const bool boot_skip = skip_requested && args.load_state.empty();
-    if (boot_skip) gba::bios_hle_boot_skip(0x08000000u);
+    if (boot_skip) {
+        gba::bios_hle_boot_skip(0x08000000u);
+        // Match mGBA's skipBios PPU phase, which GBAVideoReset() pins to
+        // scanline 0x7E with the next HBlank VIDEO_HDRAW_LENGTH - 117 = 891
+        // cycles into the line (mGBA's GBAVideoReset in gba/video.c). The
+        // recomp otherwise boots the PPU at scanline 0, a ~half-frame phase
+        // offset: a movie recorded on mGBA then samples input at a different
+        // point of each frame, so a per-frame input replay (TAS) desyncs.
+        ppu.set_scanline_phase(0x7Eu, (1008u - 117u) / 4u,
+                               (1008u - 117u) % 4u);
+    }
     if (!args.quiet && args.load_state.empty())
         std::printf("bios_boot=%s (%s)\n",
                     args.bios_hle ? "HLE" : "LLE",
@@ -2429,12 +2449,122 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // spurious "recomp is a frame ahead". g_runtime_vblank_starts counts
     // VBlank-start events; stopping on its increment puts the recomp at the
     // same PPU phase as both oracles. See runtime_bus_bridge.cpp.
+    // ── Deterministic frame-indexed KEYINPUT trace ─────────────────
+    // Interactive discovery records every observed key-state change and
+    // flushes it immediately; strict acceptance can replay the frame-indexed
+    // trace from the same initial SRAM. Declared here (before step_frame and
+    // before the TCP free-run block) so a `--tcp` session that drives
+    // step_frame() applies the same deterministic input as the headless loop
+    // — without this, the replay block used to sit after the TCP block and a
+    // TCP run (which blocks the main thread in server.run) never reached it.
+    // The trace is input evidence only and never reads or steers guest state.
+    struct InputTraceEvent {
+        uint64_t frame = 0;
+        uint16_t keyinput = 0x03FFu;
+    };
+    const char* input_record_env = std::getenv("GBARECOMP_INPUT_RECORD");
+    const char* input_replay_env = std::getenv("GBARECOMP_INPUT_REPLAY");
+    const bool input_record_requested = input_record_env && input_record_env[0];
+    const bool input_replay_requested = input_replay_env && input_replay_env[0];
+    if (input_record_requested && input_replay_requested) {
+        std::fprintf(stderr,
+                     "[gbarecomp:runtime] GBARECOMP_INPUT_RECORD and "
+                     "GBARECOMP_INPUT_REPLAY are mutually exclusive\n");
+        runtime_shutdown();
+        return 1;
+    }
+
+    std::ofstream input_record_stream;
+    bool input_record_have_value = false;
+    uint16_t input_record_last_value = 0x03FFu;
+    if (input_record_requested) {
+        input_record_stream.open(input_record_env,
+                                 std::ios::out | std::ios::trunc);
+        if (!input_record_stream) {
+            std::fprintf(stderr,
+                         "[gbarecomp:runtime] could not create input trace %s\n",
+                         input_record_env);
+            runtime_shutdown();
+            return 1;
+        }
+        input_record_stream << "# gbarecomp-keyinput-v1\n";
+        input_record_stream << "# frame,keyinput_active_low\n";
+        input_record_stream.flush();
+        if (!args.quiet)
+            std::printf("input_record=ENABLED path=\"%s\"\n", input_record_env);
+    }
+
+    std::vector<InputTraceEvent> input_replay_events;
+    std::size_t input_replay_index = 0;
+    if (input_replay_requested) {
+        std::ifstream replay(input_replay_env);
+        if (!replay) {
+            std::fprintf(stderr,
+                         "[gbarecomp:runtime] could not open input trace %s\n",
+                         input_replay_env);
+            runtime_shutdown();
+            return 1;
+        }
+        std::string line;
+        uint64_t previous_frame = 0;
+        bool have_previous = false;
+        while (std::getline(replay, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            unsigned long long frame = 0;
+            unsigned keyinput = 0;
+            if (std::sscanf(line.c_str(), "%llu,0x%x", &frame, &keyinput) != 2 ||
+                keyinput > 0x03FFu ||
+                (have_previous && frame < previous_frame)) {
+                std::fprintf(stderr,
+                             "[gbarecomp:runtime] invalid input trace line: %s\n",
+                             line.c_str());
+                runtime_shutdown();
+                return 1;
+            }
+            input_replay_events.push_back(
+                {static_cast<uint64_t>(frame), static_cast<uint16_t>(keyinput)});
+            previous_frame = static_cast<uint64_t>(frame);
+            have_previous = true;
+        }
+        if (input_replay_events.empty()) {
+            std::fprintf(stderr,
+                         "[gbarecomp:runtime] input trace has no events: %s\n",
+                         input_replay_env);
+            runtime_shutdown();
+            return 1;
+        }
+        std::printf("input_replay=ENABLED path=\"%s\" events=%zu\n",
+                    input_replay_env, input_replay_events.size());
+        std::fflush(stdout);
+    } else {
+        std::printf("input_replay=DISABLED env=%s\n",
+                    input_replay_env ? input_replay_env : "(null)");
+        std::fflush(stdout);
+    }
+
+    auto apply_input_replay = [&]() {
+        if (!input_replay_requested) return;
+        const uint64_t frame = ppu.frame_count();
+        while (input_replay_index + 1 < input_replay_events.size() &&
+               input_replay_events[input_replay_index + 1].frame <= frame) {
+            ++input_replay_index;
+        }
+        if (input_replay_events[input_replay_index].frame <= frame) {
+            bus.io().set_keyinput(
+                input_replay_events[input_replay_index].keyinput);
+        }
+    };
+
     auto step_frame = [&]() -> bool {
         apply_cheats();
         uint64_t start_vbl = g_runtime_vblank_starts;
         constexpr uint64_t kMaxDispatchesPerFrame = 2'000'000ull;
         for (uint64_t i = 0; i < kMaxDispatchesPerFrame; ++i) {
             if (!step_once()) return false;
+            // Frame-indexed replay advances after every instruction, exactly
+            // like the headless inner loop, so the TCP free-run path changes
+            // KEYINPUT at the same sub-frame phase as a headless replay.
+            if (input_replay_requested) apply_input_replay();
             if (g_runtime_vblank_starts != start_vbl) return true;
         }
         return false;
@@ -2817,6 +2947,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         bool ctl_step_ok   = true;
 
         std::thread game_thread([&]() {
+            // Seed frame 0's KEYINPUT before the first step (mirrors the
+            // headless loop's pre-loop apply_input_replay()).
+            if (input_replay_requested) apply_input_replay();
             for (;;) {
                 int st;
                 {
@@ -2984,10 +3117,19 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     uint64_t framedump_start = 0;
     int framedump_max = 200;
     int framedump_written = 0;
+    // Windowed present already writes consecutive frames (stride 1). The
+    // headless path uses the same env but strides by EVERY so one bounded
+    // --frames replay of a long movie can capture the whole run cheaply.
+    int framedump_every = 1;
+    uint64_t framedump_last_frame = ~uint64_t{0};
     if (const char* e = std::getenv("GBARECOMP_FRAMEDUMP_START"))
         framedump_start = std::strtoull(e, nullptr, 0);
     if (const char* e = std::getenv("GBARECOMP_FRAMEDUMP_COUNT"))
         framedump_max = std::atoi(e);
+    if (const char* e = std::getenv("GBARECOMP_FRAMEDUMP_EVERY")) {
+        const int v = std::atoi(e);
+        if (v > 0) framedump_every = v;
+    }
     // ── HP-002 frame-phase ring ─────────────────────────────────────────
     // Opt-in per-presented-frame breakdown of where wall time went
     // between consecutive presents: guest execution, view-sync + render/
@@ -3455,7 +3597,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 cheat_menu_keys.push_back("cheat." + std::to_string(ci));
                 RecompRuntimeUiItem cheat_item{};
                 cheat_item.key         = cheat_menu_keys.back().c_str();
-                cheat_item.section     = "Cheats";
+                cheat_item.section     = cheat_engine.preset_section(ci);
                 cheat_item.label       = cheat_engine.preset_name(ci);
                 cheat_item.description = cheat_engine.preset_description(ci);
                 cheat_item.type        = RECOMP_RUNTIME_UI_BOOL;
@@ -3588,104 +3730,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         next_rewind_capture_frame = frame + rewind_interval;
     };
 
-    // Optional frame-indexed KEYINPUT trace. Interactive discovery records
-    // every observed key-state change and flushes it immediately; strict
-    // acceptance can replay the frame-indexed trace from the same initial
-    // SRAM. The trace is input evidence only and never reads or steers guest
-    // state.
-    struct InputTraceEvent {
-        uint64_t frame = 0;
-        uint16_t keyinput = 0x03FFu;
-    };
-    const char* input_record_env = std::getenv("GBARECOMP_INPUT_RECORD");
-    const char* input_replay_env = std::getenv("GBARECOMP_INPUT_REPLAY");
-    const bool input_record_requested = input_record_env && input_record_env[0];
-    const bool input_replay_requested = input_replay_env && input_replay_env[0];
-    if (input_record_requested && input_replay_requested) {
-        std::fprintf(stderr,
-                     "[gbarecomp:runtime] GBARECOMP_INPUT_RECORD and "
-                     "GBARECOMP_INPUT_REPLAY are mutually exclusive\n");
-        runtime_shutdown();
-        return 1;
-    }
-
-    std::ofstream input_record_stream;
-    bool input_record_have_value = false;
-    uint16_t input_record_last_value = 0x03FFu;
-    if (input_record_requested) {
-        input_record_stream.open(input_record_env,
-                                 std::ios::out | std::ios::trunc);
-        if (!input_record_stream) {
-            std::fprintf(stderr,
-                         "[gbarecomp:runtime] could not create input trace %s\n",
-                         input_record_env);
-            runtime_shutdown();
-            return 1;
-        }
-        input_record_stream << "# gbarecomp-keyinput-v1\n";
-        input_record_stream << "# frame,keyinput_active_low\n";
-        input_record_stream.flush();
-        if (!args.quiet)
-            std::printf("input_record=ENABLED path=\"%s\"\n", input_record_env);
-    }
-
-    std::vector<InputTraceEvent> input_replay_events;
-    std::size_t input_replay_index = 0;
-    if (input_replay_requested) {
-        std::ifstream replay(input_replay_env);
-        if (!replay) {
-            std::fprintf(stderr,
-                         "[gbarecomp:runtime] could not open input trace %s\n",
-                         input_replay_env);
-            runtime_shutdown();
-            return 1;
-        }
-        std::string line;
-        uint64_t previous_frame = 0;
-        bool have_previous = false;
-        while (std::getline(replay, line)) {
-            if (line.empty() || line[0] == '#') continue;
-            unsigned long long frame = 0;
-            unsigned keyinput = 0;
-            if (std::sscanf(line.c_str(), "%llu,0x%x", &frame, &keyinput) != 2 ||
-                keyinput > 0x03FFu ||
-                (have_previous && frame < previous_frame)) {
-                std::fprintf(stderr,
-                             "[gbarecomp:runtime] invalid input trace line: %s\n",
-                             line.c_str());
-                runtime_shutdown();
-                return 1;
-            }
-            input_replay_events.push_back(
-                {static_cast<uint64_t>(frame), static_cast<uint16_t>(keyinput)});
-            previous_frame = static_cast<uint64_t>(frame);
-            have_previous = true;
-        }
-        if (input_replay_events.empty()) {
-            std::fprintf(stderr,
-                         "[gbarecomp:runtime] input trace has no events: %s\n",
-                         input_replay_env);
-            runtime_shutdown();
-            return 1;
-        }
-        if (!args.quiet)
-            std::printf("input_replay=ENABLED path=\"%s\" events=%zu\n",
-                        input_replay_env, input_replay_events.size());
-    } else if (!args.quiet) {
-        std::printf("input_replay=DISABLED\n");
-    }
-
-    auto apply_input_replay = [&]() {
-        if (!input_replay_requested) return;
-        const uint64_t frame = ppu.frame_count();
-        while (input_replay_index + 1 < input_replay_events.size() &&
-               input_replay_events[input_replay_index + 1].frame <= frame) {
-            ++input_replay_index;
-        }
-        if (input_replay_events[input_replay_index].frame <= frame)
-            bus.io().set_keyinput(
-                input_replay_events[input_replay_index].keyinput);
-    };
+    // (Input record/replay state — InputTraceEvent, the record stream, and
+    // apply_input_replay — now lives BEFORE step_frame, so the TCP free-run
+    // path that drives step_frame() applies deterministic replay input too.
+    // The windowed/headless main loop still calls apply_input_replay() below.)
 
     // Optional monotonic-pump Assist action script for automated validation.
     // It exercises the same runtime save/load, fast-forward, and rewind paths
@@ -3924,8 +3972,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         fast_forward_multiplier = std::clamp(
             win.fast_forward_multiplier(), 2, 10);
 #endif
+        const bool turbo_boot_active =
+            args.window && opts.auto_fast_forward_until_frame != 0 &&
+            ppu.frame_count() < opts.auto_fast_forward_until_frame;
         fast_forward_active = assist_tools_enabled() &&
-                              (ev.fast_forward || fast_forward_latched);
+                              (ev.fast_forward || fast_forward_latched ||
+                               turbo_boot_active);
         // System hotkeys (config.ini [KeyMap], rebindable in the launcher).
         if (ev.toggle_fullscreen) {
             // Toggle between windowed and the configured mode. A session
@@ -4650,6 +4702,33 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     frame_phase.record(frame, fp_t0, fp_t1, fp_t2, fp_t3,
                                        fp_t4, FramePhaseRing::now_ns());
                 }
+            }
+        }
+        // Headless periodic framdump: the same delivered-content record as the
+        // windowed present path, but driven by the guest frame counter so a
+        // bounded --frames replay of a full movie can capture the whole run.
+        // Windowed runs keep the in-present dump above. Rendering here is a
+        // pure read of VRAM/OAM/PAL/IO (no guest-state mutation).
+        if (!args.window && framedump_dir) {
+            const uint64_t frame = ppu.frame_count();
+            if (frame != framedump_last_frame && frame >= framedump_start &&
+                (frame % static_cast<uint64_t>(framedump_every)) == 0 &&
+                framedump_written < framedump_max) {
+                framedump_last_frame = frame;
+                std::vector<uint8_t> fb(ppu.render_bytes(), 0);
+                if (ppu.has_latched_framebuffer()) {
+                    std::memcpy(fb.data(), ppu.latched_framebuffer(),
+                                fb.size());
+                } else {
+                    ppu.render(fb.data(), bus.io().read16(0x000),
+                               bus.io().raw(), bus.vram_ptr(), bus.oam_ptr(),
+                               bus.pal_ptr());
+                }
+                char p[512];
+                std::snprintf(p, sizeof(p), "%s/f_%06llu.png", framedump_dir,
+                              static_cast<unsigned long long>(frame));
+                write_png(p, fb.data(), ppu.render_width(), ppu.render_height());
+                ++framedump_written;
             }
         }
         // Differential-oracle WRAM trace fires on frame advance in BOTH windowed

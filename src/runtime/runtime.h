@@ -147,6 +147,13 @@ struct RunOptions {
     bool expose_assist_tools = false;
     bool assist_tools_enabled_by_default = true;
     std::uint8_t assist_fast_forward_multiplier_default = 4;
+    // Boot convenience for windowed sessions: run fast-forwarded (frames are
+    // still fully emulated and presented sparsely, exactly like the Assist
+    // Tools Fast-forward toggle) until this guest frame count is reached, then
+    // resume normal 60 fps pacing. Startup logos and publisher screens pass in
+    // a couple of seconds while the frame sequence itself is untouched. 0
+    // disables it, and headless runs ignore it.
+    std::uint64_t auto_fast_forward_until_frame = 0;
     std::uint8_t save_state_slot_count = 9;
     std::uint8_t rewind_history_seconds = 0;
     std::uint8_t rewind_capture_interval_frames = 15;
@@ -172,6 +179,13 @@ struct RunOptions {
     bool expose_cheats = false;
     const CheatPreset* cheat_presets = nullptr;
     std::size_t cheat_preset_count = 0;
+
+    // Optional gain-multiplier presets (cheat_engine.h): they watch live
+    // 32-bit values and scale every guest-observed increase (e.g. EXP x2).
+    // They appear in the same "Cheats" menu, start disabled, and seed
+    // themselves when enabled, so nothing changes until the player opts in.
+    const CheatMultiplierSpec* cheat_multipliers = nullptr;
+    std::size_t cheat_multiplier_count = 0;
 
     // Optional in-game "Editor" section: numeric fields (money, stats, ...) the
     // player can read and change directly. Each row reads the live value and
