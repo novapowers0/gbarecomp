@@ -2087,8 +2087,53 @@ void HostWindow::push_audio_block(const int16_t* samples, std::size_t count,
     // Producer: append mono frames into the bridge ring. The SDL callback
     // (gba_audio_callback) drains it at the device rate with band-limited
     // resampling + a P-only fill servo — no queue underrun, no hard flush.
+    //
+    // Optional output smoothing (GBARECOMP_AUDIO_SMOOTH=1, off by default):
+    // a gentle one-pole low-pass (alpha 830/1024 ≈ 8.5 kHz at the native
+    // 32.768 kHz mixer rate) softens the harshness of 8-bit Direct Sound
+    // streams without the audible "muffling" of a stronger filter. The
+    // bypass path is byte-identical to the unsmoothed stream.
+    static int s_smooth = -1;
+    static int32_t s_smooth_state = 0;
+    static bool s_smooth_logged = false;
+    if (s_smooth < 0) {
+        const char* e = std::getenv("GBARECOMP_AUDIO_SMOOTH");
+        s_smooth = (e && *e && *e != '0') ? 1 : 0;
+        if (s_smooth)
+            std::fprintf(stderr,
+                         "audio_smooth=ENABLED (one-pole ~8.5kHz)\n");
+    }
     SDL_LockMutex(b->audio_mtx);
-    rab_push(&b->bridge, samples, static_cast<int>(count)); // mono: count == frames
+    if (s_smooth && count > 0) {
+        static int16_t scratch[4096];
+        const std::size_t n = count < 4096 ? count : 4096;
+        long double in_sq = 0.0, out_sq = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            const int32_t x = samples[i];
+            s_smooth_state += ((x - s_smooth_state) * 830) >> 10;
+            if (s_smooth_state > 32767) s_smooth_state = 32767;
+            else if (s_smooth_state < -32768) s_smooth_state = -32768;
+            scratch[i] = static_cast<int16_t>(s_smooth_state);
+            in_sq += static_cast<long double>(x) * x;
+            out_sq += static_cast<long double>(scratch[i]) * scratch[i];
+        }
+        if (!s_smooth_logged) {
+            s_smooth_logged = true;
+            std::fprintf(stderr,
+                "audio_smooth: first block frames=%zu rms_in=%.1f rms_out=%.1f\n",
+                n,
+                static_cast<double>(std::sqrt(
+                    static_cast<double>(in_sq / n))),
+                static_cast<double>(std::sqrt(
+                    static_cast<double>(out_sq / n))));
+        }
+        rab_push(&b->bridge, scratch, static_cast<int>(n));
+        if (count > n)
+            rab_push(&b->bridge, samples + n,
+                     static_cast<int>(count - n));
+    } else {
+        rab_push(&b->bridge, samples, static_cast<int>(count)); // mono: count == frames
+    }
     SDL_UnlockMutex(b->audio_mtx);
 
     // ── NES-mode crackle probe (measure step) ──────────────────────────
@@ -3022,15 +3067,20 @@ HostWindow::Events HostWindow::pump() {
     // Start+Select (GBA bits 2 and 3, active low) opens the runtime menu when
     // the game opts in. The combo is a host shortcut: it opens the menu on the
     // press edge only and is not leaked to the guest.
+    //
+    // A+B+Start+Select is the GBA soft-reset combo, so a bare Start+Select must
+    // not swallow the reset: when A and B are held as well, the whole combo is
+    // left for the guest (the BIOS sees the reset) and the menu does not open.
     if (b->menu_combo_start_select) {
         const bool ss_down = (keys & 0x0Cu) == 0;
-        if (ss_down && !b->menu_combo_ss_down) {
+        const bool soft_reset_combo = ss_down && (keys & 0x03u) == 0;
+        if (ss_down && !soft_reset_combo && !b->menu_combo_ss_down) {
 #if defined(GBARECOMP_RUNTIME_UI)
             open_runtime_menu_from_touch(b);
 #endif
         }
         b->menu_combo_ss_down = ss_down;
-        if (ss_down) keys |= 0x0Cu;
+        if (ss_down && !soft_reset_combo) keys |= 0x0Cu;
     }
     ev.keyinput = keys;
 #if defined(GBARECOMP_RUNTIME_UI)
