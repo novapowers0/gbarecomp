@@ -60,9 +60,18 @@ extern "C" ArmCpuState g_cpu = {};
 extern "C" RuntimeThumbAluImmediateOverride
     g_runtime_thumb_alu_imm_override = nullptr;
 extern "C" RuntimeBusReadOverride g_runtime_bus_read_override = nullptr;
+extern "C" RuntimeBusWriteOverride g_runtime_bus_write_override = nullptr;
 extern "C" RuntimeRamDispatchHook g_runtime_ram_dispatch_hook = nullptr;
 extern "C" RuntimeForceInterpHook g_runtime_force_interp_hook = nullptr;
 extern "C" int g_runtime_force_interp_step_active = 0;
+extern "C" int g_runtime_force_interp_iwram = 0;
+extern "C" int runtime_force_interp_pc(uint32_t pc, int thumb) {
+    if (g_runtime_force_interp_hook && g_runtime_force_interp_hook(pc, thumb))
+        return 1;
+    if (g_runtime_force_interp_iwram && pc >= 0x03000000u && pc < 0x03008000u)
+        return 1;
+    return 0;
+}
 
 // VBlank-start counter (defined in src/runtime/runtime_bus_bridge.cpp).
 // Used to frame-gate the mem-write watchpoint.
@@ -872,8 +881,7 @@ const DispatchEntry* dispatch_resolve(uint32_t target_pc) {
     // outer run loop first. Honor the per-PC interpreter predicate at this
     // central dispatch boundary too, and use the existing whole-subtree bridge
     // so the generated call/return ABI remains balanced.
-    if (g_runtime_force_interp_hook &&
-        g_runtime_force_interp_hook(pc, thumb ? 1 : 0)) {
+    if (runtime_force_interp_pc(pc, thumb ? 1 : 0)) {
         if (g_resumable_context)
             throw std::logic_error("multiplayer requires native dispatch coverage");
         runtime_bridge_interpret(pc, thumb, 0u, 0u);
@@ -1543,9 +1551,7 @@ extern "C" void runtime_irq(uint32_t return_address) {
     auto drive_irq_instruction = []() {
         const uint32_t pc = g_cpu.R[15] & ~1u;
         const int thumb = (g_cpu.cpsr & CPSR_T_BIT) != 0;
-        if (g_force_interp ||
-            (g_runtime_force_interp_hook &&
-             g_runtime_force_interp_hook(pc, thumb))) {
+        if (g_force_interp || runtime_force_interp_pc(pc, thumb)) {
             runtime_force_interp_step();
         } else {
             runtime_dispatch(g_cpu.R[15]);
@@ -1605,6 +1611,7 @@ void runtime_capture_arm_context(RuntimeArmContext& out) {
     out.irq_entries = g_runtime_irq_entries;
     out.immediate_override = g_runtime_thumb_alu_imm_override;
     out.read_override = g_runtime_bus_read_override;
+    out.write_override = g_runtime_bus_write_override;
     out.ram_dispatch = g_runtime_ram_dispatch_hook;
     out.force_interp = g_runtime_force_interp_hook;
     out.entry_hook = g_runtime_fn_entry_hook;
@@ -1627,6 +1634,7 @@ void runtime_restore_arm_context(const RuntimeArmContext& in) {
     g_runtime_irq_entries = in.irq_entries;
     g_runtime_thumb_alu_imm_override = in.immediate_override;
     g_runtime_bus_read_override = in.read_override;
+    g_runtime_bus_write_override = in.write_override;
     g_runtime_ram_dispatch_hook = in.ram_dispatch;
     g_runtime_force_interp_hook = in.force_interp;
     g_runtime_force_interp_step_active = 0;

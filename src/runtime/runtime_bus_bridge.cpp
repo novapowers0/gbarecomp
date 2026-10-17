@@ -442,6 +442,22 @@ static inline uint32_t apply_bus_read_override(uint32_t addr, uint32_t width,
     return value;
 }
 
+// Symmetric write-side hook. The guest's computed value is passed through the
+// game-owned callback (when installed); a non-zero return replaces the value
+// that actually lands on the bus. nullptr keeps every write byte-for-byte.
+static inline uint32_t apply_bus_write_override(uint32_t addr, uint32_t width,
+                                                uint32_t value) {
+    uint32_t overridden = value;
+    if (g_runtime_bus_write_override &&
+        g_runtime_bus_write_override(g_cpu.R[15], addr, width, value,
+                                     &overridden)) {
+        if (width == 1u) return overridden & 0xFFu;
+        if (width == 2u) return overridden & 0xFFFFu;
+        return overridden;
+    }
+    return value;
+}
+
 extern "C" uint32_t bus_read_u32(uint32_t addr) {
     if (is_io_addr(addr)) runtime_mmio_catch_up();
     if (!is_idle_safe_read(addr)) ++g_idle_disturb_epoch;
@@ -484,6 +500,7 @@ extern "C" uint8_t bus_read_u8(uint32_t addr) {
 extern "C" void bus_write_u32(uint32_t addr, uint32_t val) {
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
+    val = apply_bus_write_override(addr, 4u, val);
     if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write32(addr, val);
     ++g_idle_disturb_epoch;   // any guest write may change a watched poll value
     if (io) runtime_resync_horizon();
@@ -492,6 +509,7 @@ extern "C" void bus_write_u32(uint32_t addr, uint32_t val) {
 extern "C" void bus_write_u16(uint32_t addr, uint16_t val) {
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
+    val = static_cast<uint16_t>(apply_bus_write_override(addr, 2u, val));
     if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write16(addr, val);
     ++g_idle_disturb_epoch;
     if (io) runtime_resync_horizon();
@@ -500,6 +518,7 @@ extern "C" void bus_write_u16(uint32_t addr, uint16_t val) {
 extern "C" void bus_write_u8(uint32_t addr, uint8_t val) {
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
+    val = static_cast<uint8_t>(apply_bus_write_override(addr, 1u, val));
     if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write8(addr, val);
     ++g_idle_disturb_epoch;
     if (io) runtime_resync_horizon();
@@ -1024,8 +1043,7 @@ extern "C" bool runtime_should_yield(void) {
     // live interpreter. Do not re-trigger while the interpreter itself checks
     // the ordinary halt/frame/debug yield conditions below.
     if (!g_runtime_force_interp_step_active &&
-        g_runtime_force_interp_hook &&
-        g_runtime_force_interp_hook(
+        runtime_force_interp_pc(
             g_cpu.R[15] & ~1u,
             (g_cpu.cpsr & CPSR_T_BIT) != 0 ? 1 : 0)) {
         return true;

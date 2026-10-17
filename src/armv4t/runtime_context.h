@@ -30,6 +30,7 @@ struct RuntimeArmContext {
     std::uint64_t irq_entries = 0;
     RuntimeThumbAluImmediateOverride immediate_override = nullptr;
     RuntimeBusReadOverride read_override = nullptr;
+    RuntimeBusWriteOverride write_override = nullptr;
     RuntimeRamDispatchHook ram_dispatch = nullptr;
     // Optional pure PC/mode predicate: no bus reads or guest mutations. False
     // guarantees the RAM hook would decline, allowing normal generated RAM

@@ -62,6 +62,19 @@ typedef int (*RuntimeBusReadOverride)(uint32_t instruction_pc,
                                      uint32_t* out_value);
 extern RuntimeBusReadOverride g_runtime_bus_read_override;
 
+// Optional game-owned override for mapped bus writes, symmetric with the read
+// override above. Generated code passes the exact guest instruction PC, the
+// address, the width and the value the guest computed; the store lands with
+// *out_value only when the callback returns non-zero. nullptr preserves the
+// original write byte for byte. Intended for narrow, opt-in presentation
+// patches (never to make emulation "work by accident").
+typedef int (*RuntimeBusWriteOverride)(uint32_t instruction_pc,
+                                      uint32_t address,
+                                      uint32_t width,
+                                      uint32_t original_value,
+                                      uint32_t* out_value);
+extern RuntimeBusWriteOverride g_runtime_bus_write_override;
+
 // Optional game-owned canonicalizer for position-independent code copied to
 // transient RAM addresses (notably routines executed from a moving stack
 // frame). It runs before the fixed dispatch table and returns non-zero after
@@ -77,6 +90,14 @@ extern RuntimeRamDispatchHook g_runtime_ram_dispatch_hook;
 typedef int (*RuntimeForceInterpHook)(uint32_t pc, int thumb);
 extern RuntimeForceInterpHook g_runtime_force_interp_hook;
 extern int g_runtime_force_interp_step_active;
+
+// Opt-in narrow variant (GBARECOMP_FORCE_INTERP_IWRAM): interpret only code
+// resident in IWRAM (0x03000000-0x03007FFF) while the rest of the program keeps
+// the native backend. Lets RAM-patched routines (test cheats, self-modifying
+// code) run at full speed without interpreting the whole ROM. Combined with the
+// game-owned per-PC hook by runtime_force_interp_pc().
+extern int g_runtime_force_interp_iwram;
+int runtime_force_interp_pc(uint32_t pc, int thumb);
 
 // Only exact PCs opted in by the recompiler config call this helper. The
 // universal/default generated path keeps the compile-time operand and emits no
