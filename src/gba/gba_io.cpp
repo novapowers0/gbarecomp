@@ -162,6 +162,11 @@ GbaIo::GbaIo() {
     // BIOS instruction #743 (LDRH from 0x04000088).
     io_[0x088] = 0x00;
     io_[0x089] = 0x02;
+    // RCNT (0x134): reset value 0x8000 per GBATEK — bit 15 selects general
+    // purpose (non-multiplayer) mode. The real BIOS and mGBA's skipBios both
+    // leave this at 0x8000 at the cart handoff; defaulting to 0 diverged.
+    io_[IoReg::RCNT]     = 0x00;
+    io_[IoReg::RCNT + 1] = 0x80;
 }
 GbaIo::~GbaIo() { set_serial_device(nullptr); }
 

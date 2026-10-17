@@ -101,6 +101,16 @@ public:
     // Reset to scanline 0, dot 0. Used by the runtime on cold boot.
     void reset();
 
+    // Boot-phase override for the mGBA-compatible skipBios handoff. mGBA's
+    // GBAVideoReset() (third_party/mgba/src/gba/video.c) leaves the PPU on
+    // scanline 0x7E with the next HBlank scheduled VIDEO_HDRAW_LENGTH - 117
+    // cycles into the line. The recomp otherwise starts the PPU at scanline 0,
+    // a ~half-frame phase offset that shifts per-frame input sampling relative
+    // to a movie recorded on mGBA (a TAS replay desyncs). Sets the counters and
+    // the VCOUNT register; the DISPSTAT flags are derived from them on read.
+    void set_scanline_phase(uint32_t scanline, uint32_t dot,
+                            uint32_t cycle_in_dot);
+
     // Save-state serialization (all internal timing + latched frame).
     // No live pointers to skip. See debug/snapshot.h.
     void serialize(gbarecomp::debug::SnapshotWriter& w) const;

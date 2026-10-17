@@ -178,6 +178,14 @@ void GbaPpu::reset() {
     std::memset(work_fb_.data(), 0xFF, work_fb_.size());
 }
 
+void GbaPpu::set_scanline_phase(uint32_t scanline, uint32_t dot,
+                                uint32_t cycle_in_dot) {
+    scanline_ = scanline % kLinesTotal;
+    dot_in_scanline_ = dot % kDotsPerScanline;
+    cycle_in_dot_ = cycle_in_dot % kCyclesPerDot;
+    vcount_ = static_cast<uint16_t>(scanline_);
+}
+
 void GbaPpu::set_view_margins(uint32_t left, uint32_t right,
                               uint32_t top, uint32_t bottom) {
     // Geometry alone cannot authorize vertical content. The compositor also

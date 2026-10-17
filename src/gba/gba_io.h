@@ -87,6 +87,7 @@ constexpr uint32_t HALTCNT   = 0x301;  // u8   (write-only)
 constexpr uint32_t UNDOC_410 = 0x410;
 constexpr uint32_t KEYINPUT  = 0x130;  // u16 (read-only)
 constexpr uint32_t KEYCNT    = 0x132;  // u16
+constexpr uint32_t RCNT      = 0x134;  // u16 (reset default 0x8000)
 }  // namespace IoReg
 
 class GbaIo {

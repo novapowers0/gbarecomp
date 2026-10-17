@@ -537,6 +537,18 @@ void bios_hle_boot_skip(uint32_t cart_entry) {
     // its own during init. Zero = none yet. (IME defaults to 0, so no IRQ can
     // vector before the game programs IE/IME anyway.)
     bus_write_u32(0x03007FFCu, 0);
+    // DISPCNT at the BIOS->cart handoff. The real BIOS leaves forced blank
+    // (DISPCNT bit 7 = 0x0080) set, so the post-boot screen is white until the
+    // cart reprograms DISPCNT. Verified against the real BIOS handoff
+    // (gbarecomp_oracle --bios: DISPCNT=0x0080 at the cart entry) and against
+    // mGBA's own skipBios state. Leaving DISPCNT at the reset default of 0
+    // renders the backdrop (PAL[0]) instead of hardware forced-blank white,
+    // which is the first native-vs-oracle divergence.
+    bus_write_u16(0x04000000u, 0x0080u);
+    // POSTFLG (0x04000300): the real BIOS sets bit 0 to 1 before handing off
+    // to the cart, and mGBA's skipBios does the same. Games read this to tell
+    // a cold boot from a warm reset; leaving it 0 diverged from the oracle.
+    bus_write_u8(0x04000300u, 0x01u);
 }
 
 BiosHleMode bios_hle_mode() { return g_mode; }
