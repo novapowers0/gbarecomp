@@ -35,6 +35,40 @@ struct CheatPreset {
     const char* name = nullptr;
     const char* description = nullptr;
     const char* code = nullptr;
+    // Optional in-game menu section. Null groups the preset under "Cheats";
+    // games may group related presets (e.g. "Cheats - Multipliers") so the
+    // menu reads as tidy categories instead of one flat list.
+    const char* section = nullptr;
+};
+
+// A "multiplier" preset watches a live value and, whenever the guest changes
+// it, writes back the change scaled by the configured factors. Intended for
+// optional conveniences like "EXP x2" or a difficulty knob: the player keeps
+// playing, but gains land twice (or losses hurt twice).
+//
+// Gains: new = last + delta x factor / gain_div, for positive deltas only.
+// Losses: new = last + delta x loss_factor / loss_div, for negative deltas
+// only (defaults 1/1 leave losses untouched; 2/1 doubles damage taken; 1/2
+// halves it). Absolute resets and implausibly large jumps pass through
+// untouched; enabling the preset seeds each address with the value present at
+// that moment, so it never multiplies the current total.
+struct CheatMultiplierTarget {
+    uint32_t address = 0;
+    uint32_t factor = 2;       // gain multiplier (paired with gain_div)
+    uint32_t cap = 0;          // upper bound for written values; 0 = none
+    uint32_t gain_div = 1;     // gain divisor (factor 1 + div 2 = x0.5)
+    uint32_t loss_factor = 1;  // loss multiplier (damage x2 = 2)
+    uint32_t loss_div = 1;     // loss divisor (damage x0.5 = 2)
+    uint8_t  width = 4;        // watched width in bytes: 2 or 4
+};
+
+struct CheatMultiplierSpec {
+    const char* name = nullptr;
+    const char* description = nullptr;
+    const CheatMultiplierTarget* targets = nullptr;
+    std::size_t target_count = 0;
+    // Optional in-game menu section; null follows the CheatPreset grouping.
+    const char* section = nullptr;
 };
 
 // A parsed CodeBreaker op. Serial repeaters (type 4) fold their continuation
@@ -59,10 +93,13 @@ void cheat_apply_ops(const std::vector<CheatOp>& ops, const CheatMemory& mem);
 class CheatEngine {
 public:
     void add_preset(const CheatPreset& preset);
+    void add_multiplier(const CheatMultiplierSpec& spec);
 
     std::size_t preset_count() const { return presets_.size(); }
     const char* preset_name(std::size_t i) const;
     const char* preset_description(std::size_t i) const;
+    // Menu section for preset i; never null (defaults to "Cheats").
+    const char* preset_section(std::size_t i) const;
 
     bool enabled(std::size_t i) const;
     void set_enabled(std::size_t i, bool on);
@@ -74,9 +111,24 @@ public:
 
 private:
     struct Preset {
+        struct Multiplier {
+            uint32_t address = 0;
+            uint32_t factor = 2;
+            uint32_t cap = 0;
+            uint32_t gain_div = 1;
+            uint32_t loss_factor = 1;
+            uint32_t loss_div = 1;
+            uint8_t  width = 4;
+            // Watch state; mutable because apply() runs on a const engine,
+            // like the ops it sits beside.
+            mutable uint32_t last = 0;
+            mutable bool seeded = false;
+        };
         std::string name;
         std::string description;
+        std::string section;
         std::vector<CheatOp> ops;
+        std::vector<Multiplier> multipliers;
         bool enabled = false;
     };
     std::vector<Preset> presets_;

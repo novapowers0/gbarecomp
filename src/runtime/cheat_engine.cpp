@@ -179,6 +179,29 @@ void CheatEngine::add_preset(const CheatPreset& preset) {
     if (preset.name) p.name = preset.name;
     if (preset.description) p.description = preset.description;
     if (preset.code) p.ops = cheat_parse_code(preset.code);
+    p.section = preset.section ? preset.section : "Cheats";
+    presets_.push_back(std::move(p));
+}
+
+void CheatEngine::add_multiplier(const CheatMultiplierSpec& spec) {
+    if (!spec.name || !spec.targets || spec.target_count == 0) return;
+    Preset p;
+    p.name = spec.name;
+    if (spec.description) p.description = spec.description;
+    p.section = spec.section ? spec.section : "Cheats";
+    for (std::size_t i = 0; i < spec.target_count; ++i) {
+        Preset::Multiplier m;
+        m.address = spec.targets[i].address;
+        m.factor = spec.targets[i].factor ? spec.targets[i].factor : 2;
+        m.cap = spec.targets[i].cap;
+        m.gain_div = spec.targets[i].gain_div ? spec.targets[i].gain_div : 1;
+        m.loss_factor =
+            spec.targets[i].loss_factor ? spec.targets[i].loss_factor : 1;
+        m.loss_div =
+            spec.targets[i].loss_div ? spec.targets[i].loss_div : 1;
+        m.width = (spec.targets[i].width == 2) ? 2 : 4;
+        p.multipliers.push_back(m);
+    }
     presets_.push_back(std::move(p));
 }
 
@@ -190,16 +213,32 @@ const char* CheatEngine::preset_description(std::size_t i) const {
     return i < presets_.size() ? presets_[i].description.c_str() : "";
 }
 
+const char* CheatEngine::preset_section(std::size_t i) const {
+    return i < presets_.size() ? presets_[i].section.c_str() : "Cheats";
+}
+
 bool CheatEngine::enabled(std::size_t i) const {
     return i < presets_.size() && presets_[i].enabled;
 }
 
 void CheatEngine::set_enabled(std::size_t i, bool on) {
-    if (i < presets_.size()) presets_[i].enabled = on;
+    if (i >= presets_.size()) return;
+    Preset& p = presets_[i];
+    // Re-seed a multiplier on every off->on edge so enabling mid-game never
+    // multiplies the value already accumulated.
+    if (on && !p.enabled) {
+        for (Preset::Multiplier& m : p.multipliers) m.seeded = false;
+    }
+    p.enabled = on;
 }
 
 void CheatEngine::set_all(bool on) {
-    for (Preset& p : presets_) p.enabled = on;
+    for (Preset& p : presets_) {
+        if (on && !p.enabled) {
+            for (Preset::Multiplier& m : p.multipliers) m.seeded = false;
+        }
+        p.enabled = on;
+    }
 }
 
 bool CheatEngine::any_enabled() const {
@@ -210,8 +249,81 @@ bool CheatEngine::any_enabled() const {
 }
 
 void CheatEngine::apply(const CheatMemory& mem) const {
+    // Every guest-observed change becomes delta x factor on top of the last
+    // value the engine wrote (m.last + delta x factor), so repeated changes
+    // stay linear instead of compounding the already-multiplied base. Only
+    // deltas up to a sane bound multiply; absolute resets (save loads) and
+    // implausibly large jumps are adopted as the new base untouched. Gain and
+    // loss factors are configured independently, so a preset can scale gains
+    // only ("EXP x2"), losses only ("Damage taken x2") or divide either
+    // ("Slow XP curve", "Damage taken x0.5").
+    static constexpr int64_t kMaxMultipliedDelta = 1 << 20;
     for (const Preset& p : presets_) {
-        if (p.enabled) cheat_apply_ops(p.ops, mem);
+        if (!p.enabled) continue;
+        cheat_apply_ops(p.ops, mem);
+        if (p.multipliers.empty()) continue;
+        for (const Preset::Multiplier& m : p.multipliers) {
+            const bool width16 = m.width == 2;
+            if (width16) {
+                if (!mem.read16 || !mem.write16) continue;
+            } else if (!mem.read16 || !mem.write32) {
+                continue;
+            }
+            uint32_t v = 0;
+            if (width16) {
+                v = mem.read16(mem.ctx, m.address);
+            } else {
+                v = static_cast<uint32_t>(mem.read16(mem.ctx, m.address)) |
+                    (static_cast<uint32_t>(
+                        mem.read16(mem.ctx, m.address + 2u)) << 16);
+            }
+            if (!m.seeded) {
+                m.seeded = true;
+                m.last = v;
+                continue;
+            }
+            if (v == m.last) continue;
+            const int64_t delta = static_cast<int64_t>(v) -
+                static_cast<int64_t>(m.last);
+            bool written = false;
+            if (delta > 0 && delta <= kMaxMultipliedDelta &&
+                (m.factor != 1 || m.gain_div != 1)) {
+                const int64_t scaled =
+                    delta * static_cast<int64_t>(m.factor) /
+                    static_cast<int64_t>(m.gain_div ? m.gain_div : 1);
+                uint64_t nv = static_cast<uint64_t>(m.last) +
+                    static_cast<uint64_t>(scaled);
+                if (m.cap != 0 && nv > m.cap) nv = m.cap;
+                const uint64_t maxv = width16 ? 0xFFFFull : 0xFFFFFFFFull;
+                if (nv > maxv) nv = maxv;
+                m.last = static_cast<uint32_t>(nv);
+                if (width16) {
+                    mem.write16(mem.ctx, m.address,
+                                static_cast<uint16_t>(m.last));
+                } else {
+                    mem.write32(mem.ctx, m.address, m.last);
+                }
+                written = true;
+            } else if (delta < 0 && -delta <= kMaxMultipliedDelta &&
+                       (m.loss_factor != 1 || m.loss_div != 1)) {
+                const int64_t scaled =
+                    delta * static_cast<int64_t>(m.loss_factor) /
+                    static_cast<int64_t>(m.loss_div ? m.loss_div : 1);
+                int64_t nv = static_cast<int64_t>(m.last) + scaled;
+                if (nv < 0) nv = 0;
+                if (m.cap != 0 && static_cast<uint64_t>(nv) > m.cap)
+                    nv = static_cast<int64_t>(m.cap);
+                m.last = static_cast<uint32_t>(nv);
+                if (width16) {
+                    mem.write16(mem.ctx, m.address,
+                                static_cast<uint16_t>(m.last));
+                } else {
+                    mem.write32(mem.ctx, m.address, m.last);
+                }
+                written = true;
+            }
+            if (!written) m.last = v;
+        }
     }
 }
 
