@@ -51,6 +51,7 @@ extern "C" int (*g_ws_obj_attr_x_provider)(int, std::uint16_t,
 // rest.
 extern "C" int g_ws_obj_native_clip = 0;
 extern "C" const WsMarginObjPixel* (*g_ws_obj_margin_provider)(int, int*, int*) = nullptr;
+extern "C" const std::uint16_t* (*g_ws_margin_backdrop_provider)(int, int*, int*) = nullptr;
 
 namespace {
 
@@ -1558,6 +1559,26 @@ void render_scanline_wide(uint8_t* rgb, int y, uint16_t dispcnt,
         top[x].target1 = blend_enabled(x) && ((first_targets & (1u << 5)) != 0);
         top[x].target2 = (second_targets & (1u << 5)) != 0;
         top[x].valid = true;
+    }
+    if (g_ws_margin_backdrop_provider && out_w > kVanW) {
+        int left = 0, width = 0;
+        const uint16_t* art = g_ws_margin_backdrop_provider(
+            static_cast<int>(y), &left, &width);
+        if (art && width > 0 &&
+            width <= static_cast<int>(GbaPpu::kMaxRenderWidth)) {
+            for (int i = 0; i < width; ++i) {
+                const int hx = left + i;
+                const int x = hx + static_cast<int>(ox);
+                if ((native_row && hx >= 0 && hx < static_cast<int>(kVanW)) ||
+                    x < 0 || x >= static_cast<int>(out_w) ||
+                    (art[i] & 0x8000u))
+                    continue;
+                top[x].color = art[i];
+#if !defined(GBARECOMP_SCANLINE_HLE)
+                to_rgb888(art[i], top[x].rgb);
+#endif
+            }
+        }
     }
     auto submit = [&](uint32_t x, uint16_t color, int key, uint8_t layer,
                       bool target1, bool target2) {

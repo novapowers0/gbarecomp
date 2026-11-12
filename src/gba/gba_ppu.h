@@ -313,4 +313,15 @@ struct WsMarginObjPixel {
 extern "C" const WsMarginObjPixel* (*g_ws_obj_margin_provider)(
     int screen_y, int* hardware_left, int* width);
 
+// Optional game-owned margin backdrop: RGB555 pixels (bit 15 = keep the guest
+// backdrop) that replace the backdrop candidate in the expanded margin
+// columns of one scanline, indexed from hardware x = *hardware_left. It sits
+// at backdrop depth, so every guest BG/OBJ pixel still draws over it and the
+// backdrop's own color-effect targets (BLDCNT bit 5/13) apply to it. Never
+// consulted inside the native 240x160 viewport; null leaves rendering
+// byte-identical. Used for opt-in margin art on screens with no authored
+// content beyond 240 px.
+extern "C" const std::uint16_t* (*g_ws_margin_backdrop_provider)(
+    int screen_y, int* hardware_left, int* width);
+
 }  // namespace gba

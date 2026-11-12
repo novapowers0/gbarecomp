@@ -711,6 +711,37 @@ void test_obj_only_palette_backdrop_is_not_policy_black() {
     gba::g_ws_pillarbox_right = 0;
 }
 
+const std::uint16_t* red_margin_backdrop(int y, int* left, int* width) {
+    static std::uint16_t row[288];
+    if (y != 0) return nullptr;
+    for (auto& c : row) c = 0x001F;  // red
+    *left = -24;
+    *width = 288;
+    return row;
+}
+
+void test_margin_backdrop_is_margin_only_and_opt_in() {
+    Fixture f;
+    for (std::size_t i = 0; i < 128; ++i)
+        store16(&f.oam[i * 8], 0x0200);  // Disable every OBJ.
+    store16(&f.pal[0], 0x0000);          // Backdrop = black.
+    f.ppu.set_view_margins(24, 24, 0, 0);
+    std::vector<uint8_t> wide(gba::GbaPpu::kMaxFramebufferBytes, 0);
+    gba::g_ws_margin_backdrop_provider = red_margin_backdrop;
+    f.ppu.render(wide.data(), 0x0100, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(wide.data(), 255, 0, 0, "left margin uses provided backdrop");
+    expect_pixel(wide.data() + (287u * 3u), 255, 0, 0,
+                 "right margin uses provided backdrop");
+    expect_pixel(wide.data() + (30u * 3u), 0, 0, 0,
+                 "native viewport never uses provided backdrop");
+    std::fill(wide.begin(), wide.end(), 0);
+    gba::g_ws_margin_backdrop_provider = nullptr;
+    f.ppu.render(wide.data(), 0x0100, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(wide.data(), 0, 0, 0, "null provider leaves margins alone");
+}
+
 void test_extended_view_obj_attr_x_is_explicitly_opt_in() {
     Fixture f;
     for (std::size_t i = 0; i < 128; ++i)
@@ -1932,6 +1963,7 @@ int main() {
     test_extended_bg_sample_remap_is_opt_in_and_native_inert();
     test_extended_view_snapshot_latch_policy();
     test_obj_only_palette_backdrop_is_not_policy_black();
+    test_margin_backdrop_is_margin_only_and_opt_in();
     test_extended_view_obj_x_is_explicitly_opt_in();
     test_extended_view_obj_attr_x_is_explicitly_opt_in();
     test_extended_view_obj_native_clip_is_opt_in();
