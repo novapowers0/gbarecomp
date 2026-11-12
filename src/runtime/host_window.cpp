@@ -2150,6 +2150,8 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
 
     // The host device receives stereo S16. Both playback modes convert from
     // the block's SOUNDBIAS rate; the initial device rate is only a preference.
+    // The launcher's sample-rate choice (--audio-freq) still picks it.
+    const int want_freq = audio_freq > 0 ? audio_freq : 65536;
     SDL_AudioSpec want{};
     want.freq     = want_freq;
     want.format   = AUDIO_S16SYS;
@@ -2258,8 +2260,7 @@ void HostWindow::push_audio_stereo_block(const int16_t* samples, std::size_t cou
         s_smooth = (e && *e && *e != '0') ? 1 : 0;
         if (s_smooth)
             std::fprintf(stderr,
-                         "audio_smooth=ENABLED (one-pole ~8.5kHz, stereo)
-");
+                         "audio_smooth=ENABLED (one-pole ~8.5kHz, stereo)\n");
     }
     if (s_smooth) {
         s_smooth_buf.resize(count * 2);

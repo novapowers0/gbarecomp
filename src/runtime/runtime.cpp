@@ -1302,6 +1302,8 @@ bool parse_cli(int argc, char** argv, Args* args, std::string* err) {
             const char* v = need_value("--audio-shadow");
             if (!v) return false;
             args->audio_shadow = (v[0] == '1' || v[0] == 't' || v[0] == 'T');
+            continue;
+        }
         if (s == "--integer-scale" || s == "--scanlines" || s == "--scanline-strength") {
             const char* v = need_value(s.c_str());
             if (!v) return false;
