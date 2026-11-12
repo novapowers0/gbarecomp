@@ -191,6 +191,10 @@ public:
     // diagnostic FIFO trace ring is NOT serialized. See debug/snapshot.h.
     void serialize(gbarecomp::debug::SnapshotWriter& w) const;
     void deserialize(gbarecomp::debug::SnapshotReader& r);
+    // Fork: read a snapshot-v2 audio payload (mono ring, no PSG ch3/ch4
+    // state) into the current stereo layout. Mirrors what the v2 runtime did
+    // on load: ch3/ch4/wave RAM start clean and resync on the next write.
+    void deserialize_legacy_v2(gbarecomp::debug::SnapshotReader& r);
 
 private:
     friend class SimulationStateCodec;

@@ -87,6 +87,62 @@ void GbaAudio::serialize(gbarecomp::debug::SnapshotWriter& w) const {
     w.u32(sample_index_);
 }
 
+void GbaAudio::deserialize_legacy_v2(gbarecomp::debug::SnapshotReader& r) {
+    r.bytes(&ch1_, sizeof(ch1_));
+    r.bytes(&ch2_, sizeof(ch2_));
+    ch3_ = Sound3{};
+    ch4_ = Sound4{};
+    std::fill(std::begin(wave_ram_), std::end(wave_ram_), uint8_t{0});
+    master_enable_    = r.boolean();
+    volume_l_         = r.u8();
+    volume_r_         = r.u8();
+    ch1_left_enable_  = r.boolean();
+    ch1_right_enable_ = r.boolean();
+    ch2_left_enable_  = r.boolean();
+    ch2_right_enable_ = r.boolean();
+    ch3_left_enable_ = ch3_right_enable_ = false;
+    ch4_left_enable_ = ch4_right_enable_ = false;
+    dmg_volume_ratio_ = r.u8();
+    r.bytes(&fifo_a_, sizeof(fifo_a_));
+    r.bytes(&fifo_b_, sizeof(fifo_b_));
+    direct_a_left_        = r.boolean();
+    direct_a_right_       = r.boolean();
+    direct_a_timer1_      = r.boolean();
+    direct_a_full_volume_ = r.boolean();
+    direct_b_left_        = r.boolean();
+    direct_b_right_       = r.boolean();
+    direct_b_timer1_      = r.boolean();
+    direct_b_full_volume_ = r.boolean();
+    soundbias_         = r.u16();
+    cycles_per_sample_ = r.u32();
+    cycle_accumulator_ = r.u32();
+    const uint32_t ring_len = r.u32();
+    if (!r.ok() || ring_len != kRingSize ||
+        r.remaining() < kRingSize * sizeof(int16_t) + 28 +
+                            kMaxSamplesPerEvent * sizeof(int16_t)) {
+        r.reject(); return;
+    }
+    std::vector<int16_t> mono(ring_len, 0);
+    r.bytes(mono.data(), ring_len * sizeof(int16_t));
+    ring_.assign(ring_len, StereoFrame{});
+    ring_rate_.assign(ring_len, 0);
+    for (std::size_t i = 0; i < ring_len; ++i) ring_[i] = StereoFrame{mono[i], mono[i]};
+    const auto head = r.u64(), tail = r.u64();
+    if (head >= kRingSize || tail >= kRingSize) { r.reject(); return; }
+    ring_head_ = static_cast<std::size_t>(head);
+    ring_tail_ = static_cast<std::size_t>(tail);
+    samples_generated_ = r.u64();
+    int16_t current_mono[kMaxSamplesPerEvent] = {};
+    r.bytes(current_mono, sizeof(current_mono));
+    for (std::size_t i = 0; i < kMaxSamplesPerEvent; ++i)
+        current_samples_[i] = StereoFrame{current_mono[i], current_mono[i]};
+    sample_index_      = r.u32();
+    if (sample_index_ > kMaxSamplesPerEvent || volume_l_ > 7 || volume_r_ > 7 ||
+        dmg_volume_ratio_ > 3 || cycles_per_sample_ != (512u >> (soundbias_ >> 14)) ||
+        cycle_accumulator_ > kSampleEventCycles) r.reject();
+    std::fill(std::begin(current_sample_rates_), std::end(current_sample_rates_), uint8_t{0});
+}
+
 void GbaAudio::deserialize(gbarecomp::debug::SnapshotReader& r) {
     r.bytes(&ch1_, sizeof(ch1_));
     r.bytes(&ch2_, sizeof(ch2_));

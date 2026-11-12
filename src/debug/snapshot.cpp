@@ -56,6 +56,14 @@ constexpr uint32_t TAG_TIME  = fourcc('T', 'I', 'M', 'E');
 
 constexpr std::size_t kRomSha1Len = 40;
 
+// Fork: snapshot v2 (the format written by this game's builds up to the
+// November 2026 upstream sync) is still readable. Its layout differs from v6
+// only in three sections: CPU0 has no SWI-continuation list, AUD0 stores a
+// mono output ring and no PSG ch3/ch4 state, and TIME does not exist (the
+// scheduler values come from META, as the v2 runtime restored them).
+// BUS0/IO_0/SAV0/PPU0/META are byte-identical between the two versions.
+constexpr uint32_t kLegacyV2SnapshotVersion = 2;
+
 // Copy up to 40 hex chars of `sha1` into `buf[40]`, zero-padding the
 // remainder. Shared by the write path and the load-time gate compare.
 void fill_rom_sha1(char* buf, const char* sha1) {
@@ -87,6 +95,22 @@ void serialize_cpu(SnapshotWriter& w) {
     runtime_capture_swi_context(swi);
     w.u32(static_cast<uint32_t>(swi.size()));
     for (const auto& slot : swi) { w.u32(slot.continuation); w.u32(slot.return_pc); }
+}
+
+bool deserialize_cpu_legacy_v2(SnapshotReader& r, bool commit) {
+    ArmCpuState cpu{};
+    r.bytes(&cpu, sizeof(cpu));
+    uint32_t depth = r.u32();
+    if (!r.ok() || depth > 1024 || depth > r.remaining() / 4u) return false;
+    std::vector<uint32_t> entries(depth, 0);
+    for (uint32_t i = 0; i < depth; ++i) entries[i] = r.u32();
+    if (!r.ok() || r.remaining() != 0) return false;
+    if (commit) {
+        g_cpu = cpu;
+        runtime_call_stack_restore(entries.data(), depth);
+        runtime_restore_swi_context({});
+    }
+    return true;
 }
 
 bool deserialize_cpu(SnapshotReader& r, bool commit) {
@@ -226,7 +250,8 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
         return false;
     }
     uint32_t version = head.u32();
-    if (version != kSnapshotVersion) {
+    const bool legacy_v2 = version == kLegacyV2SnapshotVersion;
+    if (version != kSnapshotVersion && !legacy_v2) {
         if (err) {
             *err = "snapshot: version mismatch (file v" +
                    std::to_string(version) + ", runtime v" +
@@ -292,6 +317,7 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
     const uint32_t required[] = {TAG_CPU, TAG_BUS, TAG_IO,
                                  TAG_AUDIO, TAG_SAVE, TAG_PPU, TAG_TIME};
     for (uint32_t tag : required) {
+        if (legacy_v2 && tag == TAG_TIME) continue;  // synthesized below
         if (sections.find(tag) == sections.end()) {
             if (err) *err = "snapshot: missing required section";
             return false;
@@ -326,7 +352,22 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
     };
 
     RuntimeTimingContext timing;
-    {
+    if (legacy_v2) {
+        // v2 kept the scheduler position in META (cycles, vblank count) and
+        // had no pending device timing at the dispatch boundary it saved at.
+        auto meta = sections.find(TAG_META);
+        if (meta == sections.end() || meta->second.len != 24) {
+            if (err) *err = "snapshot: v2 state without META timing";
+            return false;
+        }
+        auto r = reader_for(TAG_META);
+        r.u64();  // taken
+        timing.cycles = r.u64();
+        timing.vblank_starts = r.u64();
+        timing.yielded_vblank = timing.vblank_starts;
+        timing.pending_cycles = 0;
+        timing.event_budget = 0;
+    } else {
         if (sections.at(TAG_TIME).len != 40) {
             if (err) *err = "snapshot: invalid timing section size";
             return false;
@@ -343,7 +384,8 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
 
     {
         SnapshotReader r = reader_for(TAG_CPU);
-        if (!deserialize_cpu(r, false)) {
+        if (!(legacy_v2 ? deserialize_cpu_legacy_v2(r, false)
+                        : deserialize_cpu(r, false))) {
             if (err) *err = "snapshot: invalid CPU continuation";
             return false;
         }
@@ -353,18 +395,27 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
         // cursors before touching any live CPU, memory, or persistent progress.
         auto staged = std::make_unique<gba::GbaAudio>();
         auto r = reader_for(TAG_AUDIO);
-        staged->deserialize(r);
+        if (legacy_v2) staged->deserialize_legacy_v2(r);
+        else staged->deserialize(r);
         if (!r.ok() || r.remaining() != 0) {
             if (err) *err = "snapshot: invalid audio payload";
             return false;
         }
     }
-    { SnapshotReader r = reader_for(TAG_CPU);   deserialize_cpu(r, true); }
+    {
+        SnapshotReader r = reader_for(TAG_CPU);
+        if (legacy_v2) deserialize_cpu_legacy_v2(r, true);
+        else deserialize_cpu(r, true);
+    }
     { SnapshotReader r = reader_for(TAG_BUS);   ctx.bus->deserialize(r); }
     { SnapshotReader r = reader_for(TAG_IO);    ctx.bus->io().deserialize(r); }
     // WAITCNT arrived with the IO page; re-derive the bus wait-state table.
     ctx.bus->refresh_waitstates();
-    { SnapshotReader r = reader_for(TAG_AUDIO); ctx.bus->audio().deserialize(r); }
+    {
+        SnapshotReader r = reader_for(TAG_AUDIO);
+        if (legacy_v2) ctx.bus->audio().deserialize_legacy_v2(r);
+        else ctx.bus->audio().deserialize(r);
+    }
     { SnapshotReader r = reader_for(TAG_SAVE);  ctx.bus->save().deserialize(r); }
     { SnapshotReader r = reader_for(TAG_PPU);   ctx.ppu->deserialize(r); }
     if (sections.find(TAG_META) != sections.end()) {
