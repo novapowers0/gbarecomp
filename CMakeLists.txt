@@ -1,10 +1,51 @@
 cmake_minimum_required(VERSION 3.20)
 project(gbarecomp C CXX)
 
+option(GBARECOMP_DETAILED_PHASE_PROFILE "Build additional opt-in device phase timers" OFF)
+option(GBARECOMP_DEVICE_AUDIO_WINDOWS "Let hardware audio own internal sample-event windows" OFF)
+if(GBARECOMP_DEVICE_AUDIO_WINDOWS)
+    set_property(SOURCE src/gba/gba_audio.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS GBARECOMP_DEVICE_AUDIO_WINDOWS=1)
+endif()
+option(GBARECOMP_ORDERED_SCANLINE_EXPERIMENT "Render native jobs in visible front-to-back order" OFF)
+if(GBARECOMP_ORDERED_SCANLINE_EXPERIMENT)
+    set_property(SOURCE src/gba/gba_ppu.cpp APPEND PROPERTY COMPILE_DEFINITIONS GBARECOMP_ORDERED_SCANLINE_EXPERIMENT=1)
+endif()
+option(GBARECOMP_NATIVE_REGIONS "Build bounded native CPU/RAM region experiment" OFF)
+option(GBARECOMP_NATIVE_RAM_CODE_VIEWS "Borrow live ordinary-RAM code views per generated activation" OFF)
+option(GBARECOMP_NATIVE_DRAW_JOBS "Build native draw-memory ownership experiment" OFF)
+option(GBARECOMP_DEFERRED_HD_EXPERIMENT "Exercise immutable HD jobs with portable readback" OFF)
+option(GBARECOMP_GPU_HD_EXPERIMENT "Render supported immutable HD jobs through resident GPU presentation" OFF)
+if(GBARECOMP_GPU_HD_EXPERIMENT)
+    set_property(SOURCE src/runtime/runtime.cpp src/runtime/host_window.cpp APPEND PROPERTY COMPILE_DEFINITIONS GBARECOMP_GPU_HD_EXPERIMENT=1)
+endif()
+if(GBARECOMP_DEFERRED_HD_EXPERIMENT)
+    set_property(SOURCE src/runtime/runtime.cpp APPEND PROPERTY COMPILE_DEFINITIONS GBARECOMP_DEFERRED_HD_EXPERIMENT=1)
+endif()
+if(GBARECOMP_DETAILED_PHASE_PROFILE)
+    set_property(SOURCE src/runtime/runtime_bus_bridge.cpp src/armv4t/runtime_arm.cpp
+        src/gba/gba_ppu.cpp src/gba/gba_high_resolution.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS GBARECOMP_DETAILED_PHASE_PROFILE=1)
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+
+set(GBARECOMP_BIOS_MATH_IMPLEMENTATION "LLE" CACHE STRING
+    "Build-selected BIOS Div/DivArm/ArcTan2 services: LLE or native HLE (qualification)")
+set_property(CACHE GBARECOMP_BIOS_MATH_IMPLEMENTATION PROPERTY STRINGS LLE HLE)
+if(NOT GBARECOMP_BIOS_MATH_IMPLEMENTATION MATCHES "^(LLE|HLE)$")
+    message(FATAL_ERROR "GBARECOMP_BIOS_MATH_IMPLEMENTATION must be LLE or HLE")
+endif()
+
+set(GBARECOMP_MP2K_IMPLEMENTATION "LLE" CACHE STRING
+    "Reviewed MP2K mono mixer service: LLE or native HLE (qualification build)")
+set_property(CACHE GBARECOMP_MP2K_IMPLEMENTATION PROPERTY STRINGS LLE HLE)
+if(NOT GBARECOMP_MP2K_IMPLEMENTATION MATCHES "^(LLE|HLE)$")
+    message(FATAL_ERROR "GBARECOMP_MP2K_IMPLEMENTATION must be LLE or HLE")
+endif()
 
 set(GBARECOMP_SCANLINE_IMPLEMENTATION "HLE" CACHE STRING
     "Shared native scanline renderer implementation (LLE or HLE)")
@@ -12,11 +53,38 @@ set_property(CACHE GBARECOMP_SCANLINE_IMPLEMENTATION PROPERTY STRINGS LLE HLE)
 if(NOT GBARECOMP_SCANLINE_IMPLEMENTATION MATCHES "^(LLE|HLE)$")
     message(FATAL_ERROR "GBARECOMP_SCANLINE_IMPLEMENTATION must be LLE or HLE")
 endif()
+set(GBARECOMP_HD_SAMPLER_IMPLEMENTATION "HLE" CACHE STRING
+    "High-resolution affine sampler: cached surface HLE or direct tiled LLE")
+set_property(CACHE GBARECOMP_HD_SAMPLER_IMPLEMENTATION PROPERTY STRINGS LLE HLE)
+if(NOT GBARECOMP_HD_SAMPLER_IMPLEMENTATION MATCHES "^(LLE|HLE)$")
+    message(FATAL_ERROR "GBARECOMP_HD_SAMPLER_IMPLEMENTATION must be LLE or HLE")
+endif()
 set(GBARECOMP_DMA_RAM_IMPLEMENTATION "LLE" CACHE STRING
     "Developer build choice for contiguous ordinary-RAM DMA: LLE or HLE")
 set_property(CACHE GBARECOMP_DMA_RAM_IMPLEMENTATION PROPERTY STRINGS LLE HLE)
 if(NOT GBARECOMP_DMA_RAM_IMPLEMENTATION MATCHES "^(LLE|HLE)$")
     message(FATAL_ERROR "GBARECOMP_DMA_RAM_IMPLEMENTATION must be LLE or HLE")
+endif()
+
+set(GBARECOMP_MEMORY_IMPLEMENTATION "HLE" CACHE STRING
+    "Ordinary RAM access: native backing arrays (HLE) or full bus (LLE)")
+set_property(CACHE GBARECOMP_MEMORY_IMPLEMENTATION PROPERTY STRINGS LLE HLE)
+if(NOT GBARECOMP_MEMORY_IMPLEMENTATION MATCHES "^(LLE|HLE)$")
+    message(FATAL_ERROR "GBARECOMP_MEMORY_IMPLEMENTATION must be LLE or HLE")
+endif()
+set(GBARECOMP_PRESENTATION_IMPLEMENTATION "HLE" CACHE STRING
+    "Host upload: fused native-format color conversion (HLE) or RGB24 (LLE)")
+set_property(CACHE GBARECOMP_PRESENTATION_IMPLEMENTATION PROPERTY STRINGS LLE HLE)
+if(NOT GBARECOMP_PRESENTATION_IMPLEMENTATION MATCHES "^(LLE|HLE)$")
+    message(FATAL_ERROR "GBARECOMP_PRESENTATION_IMPLEMENTATION must be LLE or HLE")
+endif()
+if(GBARECOMP_PRESENTATION_IMPLEMENTATION STREQUAL "HLE")
+    set_property(SOURCE src/runtime/host_window.cpp src/runtime/color_lut.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS GBARECOMP_NATIVE_PRESENTATION=1)
+endif()
+if(GBARECOMP_MEMORY_IMPLEMENTATION STREQUAL "HLE")
+    set_property(SOURCE src/runtime/runtime_bus_bridge.cpp src/runtime/runtime.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS GBARECOMP_NATIVE_MEMORY=1)
 endif()
 
 # Large generated corpora are expensive to rebuild in fresh build trees.
@@ -252,6 +320,12 @@ target_include_directories(gbarecomp_armv4t PUBLIC
     src/armv4t
     ${GBA_ARM_RECOMP_CORE_INCLUDE_DIRS})
 set_property(TARGET gbarecomp_armv4t PROPERTY POSITION_INDEPENDENT_CODE ON)
+if(GBARECOMP_NATIVE_REGIONS)
+    target_compile_definitions(gbarecomp_armv4t PUBLIC GBARECOMP_NATIVE_REGIONS=1)
+endif()
+if(GBARECOMP_NATIVE_RAM_CODE_VIEWS)
+    target_compile_definitions(gbarecomp_armv4t PUBLIC GBARECOMP_NATIVE_RAM_CODE_VIEWS=1)
+endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # recompile_core — function discovery + per-function codegen, as a LIBRARY.
@@ -262,7 +336,9 @@ set_property(TARGET gbarecomp_armv4t PROPERTY POSITION_INDEPENDENT_CODE ON)
 # ─────────────────────────────────────────────────────────────────────────────
 add_library(gbarecomp_recompile_core STATIC
     src/recompile/function_finder.cpp
+    src/recompile/callback_discovery.cpp
     src/recompile/emit_function.cpp
+    src/recompile/ram_templates.cpp
     src/recompile/codegen_shards.cpp
     src/recompile/dispatch_table_entries.cpp
 )
@@ -288,11 +364,13 @@ add_library(gbarecomp_gba STATIC
     src/gba/gba_dma.cpp
     src/gba/gba_timers.cpp
     src/gba/gba_ppu.cpp
+    src/gba/gba_high_resolution.cpp
     src/gba/gba_audio.cpp
     src/gba/mod_audio.cpp
     src/gba/gba_m4a.cpp
     src/gba/audio_shadow.cpp
     src/gba/mp2k_shadow.cpp
+    src/gba/mp2k_native.cpp
     src/gba/gba_input.cpp
     src/gba/gba_save.cpp
     src/gba/gba_gpio.cpp
@@ -306,6 +384,12 @@ add_library(gbarecomp_gba STATIC
     src/gba/crc32.cpp
 )
 target_include_directories(gbarecomp_gba PUBLIC src/gba)
+if(GBARECOMP_NATIVE_DRAW_JOBS)
+    target_compile_definitions(gbarecomp_gba PUBLIC GBARECOMP_NATIVE_DRAW_JOBS=1)
+endif()
+if(GBARECOMP_HD_SAMPLER_IMPLEMENTATION STREQUAL "HLE")
+    set_property(SOURCE src/gba/gba_high_resolution.cpp APPEND PROPERTY COMPILE_DEFINITIONS GBARECOMP_HD_SAMPLER_HLE=1)
+endif()
 if(GBARECOMP_SCANLINE_IMPLEMENTATION STREQUAL "HLE")
     set_property(SOURCE src/gba/gba_ppu.cpp APPEND PROPERTY COMPILE_DEFINITIONS GBARECOMP_SCANLINE_HLE=1)
 endif()
@@ -378,6 +462,7 @@ add_library(gbarecomp_runtime STATIC
     src/runtime/multiplayer_slice.cpp
     src/runtime/runtime.cpp
     src/runtime/cheat_engine.cpp
+    src/runtime/diagnostic_replay.cpp
     src/runtime/save_config.cpp
     src/runtime/bios_hle.cpp
     src/runtime/generated_dispatch.cpp
@@ -389,6 +474,9 @@ add_library(gbarecomp_runtime STATIC
     # Trusted function-entry hooks are always linked: opted-in generated code
     # must work even when the package catalog itself is disabled.
     src/runtime/mod_function_hooks.cpp
+    # Declarative mod cheats: always linked so the runner's frame hook builds
+    # in mod-disabled games too (it is then simply never armed).
+    src/runtime/codebreaker.cpp
     src/runtime/host_platform.cpp
     src/runtime/touch_input.cpp
     src/runtime/mobile_platform.cpp
@@ -403,6 +491,9 @@ add_library(gbarecomp_runtime STATIC
     # tracked empty stub; locally generated BIOS output is selected as a unit.
 )
 gbarecomp_target_link_host_stack(gbarecomp_runtime INTERFACE)
+if(GBARECOMP_BIOS_MATH_IMPLEMENTATION STREQUAL "HLE")
+    target_compile_definitions(gbarecomp_runtime PRIVATE GBARECOMP_BIOS_MATH_HLE=1)
+endif()
 if(GBARECOMP_ENABLE_MODS)
     target_sources(gbarecomp_runtime PRIVATE src/runtime/mod_runtime.cpp)
     target_compile_definitions(gbarecomp_runtime PUBLIC
@@ -445,8 +536,9 @@ else()
     target_sources(gbarecomp_runtime PRIVATE
         src/runtime/generated_bios/bios_dispatch_stub.cpp)
     message(STATUS "gbarecomp: BIOS recompiled output absent — placeholder dispatch only. "
-                   "Run `build/gba_recompile.exe --bios bios/gba_bios.bin` "
-                   "to populate.")
+                   "Run `build/gba_recompile.exe --bios bios/gba_bios.bin "
+                   "--config bios/gba_bios.toml --out ${GBARECOMP_GENERATED_BIOS_DIR}` "
+                   "to populate the selected directory with the audited BIOS configuration.")
 endif()
 if(GBARECOMP_SCANLINE_IMPLEMENTATION STREQUAL "HLE")
     set_property(SOURCE src/runtime/runtime.cpp APPEND PROPERTY COMPILE_DEFINITIONS GBARECOMP_SCANLINE_HLE=1)
@@ -480,6 +572,8 @@ else()
     target_sources(gbarecomp_runtime PRIVATE src/runtime/host_window.cpp)
 endif()
 
+target_sources(gbarecomp_runtime PRIVATE src/runtime/hd_gpu_renderer.cpp)
+
 if(GBARECOMP_RUNTIME_UI_ROOT AND
    EXISTS "${GBARECOMP_RUNTIME_UI_ROOT}/src/recomp_runtime_ui.h")
     target_compile_definitions(gbarecomp_runtime PUBLIC GBARECOMP_RUNTIME_UI=1)
@@ -494,6 +588,11 @@ if(GBARECOMP_RUNTIME_UI_ROOT AND
             GBARECOMP_MOD_UI=1)
     endif()
     if(GBARECOMP_SDL2_OK)
+        if(EXISTS "${GBARECOMP_RUNTIME_UI_ROOT}/src/consoles/gba/gba_pad_binds.h")
+            target_sources(gbarecomp_runtime PRIVATE
+                "${GBARECOMP_RUNTIME_UI_ROOT}/src/common/pad_binds.c")
+            target_compile_definitions(gbarecomp_runtime PRIVATE GBARECOMP_GBA_PAD_BINDS=1)
+        endif()
         # The runtime owns the SDL_Renderer2 adapter; the game's existing
         # game_launcher_ui target supplies the one shared ImGui core and SDL2
         # platform backend. The central helper is idempotent, preventing
@@ -537,6 +636,7 @@ add_library(gbarecomp_debug STATIC
     src/debug/trace_ring.cpp
     src/debug/file_replace.cpp
     src/debug/snapshot.cpp
+    src/debug/replay_writer.cpp
     src/debug/mod_state.cpp
     src/debug/ws_provenance.cpp
     src/debug/ws_sidecar.cpp
@@ -550,6 +650,24 @@ target_include_directories(gbarecomp_debug PUBLIC src/debug)
 target_include_directories(gbarecomp_debug PRIVATE src/runtime)
 target_link_libraries(gbarecomp_debug PUBLIC gbarecomp_gba)
 set_property(TARGET gbarecomp_debug PROPERTY POSITION_INDEPENDENT_CODE ON)
+# Engine revision stamped into diagnostic replays (docs/DIAGNOSTIC_REPLAY.md),
+# regenerated every build so a replay always names the compiled engine.
+# Release scripts building from a copied tree without .git set
+# GBARECOMP_ENGINE_REVISION explicitly.
+set(GBARECOMP_ENGINE_REVISION "" CACHE STRING
+    "Override the engine revision recorded in diagnostic replays")
+set(GBARECOMP_REVISION_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/gbarecomp_generated/engine_revision.h")
+add_custom_target(gbarecomp_engine_revision ALL
+    COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR}
+        -DOUT=${GBARECOMP_REVISION_HEADER}
+        -DOVERRIDE=${GBARECOMP_ENGINE_REVISION}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/engine_revision.cmake
+    BYPRODUCTS ${GBARECOMP_REVISION_HEADER}
+    COMMENT "gbarecomp engine revision")
+add_dependencies(gbarecomp_runtime gbarecomp_engine_revision)
+target_include_directories(gbarecomp_runtime PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/gbarecomp_generated")
 if(WIN32 OR MSYS)
     target_link_libraries(gbarecomp_debug PUBLIC ws2_32)
 endif()
@@ -604,23 +722,36 @@ target_link_libraries(gba_scan PRIVATE gbarecomp_armv4t gbarecomp_gba)
 
 # A local toml++ checkout remains useful for offline development, but it is
 # intentionally ignored.  Fresh clones/worktrees must still be able to build
-# gba_recompile, so resolve the pinned upstream dependency into the build tree
+# gba_recompile, so the pinned upstream dependency is cloned into the build tree
 # when the local single-header checkout is absent.
+#
+# The clone is a build step of the three targets that include toml++, not a
+# configure step: only gba_recompile and its config tests parse TOML, and a game
+# project that adds gbarecomp to build its runtime must configure and build
+# without network (Flatpak sandboxes, offline machines). Passing
+# -DGBARECOMP_TOMLPP_INCLUDE_DIR=<dir> also builds the recompiler offline.
 find_path(GBARECOMP_TOMLPP_INCLUDE_DIR
     NAMES toml.hpp
     HINTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlpp"
     NO_DEFAULT_PATH)
+set(GBARECOMP_TOMLPP_DEPENDENCY "")
 if(NOT GBARECOMP_TOMLPP_INCLUDE_DIR)
-    include(FetchContent)
-    set(TOMLPLUSPLUS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(TOMLPLUSPLUS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    FetchContent_Declare(tomlplusplus
+    include(ExternalProject)
+    set(_gbarecomp_tomlpp_src "${CMAKE_CURRENT_BINARY_DIR}/_deps/tomlplusplus-src")
+    ExternalProject_Add(gbarecomp_tomlplusplus
         GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
-        GIT_TAG 30172438cee64926dc41fdd9c11fb3ba5b2ba9de)
-    FetchContent_MakeAvailable(tomlplusplus)
-    set(GBARECOMP_TOMLPP_INCLUDE_DIR "${tomlplusplus_SOURCE_DIR}")
+        GIT_TAG 30172438cee64926dc41fdd9c11fb3ba5b2ba9de
+        SOURCE_DIR "${_gbarecomp_tomlpp_src}"
+        UPDATE_DISCONNECTED TRUE
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND ""
+        INSTALL_COMMAND ""
+        TEST_COMMAND ""
+        EXCLUDE_FROM_ALL TRUE)
+    set(GBARECOMP_TOMLPP_INCLUDE_DIR "${_gbarecomp_tomlpp_src}")
+    set(GBARECOMP_TOMLPP_DEPENDENCY gbarecomp_tomlplusplus)
     message(STATUS
-        "gbarecomp: fetched pinned toml++ v3.4.0 for gba_recompile")
+        "gbarecomp: toml++ v3.4.0 is fetched when gba_recompile is built")
 else()
     message(STATUS
         "gbarecomp: using local toml++ at ${GBARECOMP_TOMLPP_INCLUDE_DIR}")
@@ -633,6 +764,9 @@ target_include_directories(gba_recompile PRIVATE
     tools/gba_recompile
     src/armv4t
     "${GBARECOMP_TOMLPP_INCLUDE_DIR}")
+if(GBARECOMP_TOMLPP_DEPENDENCY)
+    add_dependencies(gba_recompile ${GBARECOMP_TOMLPP_DEPENDENCY})
+endif()
 target_link_libraries(gba_recompile PRIVATE
     gbarecomp_recompile_core gbarecomp_armv4t gbarecomp_gba)
 
@@ -743,6 +877,20 @@ endif()
 # tests — per-subsystem. Run with ctest.
 # ─────────────────────────────────────────────────────────────────────────────
 enable_testing()
+
+# The loader consumes the exact asset snapshot validated by the picker.
+add_executable(boot_asset_tests
+    tests/runtime/boot_asset_test.cpp src/runtime/asset_picker.cpp
+    src/runtime/host_platform.cpp
+    src/gba/gba_bios.cpp src/gba/sha1.cpp src/gba/crc32.cpp)
+target_include_directories(boot_asset_tests PRIVATE src)
+# A broken cache regression must fail rather than open a native picker in CI.
+target_compile_definitions(boot_asset_tests PRIVATE GBARECOMP_TEST_NO_ASSET_DIALOGS=1)
+if(WIN32)
+    target_link_libraries(boot_asset_tests PRIVATE comdlg32 user32 winmm)
+endif()
+add_test(NAME boot_asset_tests COMMAND boot_asset_tests)
+
 add_executable(link_tests tests/link/test_main.cpp
     tests/heal_gate/runtime_stubs.cpp src/runtime/multiplayer_config.cpp)
 target_include_directories(link_tests PRIVATE src/runtime)
@@ -802,6 +950,7 @@ if(GBARECOMP_ENABLE_MODS)
         # PPU by providing its otherwise PPU-owned storage symbol.
         tests/mod_runtime/ppu_provider_stub.cpp
         src/runtime/mod_runtime.cpp
+        src/runtime/codebreaker.cpp
         src/runtime/mod_function_hooks.cpp
         src/runtime/asset_picker.cpp
         src/runtime/host_platform.cpp
@@ -816,11 +965,21 @@ if(GBARECOMP_ENABLE_MODS)
     add_test(NAME mod_runtime_tests COMMAND mod_runtime_tests)
 endif()
 
+add_executable(codebreaker_tests
+    tests/runtime/codebreaker_test.cpp
+    src/runtime/codebreaker.cpp)
+target_include_directories(codebreaker_tests PRIVATE src/runtime)
+add_test(NAME codebreaker_tests COMMAND codebreaker_tests)
+
 add_executable(mod_audio_tests
     tests/mod_audio/test_main.cpp
     src/gba/mod_audio.cpp)
 target_include_directories(mod_audio_tests PRIVATE src/gba)
 add_test(NAME mod_audio_tests COMMAND mod_audio_tests)
+
+add_executable(suspend_guard_tests tests/runtime/suspend_guard_test.cpp src/gba/sha1.cpp)
+target_include_directories(suspend_guard_tests PRIVATE src/runtime)
+add_test(NAME suspend_guard_tests COMMAND suspend_guard_tests)
 
 add_executable(file_replace_tests tests/debug/file_replace_test.cpp)
 target_link_libraries(file_replace_tests PRIVATE gbarecomp_debug)
@@ -860,6 +1019,9 @@ target_include_directories(config_overlay_smoke PRIVATE
     "${GBARECOMP_TOMLPP_INCLUDE_DIR}")
 target_link_libraries(config_overlay_smoke PRIVATE
     gbarecomp_recompile_core gbarecomp_armv4t gbarecomp_gba)
+if(GBARECOMP_TOMLPP_DEPENDENCY)
+    add_dependencies(config_overlay_smoke ${GBARECOMP_TOMLPP_DEPENDENCY})
+endif()
 add_test(NAME config_overlay_smoke COMMAND config_overlay_smoke)
 
 # Decomp symbol importer: synthetic readelf + link-map fixtures through
@@ -878,6 +1040,22 @@ add_executable(function_finder_tests tests/recompile/function_finder_test.cpp)
 target_link_libraries(function_finder_tests PRIVATE gbarecomp_recompile_core)
 add_test(NAME function_finder_tests COMMAND function_finder_tests)
 
+add_executable(ram_templates_tests tests/recompile/ram_templates_test.cpp)
+target_link_libraries(ram_templates_tests PRIVATE gbarecomp_recompile_core)
+add_test(NAME ram_templates_tests COMMAND ram_templates_tests)
+
+add_executable(runtime_coverage_tests tests/runtime/runtime_coverage_test.cpp)
+# This small fixture does not pull run_game; rescan runtime after armv4t so
+# one-pass archive linkers can find the runtime-owned BIOS dispatch table.
+target_link_libraries(runtime_coverage_tests PRIVATE
+    gbarecomp_runtime gbarecomp_armv4t gbarecomp_runtime)
+add_test(NAME runtime_coverage_tests COMMAND runtime_coverage_tests)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME strict_interpreter_tests COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/strict_interpreter_test.py"
+        "$<TARGET_FILE:runtime_coverage_tests>")
+endif()
+
 add_executable(link_branch_tests tests/recompile/link_branch_test.cpp)
 target_link_libraries(link_branch_tests PRIVATE gbarecomp_recompile_core)
 add_test(NAME link_branch_tests COMMAND link_branch_tests)
@@ -893,13 +1071,27 @@ target_include_directories(recompile_config_tests PRIVATE
     tools/gba_recompile src/recompile src/armv4t
     "${GBARECOMP_TOMLPP_INCLUDE_DIR}")
 target_link_libraries(recompile_config_tests PRIVATE gbarecomp_gba)
+if(GBARECOMP_TOMLPP_DEPENDENCY)
+    add_dependencies(recompile_config_tests ${GBARECOMP_TOMLPP_DEPENDENCY})
+endif()
 add_test(NAME recompile_config_tests COMMAND recompile_config_tests)
 
 add_executable(audio_drc_tests tests/runtime/audio_drc_test.cpp)
 target_include_directories(audio_drc_tests PRIVATE src/runtime)
 add_test(NAME audio_drc_tests COMMAND audio_drc_tests)
 
+# Independent whole-bridge oracle producer. Build explicitly and use --emit
+# against a separately built reference to compare PCM and pointer-free state.
+add_executable(audio_drc_window_corpus EXCLUDE_FROM_ALL
+    tests/runtime/audio_drc_window_corpus.c)
+target_include_directories(audio_drc_window_corpus PRIVATE src/runtime)
+if(NOT WIN32)
+    target_link_libraries(audio_drc_window_corpus PRIVATE m)
+endif()
+
 add_executable(audio_playback_tests tests/runtime/audio_playback_test.cpp)
+target_compile_definitions(audio_playback_tests PRIVATE
+    GBARECOMP_TEST_DEVICE_AUDIO_WINDOWS=$<BOOL:${GBARECOMP_DEVICE_AUDIO_WINDOWS}>)
 target_include_directories(audio_playback_tests PRIVATE src/debug)
 target_link_libraries(audio_playback_tests PRIVATE gbarecomp_gba)
 add_test(NAME audio_playback_tests COMMAND audio_playback_tests)
@@ -915,12 +1107,71 @@ add_executable(color_lut_tests
     src/runtime/color_lut.cpp)
 target_include_directories(color_lut_tests PRIVATE src/runtime)
 add_test(NAME color_lut_tests COMMAND color_lut_tests)
+if(Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME netplay_optimization_identity
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/netplay/optimization_identity_test.py"
+            --cmake "${CMAKE_COMMAND}" --generator "${CMAKE_GENERATOR}"
+            --compiler "${CMAKE_CXX_COMPILER}" --make-program "${CMAKE_MAKE_PROGRAM}"
+            --output "${CMAKE_CURRENT_BINARY_DIR}/optimization-identity-test")
+endif()
+if(GBARECOMP_SDL2_OK)
+    add_executable(stereo_audio_stream_tests tests/runtime/stereo_audio_stream_test.cpp)
+    target_include_directories(stereo_audio_stream_tests PRIVATE src/runtime ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(stereo_audio_stream_tests PRIVATE ${SDL2_LIBRARIES})
+    add_test(NAME stereo_audio_stream_tests COMMAND stereo_audio_stream_tests)
+    # A standalone SDK fixture: title-supplied ImGui/launcher libraries are
+    # intentionally unnecessary for exercising the host audio implementation.
+    if(NOT GBARECOMP_RUNTIME_UI_ROOT)
+        add_executable(host_stereo_tests tests/runtime/host_stereo_test.cpp tools/bios_smoke/dispatch_stub.cpp)
+        target_include_directories(host_stereo_tests PRIVATE src/debug ${SDL2_INCLUDE_DIRS})
+        target_link_gbarecomp_runtime_stack(host_stereo_tests)
+        add_test(NAME host_stereo_tests COMMAND host_stereo_tests "${CMAKE_CURRENT_BINARY_DIR}/host-stereo-test")
+        set_tests_properties(host_stereo_tests PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    add_executable(presentation_upload_tests
+        tests/runtime/presentation_upload_test.cpp src/runtime/color_lut.cpp)
+    target_include_directories(presentation_upload_tests PRIVATE src/runtime ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(presentation_upload_tests PRIVATE ${SDL2_LIBRARIES})
+    add_test(NAME presentation_upload_tests COMMAND presentation_upload_tests)
+endif()
 
 add_executable(diagnostic_capture_tests tests/runtime/diagnostic_capture_test.cpp)
 target_include_directories(diagnostic_capture_tests PRIVATE src/gba src/runtime src/armv4t)
 target_link_libraries(diagnostic_capture_tests PRIVATE gbarecomp_gba)
 add_test(NAME diagnostic_capture_tests_disabled COMMAND diagnostic_capture_tests --disabled)
 add_test(NAME diagnostic_capture_tests_enabled COMMAND diagnostic_capture_tests --enabled)
+
+# Diagnostic replay capture/playback (docs/DIAGNOSTIC_REPLAY.md) against a
+# synthetic deterministic machine, plus the bounded background writer.
+add_executable(diagnostic_replay_tests
+    tests/runtime/diagnostic_replay_test.cpp
+    src/runtime/diagnostic_replay.cpp
+    src/debug/replay_writer.cpp)
+target_include_directories(diagnostic_replay_tests PRIVATE src/runtime src/debug)
+find_package(Threads REQUIRED)
+target_link_libraries(diagnostic_replay_tests PRIVATE Threads::Threads)
+add_test(NAME diagnostic_replay_tests COMMAND diagnostic_replay_tests)
+# Host-stack budget guard — pure pthread/stack logic, links only
+# src/runtime/mobile_platform.cpp.
+add_executable(stack_guard_tests
+    tests/runtime/stack_guard_test.cpp
+    src/runtime/mobile_platform.cpp)
+target_include_directories(stack_guard_tests PRIVATE src/runtime)
+find_package(Threads REQUIRED)
+target_link_libraries(stack_guard_tests PRIVATE Threads::Threads)
+add_test(NAME stack_guard_tests COMMAND stack_guard_tests)
+
+# FramePacer banked-frame throttling — wall-clock pacing, links only
+# src/runtime/host_platform.cpp.
+add_executable(pacer_tests
+    tests/runtime/pacer_test.cpp
+    src/runtime/host_platform.cpp)
+target_include_directories(pacer_tests PRIVATE src/runtime)
+if(WIN32)
+    target_link_libraries(pacer_tests PRIVATE winmm)
+endif()
+add_test(NAME pacer_tests COMMAND pacer_tests)
 
 # Self-heal proposal clustering — pure logic, links only the standalone
 # clustering TU (no runtime/bus/overlay dependencies).
@@ -929,6 +1180,16 @@ add_executable(selfheal_cluster_test
     src/runtime/self_heal_cluster.cpp)
 target_include_directories(selfheal_cluster_test PRIVATE src/runtime)
 add_test(NAME selfheal_cluster_test COMMAND selfheal_cluster_test)
+
+add_executable(selfheal_persistence_test tests/selfheal/persistence_test.cpp
+    tools/bios_smoke/dispatch_stub.cpp)
+target_include_directories(selfheal_persistence_test PRIVATE src/runtime)
+target_link_gbarecomp_runtime_stack(selfheal_persistence_test)
+add_test(NAME selfheal_persistence_test COMMAND selfheal_persistence_test)
+
+add_executable(selfheal_overlay_symbols_test tests/selfheal/overlay_symbols_test.cpp)
+target_include_directories(selfheal_overlay_symbols_test PRIVATE src/runtime src/armv4t)
+add_test(NAME selfheal_overlay_symbols_test COMMAND selfheal_overlay_symbols_test)
 
 add_executable(interpreter_smoke tests/armv4t/interpreter_smoke.cpp)
 target_link_libraries(interpreter_smoke PRIVATE gbarecomp_armv4t)
@@ -942,6 +1203,12 @@ target_include_directories(tail_dispatch_tests PRIVATE tests/codegen src/gba)
 target_link_libraries(tail_dispatch_tests PRIVATE gbarecomp_armv4t)
 add_test(NAME tail_dispatch_tests COMMAND tail_dispatch_tests)
 
+add_executable(swi_snapshot_tests tests/armv4t/swi_snapshot_test.cpp
+    tools/bios_smoke/dispatch_stub.cpp)
+target_include_directories(swi_snapshot_tests PRIVATE src/armv4t src/debug src/gba)
+target_link_gbarecomp_runtime_stack(swi_snapshot_tests)
+add_test(NAME swi_snapshot_tests COMMAND swi_snapshot_tests)
+
 add_executable(armv4t_tests tests/armv4t/test_main.cpp)
 target_link_libraries(armv4t_tests PRIVATE gbarecomp_armv4t)
 add_test(NAME armv4t_tests COMMAND armv4t_tests)
@@ -951,9 +1218,143 @@ target_link_libraries(thumb_tests PRIVATE gbarecomp_armv4t)
 add_test(NAME thumb_tests COMMAND thumb_tests)
 
 add_gbarecomp_runtime_stack_test(bus_tests tests/bus/test_main.cpp)
+
+add_executable(draw_memory_tests tests/ppu/draw_memory_test.cpp)
+target_include_directories(draw_memory_tests PRIVATE src/gba)
+add_test(NAME draw_memory_tests COMMAND draw_memory_tests)
+if(GBARECOMP_NATIVE_DRAW_JOBS)
+    add_gbarecomp_runtime_stack_test(draw_memory_bus_tests tests/ppu/draw_memory_bus_test.cpp)
+    if(GBARECOMP_SDL2_OK)
+        add_executable(native_gpu_jobs_tests EXCLUDE_FROM_ALL
+            tests/ppu/native_gpu_jobs_test.cpp src/runtime/hd_gpu_renderer.cpp src/runtime/color_lut.cpp)
+        target_include_directories(native_gpu_jobs_tests PRIVATE src/runtime ${SDL2_INCLUDE_DIRS})
+        target_compile_definitions(native_gpu_jobs_tests PRIVATE SDL_MAIN_HANDLED=1 GBARECOMP_HAVE_SDL2=1)
+        target_link_libraries(native_gpu_jobs_tests PRIVATE gbarecomp_gba ${SDL2_LIBRARIES})
+        # Deliberate hardware qualification under the shared capacity pool,
+        # never an automatic visible/default CTest launch.
+    endif()
+endif()
+
+# The SDK original-code differential gate takes an owner-provided cartridge;
+# the test embeds no cartridge/BIOS data and skips when no input is supplied.
+add_executable(mp2k_native_tests tests/gba/mp2k_native_test.cpp)
+target_link_libraries(mp2k_native_tests PRIVATE gbarecomp_gba gbarecomp_armv4t)
+
+# Independent original firmware oracle; the private BIOS is supplied locally,
+# never embedded in the executable or repository. The fixture owns a minimal
+# memory bridge so it tests the actual HLE service without scheduler timing.
+add_executable(bios_fast_set_tests
+    tests/runtime/bios_fast_set_test.cpp src/runtime/bios_hle.cpp)
+target_include_directories(bios_fast_set_tests PRIVATE src/runtime src/armv4t)
+target_link_libraries(bios_fast_set_tests PRIVATE gbarecomp_armv4t)
+set(GBARECOMP_BIOS_COPY_TEST_BIOS "" CACHE FILEPATH "Local canonical BIOS for native CpuFastSet contract")
+if(GBARECOMP_BIOS_COPY_TEST_BIOS)
+    add_test(NAME bios_fast_set_contract COMMAND bios_fast_set_tests "${GBARECOMP_BIOS_COPY_TEST_BIOS}")
+else()
+    add_test(NAME bios_fast_set_contract COMMAND bios_fast_set_tests)
+endif()
+set_tests_properties(bios_fast_set_contract PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(bios_math_tests
+    tests/runtime/bios_math_test.cpp src/runtime/bios_hle.cpp)
+target_include_directories(bios_math_tests PRIVATE src/runtime src/armv4t)
+add_test(NAME bios_math_tests COMMAND bios_math_tests)
+add_executable(bios_native_math_tests
+    tests/runtime/bios_native_math_test.cpp src/runtime/bios_hle.cpp)
+target_include_directories(bios_native_math_tests PRIVATE src/runtime src/armv4t)
+target_compile_definitions(bios_native_math_tests PRIVATE GBARECOMP_BIOS_MATH_HLE=1)
+target_link_libraries(bios_native_math_tests PRIVATE gbarecomp_armv4t)
+set(GBARECOMP_BIOS_MATH_TEST_BIOS "" CACHE FILEPATH "Local canonical BIOS for build-selected native math contract")
+if(GBARECOMP_BIOS_MATH_TEST_BIOS)
+    add_test(NAME bios_native_math_contract COMMAND bios_native_math_tests "${GBARECOMP_BIOS_MATH_TEST_BIOS}")
+else()
+    add_test(NAME bios_native_math_contract COMMAND bios_native_math_tests)
+endif()
+set_tests_properties(bios_native_math_contract PROPERTIES SKIP_RETURN_CODE 77)
+set(GBARECOMP_MP2K_TEST_ROM "" CACHE FILEPATH "Owner-provided MKSC USA ROM for native mixer contract checks")
+if(GBARECOMP_MP2K_TEST_ROM)
+    add_test(NAME mp2k_native_contract COMMAND mp2k_native_tests "${GBARECOMP_MP2K_TEST_ROM}")
+else()
+    add_test(NAME mp2k_native_contract COMMAND mp2k_native_tests)
+endif()
+set_tests_properties(mp2k_native_contract PROPERTIES SKIP_RETURN_CODE 77)
+
+# Mixed local-CPU/RAM regions: authored instructions only, no ROM/BIOS input.
+# Exercise exact prefix settlement as well as the complete admitted operation.
+add_executable(gen_native_region_tests EXCLUDE_FROM_ALL tests/codegen/gen_native_region_tests.cpp)
+target_link_libraries(gen_native_region_tests PRIVATE gbarecomp_recompile_core)
+set(NATIVE_REGION_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/native_region_tests_generated")
+set(NATIVE_REGION_TEST_SOURCE "${NATIVE_REGION_TEST_DIR}/n02_generated.inc")
+file(MAKE_DIRECTORY "${NATIVE_REGION_TEST_DIR}")
+add_custom_command(OUTPUT "${NATIVE_REGION_TEST_SOURCE}"
+    COMMAND gen_native_region_tests "${NATIVE_REGION_TEST_SOURCE}"
+    DEPENDS gen_native_region_tests
+    VERBATIM)
+add_executable(native_region_tests
+    tests/codegen/native_region_test.cpp "${NATIVE_REGION_TEST_SOURCE}")
+target_include_directories(native_region_tests PRIVATE "${NATIVE_REGION_TEST_DIR}")
+target_link_libraries(native_region_tests PRIVATE gbarecomp_armv4t)
+add_test(NAME native_region_contract COMMAND native_region_tests)
+
+add_gbarecomp_runtime_stack_test(bridge_iret_tests tests/runtime/bridge_iret_test.cpp)
+if(GBARECOMP_NATIVE_REGIONS)
+    add_gbarecomp_runtime_stack_test(native_region_admission_tests tests/runtime/native_region_admission_test.cpp)
+    set_tests_properties(native_region_admission_tests PROPERTIES SKIP_RETURN_CODE 77)
+    add_gbarecomp_runtime_stack_test(native_region_function_tests tests/runtime/native_region_function_test.cpp)
+    target_sources(native_region_function_tests PRIVATE "${NATIVE_REGION_TEST_SOURCE}")
+    target_include_directories(native_region_function_tests PRIVATE "${NATIVE_REGION_TEST_DIR}")
+    set_tests_properties(native_region_function_tests PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+add_gbarecomp_runtime_stack_test(high_resolution_tests tests/ppu/high_resolution_test.cpp)
+add_gbarecomp_runtime_stack_test(native_draw_reuse_tests tests/ppu/native_draw_reuse_test.cpp)
+add_gbarecomp_runtime_stack_test(native_ram_code_view_tests tests/runtime/native_ram_code_view_test.cpp)
+add_executable(emit_ram_code_view_fixture EXCLUDE_FROM_ALL tests/codegen/emit_ram_code_view_fixture.cpp)
+target_link_libraries(emit_ram_code_view_fixture PRIVATE gbarecomp_recompile_core)
+set(RAM_CODE_VIEW_FIXTURE "${CMAKE_CURRENT_BINARY_DIR}/native_ram_code_view_fixture.cpp")
+add_custom_command(OUTPUT "${RAM_CODE_VIEW_FIXTURE}"
+    COMMAND $<TARGET_FILE:emit_ram_code_view_fixture> "${RAM_CODE_VIEW_FIXTURE}"
+    DEPENDS emit_ram_code_view_fixture
+    VERBATIM)
+add_gbarecomp_runtime_stack_test(native_ram_code_view_function_tests "${RAM_CODE_VIEW_FIXTURE}")
+set_tests_properties(native_ram_code_view_function_tests PROPERTIES SKIP_RETURN_CODE 77)
+# Deliberate separate-build oracle: stdout is a binary canonical-state corpus
+# (about0.8GB), not routine CTest text. Build/run reference and candidate
+# explicitly and compare the complete streams under a shared QA reservation.
+add_executable(ordered_scanline_corpus EXCLUDE_FROM_ALL
+    tests/ppu/ordered_scanline_corpus.cpp tools/bios_smoke/dispatch_stub.cpp)
+target_include_directories(ordered_scanline_corpus PRIVATE src/gba src/debug src/armv4t src/runtime src/link)
+target_link_gbarecomp_runtime_stack(ordered_scanline_corpus)
+
+# Explicit full-byte expanded/provider corpus; it emits a large canonical
+# stream for an independent original/candidate comparison, never default CTest.
+add_executable(ordered_wide_scanline_corpus EXCLUDE_FROM_ALL
+    tests/ppu/ordered_wide_scanline_corpus.cpp tools/bios_smoke/dispatch_stub.cpp)
+target_include_directories(ordered_wide_scanline_corpus PRIVATE src/gba src/debug src/armv4t src/runtime src/link)
+target_link_gbarecomp_runtime_stack(ordered_wide_scanline_corpus)
+add_executable(high_resolution_jobs_tests tests/ppu/high_resolution_jobs_test.cpp src/gba/gba_high_resolution.cpp)
+target_include_directories(high_resolution_jobs_tests PRIVATE src/gba)
+add_test(NAME high_resolution_jobs_tests COMMAND high_resolution_jobs_tests)
+add_executable(high_resolution_limits_tests tests/ppu/high_resolution_limits_test.cpp)
+target_link_libraries(high_resolution_limits_tests PRIVATE gbarecomp_gba)
+add_test(NAME high_resolution_limits_tests COMMAND high_resolution_limits_tests)
+
+add_executable(high_resolution_gpu_tests EXCLUDE_FROM_ALL tests/ppu/high_resolution_gpu_test.cpp
+    src/runtime/hd_gpu_renderer.cpp src/runtime/color_lut.cpp src/gba/gba_high_resolution.cpp)
+target_include_directories(high_resolution_gpu_tests PRIVATE src/gba src/runtime)
+target_compile_definitions(high_resolution_gpu_tests PRIVATE SDL_MAIN_HANDLED=1)
+if(GBARECOMP_SDL2_OK)
+    target_compile_definitions(high_resolution_gpu_tests PRIVATE GBARECOMP_HAVE_SDL2=1)
+    target_include_directories(high_resolution_gpu_tests PRIVATE ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(high_resolution_gpu_tests PRIVATE ${SDL2_LIBRARIES})
+endif()
+# Hardware execution is deliberate and guarded, rather than an unattended
+# default CTest launch which could interfere with another console's benchmark.
+add_gbarecomp_runtime_stack_test(vertical_obj_tests tests/ppu/vertical_obj_test.cpp)
 add_gbarecomp_runtime_stack_test(dma_tests tests/dma/test_main.cpp)
 add_gbarecomp_runtime_stack_test(dma_bulk_tests tests/dma/bulk_test_main.cpp)
 add_gbarecomp_runtime_stack_test(timer_tests tests/timers/test_main.cpp)
+add_gbarecomp_runtime_stack_test(device_audio_window_tests tests/runtime/device_audio_window_test.cpp)
+target_compile_definitions(device_audio_window_tests PRIVATE
+    GBARECOMP_TEST_DEVICE_AUDIO_WINDOWS=$<BOOL:${GBARECOMP_DEVICE_AUDIO_WINDOWS}>)
 
 add_executable(gpio_tests tests/gpio/test_main.cpp)
 target_link_libraries(gpio_tests PRIVATE gbarecomp_gba)
@@ -972,6 +1373,16 @@ target_include_directories(ppu_smoke_tests PRIVATE src/runtime src/debug)
 target_link_libraries(ppu_smoke_tests PRIVATE gbarecomp_gba)
 gbarecomp_target_link_host_stack(ppu_smoke_tests PRIVATE)
 add_test(NAME ppu_smoke_tests COMMAND ppu_smoke_tests)
+add_executable(ui_layer_tests tests/ppu/ui_layers_test.cpp)
+target_include_directories(ui_layer_tests PRIVATE src/runtime src/debug)
+target_link_libraries(ui_layer_tests PRIVATE gbarecomp_gba)
+gbarecomp_target_link_host_stack(ui_layer_tests PRIVATE)
+add_test(NAME ui_layer_tests COMMAND ui_layer_tests)
+
+add_executable(ppu_text_span_tests tests/ppu/text_span_contract.cpp)
+target_link_libraries(ppu_text_span_tests PRIVATE gbarecomp_gba)
+gbarecomp_target_link_host_stack(ppu_text_span_tests PRIVATE)
+add_test(NAME ppu_text_span_tests COMMAND ppu_text_span_tests)
 
 add_executable(save_config_tests
     tests/runtime/save_config_test.cpp
@@ -980,6 +1391,11 @@ target_include_directories(save_config_tests PRIVATE src/runtime)
 target_link_libraries(save_config_tests PRIVATE gbarecomp_gba)
 add_test(NAME save_config_tests COMMAND save_config_tests)
 
+add_executable(launcher_input_cache_tests tests/runtime/launcher_input_cache_test.cpp)
+target_include_directories(launcher_input_cache_tests PRIVATE src/runtime)
+add_test(NAME launcher_input_cache_tests COMMAND launcher_input_cache_tests
+    "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+
 add_executable(presentation_layout_tests tests/presentation_layout/test_main.cpp)
 target_include_directories(presentation_layout_tests PRIVATE src/runtime)
 add_test(NAME presentation_layout_tests COMMAND presentation_layout_tests)
@@ -987,10 +1403,26 @@ add_test(NAME presentation_layout_tests COMMAND presentation_layout_tests)
 # Touch input: gesture recognizer, hub rings/scripts, key synthesis, JSON.
 add_gbarecomp_runtime_stack_test(touch_input_tests tests/touch_input/test_main.cpp)
 add_gbarecomp_runtime_stack_test(multiplayer_session_tests tests/link/session_test.cpp)
+add_gbarecomp_runtime_stack_test(multiplayer_device_interval_tests tests/link/device_interval_test.cpp)
 add_gbarecomp_runtime_stack_test(wireless_tests tests/link/wireless_test.cpp)
 add_subdirectory(tests/link)
 add_subdirectory(tests/timing)
 include(cmake/GbaNetplay.cmake)
+
+option(GBARECOMP_BUILD_PERFORMANCE_TOOLS "Build explicit host-cost qualification tools" OFF)
+if(GBARECOMP_BUILD_PERFORMANCE_TOOLS)
+    add_executable(gba_session_benchmark tools/performance/session_benchmark.cpp
+        tools/bios_smoke/dispatch_stub.cpp)
+    target_link_gbarecomp_runtime_stack(gba_session_benchmark)
+    if(GBARECOMP_NETPLAY)
+        target_compile_definitions(gba_session_benchmark PRIVATE GBARECOMP_CHECKPOINT_BENCHMARK=1)
+        target_link_libraries(gba_session_benchmark PRIVATE gbarecomp_netplay)
+    endif()
+    add_executable(gba_audio_capture_qualification tools/performance/audio_capture_qualification.cpp)
+    target_include_directories(gba_audio_capture_qualification PRIVATE src/debug)
+    target_link_libraries(gba_audio_capture_qualification PRIVATE gbarecomp_gba)
+    add_test(NAME audio_capture_qualification COMMAND gba_audio_capture_qualification)
+endif()
 
 # P6 differential-gate primitives (offline; full-RAM snapshot/restore/diff).
 add_executable(heal_gate_tests
@@ -1024,7 +1456,7 @@ add_executable(gen_codegen_tests
 target_include_directories(gen_codegen_tests PRIVATE
     tests/codegen
     src/armv4t)
-target_link_libraries(gen_codegen_tests PRIVATE gbarecomp_armv4t)
+target_link_libraries(gen_codegen_tests PRIVATE gbarecomp_recompile_core)
 
 # NOTE: must not collide with the codegen_tests TARGET name. On Windows the
 # executable gains a .exe suffix so a same-named directory is harmless, but on
@@ -1120,3 +1552,22 @@ configure_file(
     ${CMAKE_CURRENT_BINARY_DIR}/runtime.cmake
     @ONLY
 )
+
+if(GBARECOMP_SDL2_OK AND EXISTS "${GBARECOMP_RUNTIME_UI_ROOT}/src/consoles/gba/gba_pad_binds.h")
+    add_executable(gba_controller_menu_contract_tests tests/host_input/controller_menu_contract.cpp
+        tools/bios_smoke/dispatch_stub.cpp)
+    target_link_gbarecomp_runtime_stack(gba_controller_menu_contract_tests)
+    recomp_target_launcher_ui(gba_controller_menu_contract_tests CONSOLE gba)
+    add_test(NAME gba_controller_menu_contract COMMAND gba_controller_menu_contract_tests
+        "${CMAKE_CURRENT_BINARY_DIR}/controller-contract-fixture")
+    set_tests_properties(gba_controller_menu_contract PROPERTIES SKIP_RETURN_CODE 77)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT APPLE)
+        add_executable(gba_display_contract_tests tests/host_input/display_contract.cpp
+            tools/bios_smoke/dispatch_stub.cpp)
+        target_link_gbarecomp_runtime_stack(gba_display_contract_tests)
+        recomp_target_launcher_ui(gba_display_contract_tests CONSOLE gba)
+        target_link_options(gba_display_contract_tests PRIVATE "-Wl,--wrap=SDL_RenderPresent")
+        add_test(NAME gba_display_contract COMMAND gba_display_contract_tests
+            "${CMAKE_CURRENT_BINARY_DIR}/display-contract-fixture")
+    endif()
+endif()

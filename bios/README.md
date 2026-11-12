@@ -5,16 +5,18 @@ Drop your own dump of the GBA BIOS here as `gba_bios.bin`. The binary
 `.md` / `.sym` files in this folder ARE tracked, so the path layout
 matches between developer machines.
 
-## Why we need a real BIOS
+## Maintain the real BIOS reference
 
-`gbarecomp` runs the **actual** GBA BIOS, interpreted instruction by
-instruction. We do **not** HLE SWIs. We do **not** stub the BIOS
-intro. We do **not** "fast-forward through boot." The whole point of
-a recompiler is faithfulness; the BIOS is part of what we recompile
-through.
+The LLE configuration statically recompiles and executes the actual BIOS.
+Keep it buildable and functioning as the accuracy reference for SWIs, IRQs,
+boot and their required device effects. The interpreter can diagnose CPU
+coverage gaps; independent emulators help diagnose shared hardware-model bugs.
 
-This matches the PSXRecomp approach — see `../docs/ARCHITECTURE.md`
-"BIOS as the boot path" and `../PRINCIPLES.md` "BIOS is sacred."
+Native BIOS service implementations are allowed under [HLE.md](../HLE.md).
+They preserve the supported caller contract and may approximate internal work
+and timing. The existing legacy BIOS selectors do not replace the build-time
+selection policy for new services. Boot-intro playback is a separate option.
+Never use a success stub to conceal a missing required effect or LLE route.
 
 ## Required image
 
@@ -32,7 +34,7 @@ verify.
 
 ## Where to put it
 
-`F:/Projects/gbarecomp/gbarecomp/bios/gba_bios.bin`
+`bios/gba_bios.bin`
 
 The `bios_smoke` tool, the runtime, and `gba_recompile` all look here
 by default. Override with `--bios <path>` if you keep yours elsewhere.
@@ -48,6 +50,14 @@ by default. Override with `--bios <path>` if you keep yours elsewhere.
 
 ## What does NOT live here
 
-- Decompiled or "lifted to C" BIOS source. We interpret the original
-  bytes; we don't ship a re-implementation.
-- HLE stubs that pretend to be SWIs.
+- Owned BIOS bytes or ROM-derived generated sources in version control.
+- Decompiled pseudo-C treated as an independent execution oracle.
+- Success stubs that omit required BIOS behavior.
+
+Native service implementations live in their appropriate runtime component,
+with licensing, caller contracts and a maintained LLE build documented.
+
+Generate locally with `gba_recompile --bios bios/gba_bios.bin --config
+bios/gba_bios.toml` into the ignored `src/runtime/generated_bios` directory,
+or configure an explicit `GBARECOMP_GENERATED_BIOS_DIR`. Generated source
+is a private build input and never enters version control.

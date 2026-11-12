@@ -45,6 +45,15 @@ public:
     void eeprom_write_bit(uint16_t value);
     uint16_t eeprom_read_bit();
 
+    // The EEPROM part is a property of the cartridge and the game's request
+    // DMAs reveal it: a 4 Kbit part takes 6-bit block addresses (read request
+    // 9 bits, write request 73), a 64 Kbit part 14-bit (17 / 81). The
+    // configured size is only the starting assumption; each unambiguous
+    // request length settles the part. On a change the bytes the new part
+    // decodes are kept (a 4 Kbit part sees the first 512). Returns true when
+    // the part changed.
+    bool eeprom_observe_request_length(uint32_t bits);
+
     std::size_t eeprom_size() const { return eeprom_size_; }
     bool load_eeprom_bytes(const uint8_t* data, std::size_t bytes);
     std::vector<uint8_t> eeprom_bytes() const;

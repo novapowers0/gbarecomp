@@ -12,9 +12,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
 #include <memory>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 namespace gbarecomp {
 namespace {
@@ -26,6 +28,7 @@ struct Backend {
     bool assist=true, resize=false;
     int turbo=4;
     std::unique_ptr<runtime::ColorLut> lut;
+    std::vector<uint8_t> sampled_native;
     // Touch (touch_input.h). The page owns the virtual pad (its presses arrive
     // in `keys` through the touch mask) and forwards every other pointer
     // through the touch ring; pump() feeds those to the TouchHub.
@@ -62,6 +65,7 @@ std::string descriptor() {
       << ",\"overlayStride\":" << sizeof(OverlayCmd)
       << ",\"audio\":" << offsetof(Shared,audio) << ",\"audioStride\":" << sizeof(AudioSlot)
       << ",\"audioSamples\":" << AudioSamples << ",\"audioSlots\":" << AudioSlots
+      << ",\"audioChannels\":" << AudioChannels
       << ",\"commands\":" << offsetof(Shared,commands) << ",\"commandSlots\":" << CommandSlots
       << ",\"touches\":" << offsetof(Shared,touches) << ",\"touchSlots\":" << TouchSlots
       << ",\"touchStride\":" << sizeof(TouchSlot) << '}';
@@ -315,6 +319,13 @@ void HostWindow::close() {
 }
 bool HostWindow::set_surface_size(int w,int h) { if(!impl_||!dimensions(w,h))return false; backend(impl_)->width=w;backend(impl_)->height=h;return true; }
 bool HostWindow::drawable_size(int* w,int* h) const { if(!impl_||!w||!h)return false; auto d=backend(impl_)->shared.control.drawable.load(); *w=d&65535;*h=d>>16;return *w&&*h; }
+bool HostWindow::hd_jobs_available() { return false; }
+bool HostWindow::present_hd(const gba::GbaHighResolutionFrame::DrawFrame&) { return false; }
+bool HostWindow::readback_hd(std::vector<uint8_t>&,unsigned&,unsigned&) { return false; }
+#if defined(GBARECOMP_NATIVE_DRAW_JOBS)
+bool HostWindow::present_native(const std::shared_ptr<const gba::GbaNativeDrawFrame>&) { return false; }
+bool HostWindow::readback_native(const std::shared_ptr<const gba::GbaNativeDrawFrame>&,std::vector<uint8_t>&) { return false; }
+#endif
 void HostWindow::present(const uint8_t* rgb) {
     if(!impl_||!rgb)return;
     auto& b=*backend(impl_);auto& s=b.shared;auto& v=s.video[b.back];
@@ -331,8 +342,35 @@ void HostWindow::present(const uint8_t* rgb) {
     const auto old=s.control.middle.exchange(b.back|Dirty,std::memory_order_acq_rel);
     b.back=old&3; if(old&Dirty)++s.control.replaced; ++s.control.published;
 }
+void HostWindow::present(const uint8_t* rgb,unsigned sampled_w,unsigned sampled_h) {
+    if(!impl_||!rgb)return;
+    auto& b=*backend(impl_);
+    if(!sampled_w)sampled_w=b.width;
+    if(!sampled_h)sampled_h=b.height;
+    if(sampled_w==unsigned(b.width)&&sampled_h==unsigned(b.height)) { present(rgb);return; }
+    // The browser shared-memory protocol has fixed logical-size slots. Keep
+    // its portable native-density fallback until an enhanced-slot ABI exists.
+    // Read the supplied sampled stride; never reinterpret it as native RGB.
+    b.sampled_native.resize(std::size_t(b.width)*b.height*3);
+    for(int y=0;y<b.height;++y) for(int x=0;x<b.width;++x) {
+        const auto sy=std::uint64_t(y)*sampled_h/b.height;
+        const auto sx=std::uint64_t(x)*sampled_w/b.width;
+        std::copy_n(rgb+(sy*sampled_w+sx)*3,3,
+                    b.sampled_native.data()+(std::size_t(y)*b.width+x)*3);
+    }
+    present(b.sampled_native.data());
+}
 void HostWindow::push_audio_samples(const int16_t* x,std::size_t n){push_audio_block(x,n,65536);}
 void HostWindow::push_audio_block(const int16_t* x,std::size_t n,uint32_t rate) {
+    if(!x)return;
+    int16_t stereo[AudioSamples * AudioChannels];
+    while(n) {
+        const auto count=std::min(n,std::size_t(AudioSamples));
+        for(std::size_t i=0;i<count;++i) stereo[i*2]=stereo[i*2+1]=x[i];
+        push_audio_stereo_block(stereo,count,rate); x+=count;n-=count;
+    }
+}
+void HostWindow::push_audio_stereo_block(const int16_t* x,std::size_t n,uint32_t rate) {
     if(!impl_||!x||!(rate==32768||rate==65536||rate==131072||rate==262144))return;
     auto& b=*backend(impl_);auto& s=b.shared;auto& c=s.control;
     if(c.audioReady!=1 || c.resetAck.load()!=c.resetRequest.load())return;
@@ -340,7 +378,7 @@ void HostWindow::push_audio_block(const int16_t* x,std::size_t n,uint32_t rate) 
         uint32_t w=c.audioWrite.load(std::memory_order_relaxed),r=c.audioRead.load(std::memory_order_acquire);
         if(uint32_t(w-r)>=AudioSlots){c.audioOverflow.fetch_add(n);reset_audio();return;}
         auto& a=s.audio[w&(AudioSlots-1)]; a.count=std::min(n,std::size_t(AudioSamples)); a.rate=rate;a.epoch=b.epoch;
-        std::copy_n(x,a.count,a.samples); x+=a.count;n-=a.count;
+        std::copy_n(x,a.count * AudioChannels,a.samples); x+=a.count * AudioChannels;n-=a.count;
         c.audioPublished.fetch_add(a.count);c.audioWrite.store(w+1,std::memory_order_release);
     }
 }
@@ -387,9 +425,11 @@ HostWindow::Events HostWindow::pump() {
     return e;
 }
 void HostWindow::service_events(){} // All DOM service belongs to the page; do not consume commands here.
-void HostWindow::load_input_config(const char* dir,bool assist,int turbo) {
+void HostWindow::load_input_config(const char* dir,bool assist,int turbo,const char* config_filename,const char* keybinds_filename) {
     if(!impl_)return;auto& b=*backend(impl_);b.assist=assist;b.turbo=std::clamp(turbo,2,10);
-    std::string base=dir?dir:".";base+='/';auto keys=read_file(base+"keybinds.ini"),config=read_file(base+"config.ini");
+    const std::filesystem::path base=dir?dir:".";
+    auto keys=read_file((base/(keybinds_filename&&keybinds_filename[0]?keybinds_filename:"keybinds.ini")).string());
+    auto config=read_file((base/(config_filename&&config_filename[0]?config_filename:"config.ini")).string());
     MAIN_THREAD_EM_ASM({globalThis.GbrHost.configure(UTF8ToString($0),UTF8ToString($1));},keys.c_str(),config.c_str());
 }
 void HostWindow::set_fullscreen(int mode){if(impl_)MAIN_THREAD_EM_ASM({globalThis.GbrHost.fullscreenRequest($0);},std::clamp(mode,0,2));}
@@ -404,6 +444,13 @@ CONTROL_SETGET(set_audio_enabled,audio_enabled,audioEnabled,bool,false,v)
 CONTROL_SETGET(set_fps_readout,fps_readout,fps,bool,false,v)
 void HostWindow::set_linear_filter(bool v){if(impl_)backend(impl_)->shared.control.filter=v?1:0;}
 bool HostWindow::linear_filter()const{return impl_&&backend(impl_)->shared.control.filter.load()==1;}
+// Browser presentation uses the page's own controls rather than the desktop
+// launcher/runtime menu. These optional desktop effects are unavailable there.
+void HostWindow::set_integer_scale(bool) {}
+bool HostWindow::integer_scale() const { return false; }
+void HostWindow::set_scanlines(bool, int) {}
+bool HostWindow::scanlines() const { return false; }
+int HostWindow::scanline_strength() const { return 35; }
 void HostWindow::set_resize_driven_view(bool v){if(impl_)backend(impl_)->resize=v;}
 bool HostWindow::assist_tools_enabled()const{return impl_&&backend(impl_)->assist;}
 int HostWindow::fast_forward_multiplier()const{return impl_?backend(impl_)->turbo:4;}

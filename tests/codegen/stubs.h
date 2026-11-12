@@ -48,6 +48,8 @@ extern bool     g_swi_called;
 extern bool     g_fellthrough;
 // Set when a named-target variant calls its resolved branch target.
 extern bool     g_named_sink_called;
+extern unsigned g_mod_entry_calls;
+extern uint32_t g_mod_entry_pc;
 extern bool     g_unimplemented_called;
 extern const char* g_unimplemented_op;
 extern uint32_t g_unimplemented_pc;

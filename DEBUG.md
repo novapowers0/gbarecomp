@@ -1,7 +1,12 @@
 # DEBUG LOOP (EXECUTION CONTRACT)
 
-Follow exactly. No deviation. All inspection goes through TCP.
-See `TCP.md` for the command surface.
+Use the part of this workflow that matches the investigation. Live guest-state
+inspection uses TCP; see `TCP.md`. Existing offline fixtures, explicit snapshot
+exports, compiler/disassembly checks and bounded phase/performance counters are
+also supported. Keep expensive diagnostic recording out of timing samples.
+The current `PRINCIPLES.md`, `HLE.md` and shared optimization policy supersede
+historical blanket gates below. A presentation optimization does not require
+requalifying unrelated BIOS, CPU or cartridge behavior.
 
 ---
 
@@ -21,41 +26,46 @@ If not validated → all reasoning is INVALID.
 
 # RULE 0a — DISPATCH MISS CHECK (every run, before any debugging)
 
-Before anything else, read `dispatch_misses.log` next to the game
-executable.
+Inspect dispatch/coverage evidence for every acceptance run, including
+`dispatch_misses.log` when present and the runtime's final counters.
 
-- If non-empty: add the listed functions (with detected mode: ARM or
-  THUMB) to `game.toml [functions]`, regenerate, rebuild, re-run.
-- Repeat until `dispatch_misses.log` is empty.
+- If non-empty, retain the evidence and identify the missing control-flow or
+  runtime contract. Review a metadata proposal before changing `game.toml`;
+  do not blindly add PCs or hand-edit generated bodies.
+- A strict static acceptance run must abort on a miss and finish with zero
+  interpreted/healed execution. Discovery builds may bridge loudly under
+  the current coverage policy; report their coverage honestly.
 
-A game with dispatch misses is FUNDAMENTALLY BROKEN. Do not debug
-anything else until resolved.
+A coverage gap does not invalidate unrelated host-only measurements, but it
+must not be hidden or described as fully static qualification.
 
 ---
 
 # RULE 0c — BIOS SYNC
 
-When comparing native vs oracle (mGBA / NanoBoyAdvance), both
-processes must be running through their respective real BIOS
-implementations. Sync points always include "first BIOS instruction
-executed" and "BIOS handed off to cartridge entry."
+For BIOS/CPU timing comparisons against mGBA or NanoBoyAdvance, use matching
+boot modes and actual qualified BIOS implementations. Record meaningful sync
+points such as BIOS entry and cartridge handoff. A build-selected BIOS HLE
+service is assessed against its documented caller contract; it need not
+reproduce every original instruction or stall. Boot-intro selection is separate
+from SWI service selection.
 
 Symptoms that mean RULE 0c is violated:
 - Native skips the Nintendo logo intro but oracle plays it.
 - Native SWI handler returns instantly; oracle takes real cycles.
 - Cartridge code on native starts before BIOS has cleared IWRAM.
 
-If any of those is true, stop debugging the game and fix the BIOS
-boot path. There is no "I'll come back to that later" — every
-downstream divergence will be polluted by it.
+If boot modes or BIOS semantics differ unintentionally, fix or isolate that
+mismatch before claiming an exact downstream differential. Presentation-only
+timing from an existing matched checkpoint remains a separate valid experiment.
 
 ---
 
-# RULE 0d — BIOS INTRO DRIFT IS P0
+# RULE 0d — Investigate BIOS defects in their affected scope
 
-Any OAM / PAL / VRAM / IWRAM byte that differs between native and
-the mGBA oracle during the BIOS intro is a **P0 bug**. No
-deferral, no "close enough," no triage to a later phase.
+An unexpected BIOS-intro difference is a correctness finding. Retain it,
+identify the first relevant divergence and fix the affected path. Exact LLE
+claims require exactness; a declared HLE approximation uses its caller contract.
 
 Symptoms that mean RULE 0d is violated:
 - `diff_frame.py` reports any byte diff in OAM/PAL/VRAM/IWRAM for
@@ -65,9 +75,11 @@ Symptoms that mean RULE 0d is violated:
 - The startup chime sounds different than mGBA's chime, or is
   silent on native.
 
-The Phase 2.7 gate (`PRINCIPLES.md` "BIOS intro must be flawless
-before ROM") stays open while any of these are true. ROM / cart /
-game / generator work is blocked.
+The former global "BIOS flawless before all ROM work" gate is obsolete.
+Maintain the functioning real-BIOS LLE reference and record its limitations;
+do not block unrelated game, generator or host-presentation work on a known
+isolated defect. This does not permit hiding a BIOS defect with fabricated HLE
+success or weakening netplay determinism.
 
 ---
 
@@ -129,13 +141,17 @@ value, then trace that writer.
 7. **Fix the tool** — recompiler, runtime, or TCP tooling. Never
    edit generated output.
 
-If any step is skipped → STOP and restart.
+For a guest correctness divergence, retain the relevant sync, first-difference
+and writer evidence. Use a focused contract/measurement workflow for a host-only
+optimization rather than inventing a guest write divergence where none exists.
 
 ---
 
 # HARD RULES
 
-- **No printf debugging.** Ever. If TCP can't see it, extend TCP.
+- **Live guest inspection uses structured tools.** Extend TCP/rings when needed.
+  Bounded startup/exit counters, phase CSVs and isolated test diagnostics are
+  allowed; avoid unbounded hot-loop logging and keep it out of timings.
 - **No hand-editing generated output.** Fix the generator / runtime /
   game config and regenerate.
 - **No guessing.** Every claim must cite measured data, oracle
@@ -168,7 +184,9 @@ Every debugging response must at minimum state:
    NEVER in generated code).
 9. Re-test plan.
 
-If any section is missing → STOP.
+These fields describe guest correctness findings. For host/performance work,
+record the supported contract, exact build/input identity, useful work measured,
+relevant focused checks and limitations instead.
 
 ---
 
@@ -193,6 +211,9 @@ window after the fact:
 - Last function entered, last SWI, last DMA fired, last IRQ taken.
 - Up to N (configurable) verify-mode diffs vs oracle for the frame.
 
-This ring is **always on**, including in Release builds. Eviction
-keeps memory bounded. Probes pull the requested slice; they do not
-arm a new recording.
+While the diagnostic surface is enabled, retain bounded history for queries
+instead of requiring a late arm-and-record sequence. Heavy snapshot/payload
+recording may be gated for normal play and disabled in performance measurements;
+retain cheap coverage counters and an explicit way to enable detailed capture.
+Report when history is unavailable. Netplay's canonical rollback/state history
+is a separate required service and cannot be disabled as a diagnostic shortcut.

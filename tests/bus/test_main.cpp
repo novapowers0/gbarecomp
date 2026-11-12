@@ -1,6 +1,7 @@
 // bus_tests — current scope: ROM header parser. As more bus
 // subsystems come online (Phase 2/3) this file expands to cover them.
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -17,6 +18,8 @@
 #include "gba_simulation_state.h"
 #include "mod_state.h"
 #include "snapshot.h"
+#include "runtime_bus_bridge.h"
+#include "runtime_arm.h"
 
 namespace {
 
@@ -49,6 +52,60 @@ void check_bool(const char* test, const char* tag,
                     test, tag, got ? 1 : 0, expect ? 1 : 0);
         ++failures;
     }
+}
+
+void test_native_ram_contract() {
+    constexpr const char* t = "native_ram";
+    gba::GbaBus bus;
+    uint32_t value = 0;
+    for (uint32_t region : {0x02000000u, 0x03000000u}) {
+        for (uint32_t offset : {0u, 1u, 0x123u, 0x7ffcu}) {
+            const uint32_t addr = region + offset;
+            bus.write32(addr, 0x89abcdefu);
+            check_bool(t, "read8 admitted", bus.native_ram_read<1>(addr, value), true);
+            check_eq(t, "read8 bytes", value, bus.read8(addr));
+            check_bool(t, "read16 admitted", bus.native_ram_read<2>(addr, value), true);
+            check_eq(t, "read16 bytes", value, bus.read16(addr));
+            check_bool(t, "read32 admitted", bus.native_ram_read<4>(addr, value), true);
+            check_eq(t, "read32 bytes", value, bus.read32(addr));
+            const uint32_t mirror = addr + (region == 0x02000000u ? 0x40000u : 0x8000u);
+            check_bool(t, "mirror write", bus.native_ram_write<4>(mirror, 0x76543210u), true);
+            check_eq(t, "mirror backing", bus.read32(addr), 0x76543210u);
+            check_bool(t, "byte write", bus.native_ram_write<1>(addr+1, 0xef), true);
+            check_eq(t, "byte neighbors", bus.read32(addr), 0x7654ef10u);
+            check_bool(t, "half write", bus.native_ram_write<2>(addr+1, 0xabcd), true);
+            check_eq(t, "half neighbors", bus.read32(addr), 0x76abcd10u);
+        }
+    }
+    for (uint32_t addr : {0u,0x04000000u,0x05000000u,0x06000000u,0x07000000u,
+                          0x08000000u,0x0e000000u,0x12000000u,0xffffffffu}) {
+        check_bool(t, "device read rejected", bus.native_ram_read<4>(addr,value), false);
+        check_bool(t, "device write rejected", bus.native_ram_write<4>(addr,0), false);
+    }
+    check_bool(t, "edge read rejected", bus.native_ram_read<4>(0x03007ffe,value), false);
+    check_bool(t, "edge write rejected", bus.native_ram_write<2>(0x0203ffff,0), false);
+    struct Observer : gba::BusWriteObserver {
+        unsigned calls = 0;
+        bool on_bus_write(gba::BusWriteRegion,uint32_t,uint32_t,uint8_t,uint32_t,uint32_t) override {
+            ++calls; return true;
+        }
+    } observer;
+    bus.write32(0x02000000u,0x12345678u);
+    bus.set_write_observer(&observer);
+    check_bool(t, "observer declines direct store", bus.native_ram_write<4>(0x02000000u,0), false);
+    auto* previous = gbarecomp::active_bus();
+    gbarecomp::set_active_bus(&bus);
+    bus_write_u32(0x02000000u,0);
+    check_eq(t, "observer sees runtime store", observer.calls, 1u);
+    check_eq(t, "observer suppresses runtime store", bus.read32(0x02000000u), 0x12345678u);
+    const auto previous_override = g_runtime_bus_read_override;
+    g_runtime_bus_read_override = [](uint32_t,uint32_t,uint32_t,uint32_t original,uint32_t* out) {
+        *out = original ^ 0x11223344u; return 1;
+    };
+    check_eq(t, "runtime read override", bus_read_u32(0x02000000u), 0x0316653cu);
+    g_runtime_bus_read_override = previous_override;
+    gbarecomp::set_active_bus(previous);
+    bus.set_write_observer(nullptr);
 }
 
 // Build a synthetic but valid-shape ROM and verify the parser
@@ -147,12 +204,24 @@ void test_no_save_signature() {
 }
 
 void test_sram_signature() {
-    auto rom = build_synthetic_rom("GAME", "XXXX", "00", 0x00,
-                                   "SRAM_V112", 64 * 1024);
-    auto h = gba::parse_rom(rom.data(), rom.size());
-    check_eq  ("sram_signature", "save_type",
-               static_cast<int>(h.save_type),
-               static_cast<int>(gba::SaveType::SRAM));
+    struct Case { const char* sdk; const char* matched; gba::SaveType type; };
+    const Case cases[] = {
+        {"SRAM_F_V103", "SRAM_F_V", gba::SaveType::SRAM},
+        {"SRAM_V112", "SRAM_V", gba::SaveType::SRAM},
+        {"EEPROM_V124", "EEPROM_V", gba::SaveType::EEPROM},
+        {"FLASH_V123", "FLASH_V", gba::SaveType::Flash512},
+        {"FLASH512_V130", "FLASH512_V", gba::SaveType::Flash512},
+        {"FLASH1M_V103", "FLASH1M_V", gba::SaveType::Flash1M},
+    };
+    for (const auto& c : cases) {
+        auto rom = build_synthetic_rom("GAME", "XXXX", "00", 0x00,
+                                       c.sdk, 64 * 1024);
+        auto h = gba::parse_rom(rom.data(), rom.size());
+        check_eq(c.sdk, "save_type", static_cast<int>(h.save_type),
+                 static_cast<int>(c.type));
+        check_str(c.sdk, "matched_signature", h.save_signature, c.matched);
+        check_eq(c.sdk, "signature_offset", h.save_signature_offset, 0x1000u);
+    }
 }
 
 void test_sram_controller_and_snapshot() {
@@ -254,7 +323,7 @@ void patch_snapshot_version(const std::filesystem::path& path, uint32_t version)
     file.write(bytes, sizeof(bytes));
 }
 
-void test_legacy_v1_snapshot_empty_catalog_only() {
+void test_older_snapshots_rejected_before_restore() {
     namespace debug = gbarecomp::debug;
     gba::GbaBus bus;
     gba::GbaPpu ppu;
@@ -274,18 +343,20 @@ void test_legacy_v1_snapshot_empty_catalog_only() {
     context.rom_sha1 = "0123456789012345678901234567890123456789";
     context.mod_state = &empty_catalog;
     bus.write8(0x02000000u, 0x11);
-    check_bool("snapshot_legacy_v1", "write v2 source",
+    check_bool("snapshot_legacy_v1", "write current source",
                debug::save_state(v2_path.string().c_str(), context, &error), true);
     std::filesystem::copy_file(v2_path, v1_path, std::filesystem::copy_options::overwrite_existing, ec);
     patch_snapshot_version(v1_path, 1);
 
-    // v1 has the original seven guest sections and no native MODS identity;
-    // an empty catalog may restore it exactly.
+    // Old layouts are disposable, including for an empty provider catalog.
     bus.write8(0x02000000u, 0xaa);
     error.clear();
-    check_bool("snapshot_legacy_v1", "empty catalog loads",
-               debug::load_state(v1_path.string().c_str(), context, &error), true);
-    check_eq("snapshot_legacy_v1", "guest restored", bus.read8(0x02000000u), 0x11u);
+    for (uint32_t version : {1u,2u,3u,4u}) {
+        patch_snapshot_version(v1_path,version);
+        check_bool("snapshot_old", "old version rejected",
+                   debug::load_state(v1_path.string().c_str(), context, &error), false);
+        check_eq("snapshot_old", "guest unchanged", bus.read8(0x02000000u), 0xaau);
+    }
 
     SnapshotModValue provider_value{0x7777u};
     debug::ModStateRegistry catalog;
@@ -300,13 +371,12 @@ void test_legacy_v1_snapshot_empty_catalog_only() {
     error.clear();
     check_bool("snapshot_legacy_v1", "provider catalog rejected",
                debug::load_state(v1_path.string().c_str(), provider_context, &error), false);
-    check_bool("snapshot_legacy_v1", "rejection names migration",
-               error.find("no MODS migration") != std::string::npos, true);
+    check_bool("snapshot_legacy_v1", "rejection names version",
+               error.find("version mismatch") != std::string::npos, true);
     check_eq("snapshot_legacy_v1", "provider rejection leaves guest", bus.read8(0x02000000u), 0xbbu);
     check_eq("snapshot_legacy_v1", "provider not restored", provider_value.restores, 0);
 
-    // The legacy branch frames every declared section and consumes the entire
-    // container before guest restoration; an unframed tail is never ignored.
+    // A malformed old file is rejected without attempting restoration.
     std::filesystem::copy_file(v1_path, malformed_path, std::filesystem::copy_options::overwrite_existing, ec);
     { std::ofstream malformed(malformed_path, std::ios::binary | std::ios::app); malformed.put('\0'); }
     bus.write8(0x02000000u, 0xcc);
@@ -320,7 +390,52 @@ void test_legacy_v1_snapshot_empty_catalog_only() {
     std::filesystem::remove(malformed_path, ec);
 }
 
-void test_v2_trailing_container_rejects_before_guest_mutation() {
+void test_snapshot_pending_timing() {
+    namespace debug=gbarecomp::debug;
+    const char* t="snapshot_pending_timing";
+    gbarecomp::RuntimeTimingContext previous;
+    gbarecomp::runtime_capture_timing_context(previous);
+    const gbarecomp::RuntimeTimingContext saved{1000,8,7,37,150};
+    gbarecomp::runtime_restore_timing_context(saved);
+    gba::GbaBus bus; gba::GbaPpu ppu;
+    debug::SnapshotContext context;
+    context.bus=&bus; context.ppu=&ppu;
+    bus.write8(0x02000000,0x11);
+    std::string error; std::vector<uint8_t> bytes;
+    check_bool(t,"save",debug::save_state_bytes(&bytes,context,&error),true);
+    gbarecomp::runtime_restore_timing_context({2000,18,17,3,50});
+    bus.write8(0x02000000,0xaa);
+    check_bool(t,"load",debug::load_state_bytes(bytes.data(),bytes.size(),context,&error),true);
+    gbarecomp::RuntimeTimingContext restored;
+    gbarecomp::runtime_capture_timing_context(restored);
+    check_eq(t,"master clock",restored.cycles,saved.cycles);
+    check_eq(t,"vblank count",restored.vblank_starts,saved.vblank_starts);
+    check_eq(t,"presentation boundary",restored.yielded_vblank,saved.yielded_vblank);
+    check_eq(t,"pending cycles",restored.pending_cycles,saved.pending_cycles);
+    check_eq(t,"event horizon",restored.event_budget,saved.event_budget);
+    check_eq(t,"guest restored",bus.read8(0x02000000),0x11u);
+    // Corrupt only the fixed timing payload. Refusal precedes any guest or
+    // clock restoration, rather than silently dropping the clock debt.
+    std::size_t cursor=52;
+    while (cursor+8<=bytes.size()) {
+        const uint32_t size=bytes[cursor+4] | (uint32_t(bytes[cursor+5])<<8) |
+            (uint32_t(bytes[cursor+6])<<16) | (uint32_t(bytes[cursor+7])<<24);
+        if (std::memcmp(bytes.data()+cursor,"TIME",4)==0) {
+            std::fill(bytes.begin()+cursor+8+24,bytes.begin()+cursor+8+32,0xff);
+            break;
+        }
+        cursor+=8+size;
+    }
+    check_bool(t,"timing payload found",cursor+8<=bytes.size(),true);
+    bus.write8(0x02000000,0xa5);
+    check_bool(t,"bad timing refused",debug::load_state_bytes(bytes.data(),bytes.size(),context,&error),false);
+    check_eq(t,"refusal leaves guest",bus.read8(0x02000000),0xa5u);
+    gbarecomp::runtime_capture_timing_context(restored);
+    check_eq(t,"refusal leaves clock",restored.pending_cycles,saved.pending_cycles);
+    gbarecomp::runtime_restore_timing_context(previous);
+}
+
+void test_trailing_container_rejects_before_guest_mutation() {
     namespace debug = gbarecomp::debug;
     gba::GbaBus bus;
     gba::GbaPpu ppu;
@@ -437,6 +552,36 @@ void test_matrix_memory_mapper() {
     check_eq("matrix", "waitstate_mirror", bus.read8(0x0C000000u), 0xC3u);
     check_eq("matrix", "mirror_map_command_count",
              bus.matrix().map_command_count(), 2u);
+    const auto waits_before=*bus.wait_table();
+    rom[0x020011F0u]=0xD7u;
+    rom[0x200u]=0xE8u;
+    auto view=bus.native_code_view(0x0C0001F0u,32);
+    check_bool("native_code_view","noncontiguous_matrix_pages",view!=nullptr,true);
+    if (view) {
+        check_eq("native_code_view","mapped_tail",view[0],0xD7u);
+        check_eq("native_code_view","next_page",view[16],0xE8u);
+    }
+    rom[0x200u]=0xE9u;
+    view=bus.native_code_view(0x080001F0u,32);
+    if (view) check_eq("native_code_view","live_mapping_bytes",view[16],0xE9u);
+    check_bool("native_code_view","outside_aperture",bus.native_code_view(0x08002000u,4)==nullptr,true);
+    bus.iwram_ptr()[0x7FFEu]=0xA1u; bus.iwram_ptr()[0]=0xB2u;
+    view=bus.native_code_view(0x03007FFEu,4);
+    check_bool("native_code_view","iwram_mirror_wrap",view!=nullptr,true);
+    if (view) { check_eq("native_code_view","iwram_tail",view[0],0xA1u);
+                check_eq("native_code_view","iwram_head",view[2],0xB2u); }
+    bus.ewram_ptr()[0x3FFFEu]=0xC3u; bus.ewram_ptr()[0]=0xD4u;
+    view=bus.native_code_view(0x0203FFFEu,4);
+    check_bool("native_code_view","ewram_mirror_wrap",view!=nullptr,true);
+    if (view) { check_eq("native_code_view","ewram_tail",view[0],0xC3u);
+                check_eq("native_code_view","ewram_head",view[2],0xD4u); }
+    check_bool("native_code_view","cross_region",bus.native_code_view(0x03FFFFFEu,4)==nullptr,true);
+    check_bool("native_code_view","bios_excluded",bus.native_code_view(0,4)==nullptr,true);
+    check_bool("native_code_view","io_excluded",bus.native_code_view(0x04000000u,4)==nullptr,true);
+    check_bool("native_code_view","waits_unchanged",
+        std::memcmp(&waits_before,bus.wait_table(),sizeof(waits_before))==0,true);
+    check_eq("native_code_view","mapper_unchanged",bus.matrix().map_command_count(),2u);
+    check_eq("native_code_view","unmapped_unchanged",bus.unmapped_count(),std::size_t(0));
 }
 
 void test_flash1m_beats_flash() {
@@ -562,6 +707,64 @@ void test_eeprom_8k_read_write() {
     }
 }
 
+uint8_t eeprom_read_block_byte(gba::GbaSave& save, uint32_t block, int addr_bits,
+                               int byte_index) {
+    eeprom_send_bits(save, 0b11, 2);
+    eeprom_send_bits(save, block, addr_bits);
+    eeprom_send_bits(save, 0, 1);
+    for (int i = 0; i < 4; ++i) (void)save.eeprom_read_bit();
+    uint8_t want = 0;
+    for (int i = 0; i < 8; ++i) {
+        uint8_t got = 0;
+        for (int bit = 0; bit < 8; ++bit) {
+            got = static_cast<uint8_t>((got << 1) | save.eeprom_read_bit());
+        }
+        if (i == byte_index) want = got;
+    }
+    return want;
+}
+
+// A title configured as 64 Kbit whose game drives a 4 Kbit part: the game's
+// request lengths (9 / 73 bits) settle the part, the bytes a 4 Kbit part
+// decodes survive, and a later 17 / 81-bit request widens it again.
+void test_eeprom_part_from_request_lengths() {
+    gba::GbaSave save;
+    save.configure_eeprom(8 * 1024);
+    std::array<uint8_t, 8 * 1024> image{};
+    image.fill(0xFF);
+    image[2 * 8 + 3] = 0x5A;   // 4 Kbit block 2, byte 3
+    image[600] = 0x77;         // past the 4 Kbit part
+    check_bool("eeprom_part", "load_8k",
+               save.load_eeprom_bytes(image.data(), image.size()), true);
+
+    check_bool("eeprom_part", "ignores_other_lengths",
+               save.eeprom_observe_request_length(68), false);
+    check_bool("eeprom_part", "read_request_4k",
+               save.eeprom_observe_request_length(9), true);
+    check_eq("eeprom_part", "size_4k", save.eeprom_size(), 512u);
+    check_eq("eeprom_part", "bytes_4k", save.eeprom_bytes().size(), 512u);
+    check_eq("eeprom_part", "kept_low_byte",
+             eeprom_read_block_byte(save, 2, 6, 3), 0x5Au);
+
+    check_bool("eeprom_part", "write_request_4k_no_change",
+               save.eeprom_observe_request_length(73), false);
+    const uint8_t pattern[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    eeprom_send_bits(save, 0b10, 2);
+    eeprom_send_bits(save, 63, 6);
+    for (uint8_t b : pattern) eeprom_send_bits(save, b, 8);
+    eeprom_send_bits(save, 0, 1);
+    check_eq("eeprom_part", "write_4k_last_block",
+             eeprom_read_block_byte(save, 63, 6, 7), 8u);
+
+    check_bool("eeprom_part", "write_request_64k",
+               save.eeprom_observe_request_length(81), true);
+    check_eq("eeprom_part", "size_64k", save.eeprom_size(), 8u * 1024u);
+    check_eq("eeprom_part", "kept_after_widen",
+             eeprom_read_block_byte(save, 63, 14, 7), 8u);
+    check_eq("eeprom_part", "dropped_past_4k_reads_erased",
+             save.eeprom_bytes()[600], 0xFFu);
+}
+
 void test_eeprom_persistence_bytes_and_dirty() {
     gba::GbaSave save;
     std::array<uint8_t, 16> persisted{};
@@ -681,14 +884,16 @@ void test_waitstates() {
 }
 
 int main() {
+    test_native_ram_contract();
     test_minishcap_like();
     test_corrupt_header();
     test_no_save_signature();
     test_sram_signature();
     test_sram_controller_and_snapshot();
     test_snapshot_mods_preflight_before_guest_restore();
-    test_legacy_v1_snapshot_empty_catalog_only();
-    test_v2_trailing_container_rejects_before_guest_mutation();
+    test_older_snapshots_rejected_before_restore();
+    test_snapshot_pending_timing();
+    test_trailing_container_rejects_before_guest_mutation();
     test_sram_bus_width_and_region_mirroring();
     test_bios_undocumented_io_write();
     test_bios_window_writes_are_ignored();
@@ -697,6 +902,7 @@ int main() {
     test_flash_chip(0x10000, 0x1C);
     test_flash_chip(0x20000, 0x09);
     test_eeprom_8k_read_write();
+    test_eeprom_part_from_request_lengths();
     test_eeprom_persistence_bytes_and_dirty();
     test_waitstates();
     if (failures) {

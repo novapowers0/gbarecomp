@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -29,6 +30,7 @@
 #include "arm_decode.h"
 #include "arm_ir.h"
 #include "thumb_decode.h"
+#include "emit_function.h"
 
 namespace {
 
@@ -42,6 +44,7 @@ armv4t::Instr decode_one(const TestCase& tc) {
 
 int emit(FILE* f, const char* out_path) {
     const std::unordered_set<uint32_t> thumb_alu_immediate_override_pcs = {
+        0x03007D3Eu,0x0800103Eu,
         0x0800E2D2u,
         0x0800E31Cu,
         0x080B291Cu,
@@ -68,14 +71,19 @@ int emit(FILE* f, const char* out_path) {
     // Per-test function bodies.
     for (std::size_t i = 0; i < kTestCasesCount; ++i) {
         const TestCase& tc = kTestCases[i];
-        armv4t::Instr ins = decode_one(tc);
+        TestCase canonical = tc;
+        if (tc.runtime_pc_base) canonical.pc = tc.pc>=0x08000000u ? 0x08000000u : 0x03000000u;
+        armv4t::Instr ins = decode_one(canonical);
         armv4t::CodegenCtx ctx{};
-        ctx.current_function_addr = tc.pc;
+        ctx.current_function_addr = canonical.pc;
+        ctx.current_function_end_addr = canonical.pc + (tc.thumb ? 2u : 4u);
+        if (tc.runtime_pc_base) ctx.runtime_pc_base = "_runtime_base";
         ctx.alu_immediate_override_pcs =
             &thumb_alu_immediate_override_pcs;
         bool not_implemented = false;
         std::string body = armv4t::ArmCodegen::emit_instr(
             ins, ctx, &not_implemented);
+        if (tc.runtime_pc_base) body = "    const uint32_t _runtime_base = g_cpu.R[15];\n" + body;
         for (std::size_t trace_pos = body.find("runtime_trace_event(");
              trace_pos != std::string::npos;
              trace_pos = body.find("runtime_trace_event(",
@@ -167,6 +175,51 @@ int emit(FILE* f, const char* out_path) {
             "    codegen_test_fellthrough();\n"
             "}\n\n",
             i, tc.name, tc.pc, i, body.c_str());
+    }
+    // Whole native RAM fragments: the first instruction changes the following
+    // instruction. Both byte sequences are AOT bodies, never runtime codegen.
+    for (unsigned variant = 0; variant < 2; ++variant) {
+        const uint8_t image[] = {0x01, 0x80, uint8_t(1u+variant), 0x22, 0x70, 0x47};
+        gbarecomp::Function fn{};
+        fn.addr = 0x03000000u;
+        fn.source_addr = 0x08000000u;
+        fn.end_addr = fn.walk_end_addr = fn.addr + sizeof(image);
+        fn.mode = gbarecomp::CpuMode::Thumb;
+        fn.alias_entries = {fn.addr+2, fn.addr+4};
+        const std::unordered_map<uint64_t, std::string> empty;
+        const std::unordered_set<uint64_t> reviewed={
+            (uint64_t(0x03001002u)<<1)|1u,(uint64_t(0x08001002u)<<1)|1u};
+        const auto body = gbarecomp::emit_function_body_str(fn, image, sizeof(image),
+            fn.source_addr, empty, nullptr, &reviewed, true);
+        std::fprintf(f, "extern \"C\" void ram_mutation_fixture_%u(void) {\n%s}\n",
+                     variant, body.c_str());
+    }
+    for (unsigned region : {3u,8u}) for (unsigned op=0;op<2;++op) {
+        const uint32_t pc=region<<24;
+        const auto ins=armv4t::ArmDecoder::decode(op ? 0xE2800000u : 0xE3A0A000u,pc);
+        armv4t::CodegenCtx ctx{};
+        ctx.current_function_addr=pc; ctx.current_function_end_addr=pc+4u;
+        ctx.runtime_pc_base="_runtime_base"; ctx.runtime_arm_immediate=true;
+        bool unimplemented=false;
+        const auto body=armv4t::ArmCodegen::emit_instr(ins,ctx,&unimplemented);
+        if (unimplemented) return 1;
+        std::fprintf(f,"extern \"C\" void native_param_%u_%u(void) {\n"
+            "const uint32_t _runtime_base=g_cpu.R[15];\n%s"
+            "codegen_test_fellthrough();\n}\n",region,op,body.c_str());
+    }
+    std::fprintf(f,"extern \"C\" const TestFn kNativeParamFns[2][2] = {"
+        "{native_param_3_0,native_param_3_1},{native_param_8_0,native_param_8_1}};\n");
+    // Fixed control/flag fields are never eligible for parameter matching.
+    for (uint32_t raw : {0xE3B0A000u,0x13A0A000u,0xE28F0000u,0xE3A0F000u,0xE3E0A000u}) {
+        const auto ins=armv4t::ArmDecoder::decode(raw,0x03000000u);
+        if (armv4t::ArmCodegen::supports_runtime_arm_immediate(ins)) return 1;
+        armv4t::CodegenCtx ctx{};
+        ctx.current_function_addr=0x03000000u; ctx.runtime_pc_base="base";
+        ctx.runtime_arm_immediate=true;
+        bool rejected=false,unused=false;
+        try { armv4t::ArmCodegen::emit_instr(ins,ctx,&unused); }
+        catch (const std::invalid_argument&) { rejected=true; }
+        if (!rejected) return 1;
     }
     std::fprintf(f, "extern \"C\" const TestFn kRomTestFns[] = {\n");
     for (std::size_t i = 0; i < kTestCasesCount; ++i) {

@@ -26,6 +26,8 @@ enum class JumpTableFormat : uint8_t {
     Abs16 = 1,
     PcrelArm = 2,
     PcrelThumb = 3,
+    U8RelThumb = 4,
+    U16RelThumb = 5,
 };
 
 enum class JumpTableEntriesMode : uint8_t {
@@ -51,7 +53,7 @@ struct ConfigProgram {
     uint32_t    aot_scan_end = 0;
     // Emit native resume entries for every instruction boundary so IRQ/SWI
     // returns never require interpreter or self-heal fallback.
-    bool        static_resume_all = false;
+    bool        static_resume_all = true;
     // Number of deterministic C++ translation units used for emitted guest
     // bodies. Zero selects the adaptive cartridge default. Cartridge output
     // is never monolithic; BIOS output remains one small translation unit.
@@ -129,6 +131,7 @@ struct ConfigCodeCopy {
 
 struct ConfigJumpTable {
     uint32_t            addr = 0;
+    uint32_t            base = 0;  // required for u8/u16_rel_thumb: ADD pc PC + 4
     uint32_t            stride = 0;
     uint32_t            count = 0;
     JumpTableFormat     format = JumpTableFormat::Abs32;

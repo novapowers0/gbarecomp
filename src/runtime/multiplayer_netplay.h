@@ -32,9 +32,12 @@ struct GbaNetplayOutput {
     GbaMachineId machine = 0;
     std::array<std::uint8_t,gba::GbaPpu::kFramebufferBytes> rgb888{};
     std::vector<std::int16_t> audio;
-    // The mixer rate the samples were produced at (SOUNDBIAS-driven, typically
-    // 32768). The host must re-tune its resampler to this, not assume 65536.
-    std::uint32_t audio_rate = 32768;
+    // Consecutive runs of `audio`, each produced at one SOUNDBIAS mixer rate
+    // (GbaAudio::drain_sample_block). The host re-tunes its resampler per
+    // block instead of assuming 65536 Hz; a mid-tick SOUNDBIAS change yields
+    // two blocks. The counts sum to audio.size().
+    struct AudioBlock { std::uint32_t rate = 0; std::size_t count = 0; };
+    std::vector<AudioBlock> audio_blocks;
 };
 // Engine callbacks for the shared episode driver. The runner owns transport,
 // lobby/startup agreement, and the driver lifetime. No serial data crosses this
@@ -111,7 +114,11 @@ private:
     mutable std::uint64_t cached_generation_ = UINT64_MAX, cached_cycle_ = 0;
     mutable std::vector<std::uint8_t> cached_state_;
     mutable std::uint32_t cached_hash_ = 0;
+    mutable GbaSessionStateLayout cached_layout_;
+    mutable std::array<std::uint32_t,3> cached_parts_{};
+    mutable bool cached_parts_valid_ = false;
     const std::vector<std::uint8_t>& current_state() const;
+    const std::array<std::uint32_t,3>& current_state_parts() const;
     void mutated() { ++generation_; }
     std::uint32_t pinned_tick_ = UINT32_MAX;
     std::vector<std::uint8_t> pinned_state_;

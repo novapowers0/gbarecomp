@@ -31,7 +31,6 @@ const char* dma_ram_implementation() {
 namespace {
 MmioCapEntry* g_mmio_ring  = nullptr;
 uint64_t      g_mmio_write = 0;      // total committed writes (monotonic)
-bool          g_mmio_split = false;  // suppress nested write16 from write32
 
 bool mmio_cap_enabled() {
     static const bool enabled = [] {
@@ -233,6 +232,21 @@ uint32_t GbaIo::dma_transfer_cost(uint32_t src, uint32_t dst, bool transfer_32,
     return read + write + 2u;
 }
 
+// A DMA3 aimed at the EEPROM window is one serial request, so its unit count
+// is the request length in bits: the game's own requests identify the part
+// (see GbaSave::eeprom_observe_request_length).
+static void observe_eeprom_request(armv4t::Bus* bus, int channel, uint32_t dad,
+                                   uint32_t units) {
+    if (channel != 3 || (dad >> 24) != 0x0Du) return;
+    auto* gba = dynamic_cast<GbaBus*>(bus);
+    if (!gba || !gba->save().eeprom_observe_request_length(units)) return;
+    std::fprintf(stderr,
+                 "[gbarecomp:save] EEPROM part taken from the game's requests: "
+                 "%s (%u-bit request, %zu bytes)\n",
+                 gba->save().eeprom_size() == 512u ? "4 Kbit" : "64 Kbit",
+                 units, gba->save().eeprom_size());
+}
+
 // Run a DMA channel in immediate mode.
 //
 // GBATEK § "GBA DMA Transfers":
@@ -291,6 +305,7 @@ void GbaIo::run_immediate_dma(int channel) {
 
     ++dma_runs_[channel];
     dma_words_[channel] += word_count;
+    observe_eeprom_request(bus_, channel, dad, word_count);
 
     // Always-on DMA-write watchpoint (MC-HP-002). DMA writes go straight through
     // bus_->write*, bypassing the recompiled-code runtime_trace path, so the CPU
@@ -376,6 +391,7 @@ void GbaIo::run_timed_dma(int start_mode) {
         const uint32_t align_mask = transfer_32 ? ~3u : ~1u;
         uint32_t s = dma_next_source_[channel] & align_mask;
         uint32_t d = dma_next_dest_[channel] & align_mask;
+        observe_eeprom_request(bus_, channel, d, word_count);
         dma_steal_cycles_ += dma_transfer_cost(s, d, transfer_32, word_count);
 #if defined(GBARECOMP_DMA_RAM_HLE)
         const bool copied = dma_watch < 0 && src_ctrl == 0 &&
@@ -753,10 +769,12 @@ void GbaIo::write8(uint32_t off, uint8_t v) {
     }
 }
 
-void GbaIo::write16(uint32_t off, uint16_t v) {
+void GbaIo::write16(uint32_t off, uint16_t v) { write16_commit(off, v, /*record=*/true); }
+
+void GbaIo::write16_commit(uint32_t off, uint16_t v, bool record) {
     if (serial_device_ && GbaSerialDevice::handles(off)) { serial_device_->write16(off, v); return; }
     if (off + 1 >= kIoSize) { warn_unhandled(off, v, true, 2); return; }
-    if (!g_mmio_split) mmio_cap_record(0x04000000u + off, v, 2);
+    if (record) mmio_cap_record(0x04000000u + off, v, 2);
     if (audio_ && off >= 0x060 && off <= 0x0AF) {
         audio_->write_io16(off, v);
     }
@@ -885,13 +903,15 @@ void GbaIo::write32(uint32_t off, uint32_t v) {
     }
     // 32-bit IO writes are routed as two 16-bit writes so the
     // per-register quirks (DISPSTAT mask, IF write-1-to-clear, etc.)
-    // apply consistently. Suppress the nested write16 MMIO-ring taps so the
+    // apply consistently. The synthetic halves pass record=false so the
     // 32-bit access is recorded as ONE size-4 entry (peer to the oracle), not
     // two size-2 sub-writes — the split is purely our internal decomposition.
-    g_mmio_split = true;
-    write16(off, static_cast<uint16_t>(v & 0xFFFF));
-    write16(off + 2, static_cast<uint16_t>((v >> 16) & 0xFFFF));
-    g_mmio_split = false;
+    // Suppression is per-call on purpose: a 32-bit write covering CNT_L+CNT_H
+    // (e.g. the FFTA DMA-helper `str r0,[r2,#8]`) kicks a transfer from the
+    // high half, and a global split flag used to swallow that transfer's
+    // destination writes — the MMIO-cap guest-DMA gap (fixed 2026-10-08).
+    write16_commit(off, static_cast<uint16_t>(v & 0xFFFF), /*record=*/false);
+    write16_commit(off + 2, static_cast<uint16_t>((v >> 16) & 0xFFFF), /*record=*/false);
 }
 
 }  // namespace gba

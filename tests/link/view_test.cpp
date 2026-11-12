@@ -10,7 +10,13 @@
 using namespace gbarecomp;
 namespace {
 int anchor_left = -1;
-void anchor_frame(const ExtendedViewFrameInfo*) { gba::g_ws_native_view_left = anchor_left; }
+int owned_window_calls = 0, unrelated_window_calls = 0;
+int owned_window_x(int, int, int*) { ++owned_window_calls; return 0; }
+int unrelated_window_x(int, int, int*) { ++unrelated_window_calls; return 0; }
+void anchor_frame(const ExtendedViewFrameInfo*) {
+    gba::g_ws_native_view_left = anchor_left;
+    gba::g_ws_window_x_provider = owned_window_x;
+}
 void anchored_raster() {
     auto bus=std::make_unique<gba::GbaBus>();
     bus->rtc().set_emulated_clock(0);
@@ -39,10 +45,13 @@ void anchored_raster() {
         reference->set_view_margins(left,44-left,0,0);
         for(unsigned y=0;y<160;++y) {
             gba::g_ws_native_view_left=13; // an unrelated presentation's policy
+            gba::g_ws_window_x_provider=unrelated_window_x;
             source->render_scanline(y,0x3100,io,bus->vram_ptr(),bus->oam_ptr(),bus->pal_ptr());
             canonical->render_scanline(y,0x3100,io,bus->vram_ptr(),bus->oam_ptr(),bus->pal_ptr());
             CHECK(gba::g_ws_native_view_left==13);
+            CHECK(gba::g_ws_window_x_provider==unrelated_window_x);
             gba::g_ws_native_view_left=-1;
+            gba::g_ws_window_x_provider=nullptr;
             reference->render_scanline(y,0x3100,io,bus->vram_ptr(),bus->oam_ptr(),bus->pal_ptr());
         }
         source->mark_framebuffer_latched(); reference->mark_framebuffer_latched();
@@ -52,6 +61,7 @@ void anchored_raster() {
         CHECK(gba::save_device_state(*bus,*source)==gba::save_device_state(*bus,*canonical));
         mirror.restored();
     }
+    CHECK(owned_window_calls>0 && unrelated_window_calls==0);
     source->set_presentation_observer(nullptr);
     gba::g_ws_native_view_left=-1;
 }
@@ -132,6 +142,33 @@ void restores() {
     CHECK(session.save_state()==snapshot);
     session.machine(1).ppu.set_presentation_observer(nullptr);
 }
+bool authorize_hd(int bg, int) { return bg==2; }
+void independent_resolution() {
+    auto bus=std::make_unique<gba::GbaBus>(); bus->rtc().set_emulated_clock(0);
+    auto native=std::make_unique<gba::GbaPpu>();
+    auto observed=std::make_unique<gba::GbaPpu>();
+    GbaNetplayViewPolicy policy{true,true}; policy.high_resolution_affine_provider=authorize_hd;
+    GbaNetplayPresentation mirror(policy,false,4);
+    observed->set_presentation_observer(&mirror);
+    std::array<std::uint8_t,0x400> io{};
+    auto w16=[&](unsigned a,unsigned n) { io[a]=n; io[a+1]=n>>8; };
+    w16(0x0c,0x2004); w16(0x20,0x200); w16(0x26,0x100);
+    for (unsigned i=0;i<64;++i) bus->vram_ptr()[0x4000+i]=i+1;
+    for (unsigned i=0;i<128;++i) bus->pal_ptr()[i]=i*17;
+    for (unsigned width:{240u,284u,382u,317u}) {
+        mirror.request_width(width);
+        for (unsigned y=0;y<160;++y) for (auto* p:{native.get(),observed.get()})
+            p->render_scanline(y,0x0401,io.data(),bus->vram_ptr(),bus->oam_ptr(),bus->pal_ptr());
+        native->mark_framebuffer_latched(); observed->mark_framebuffer_latched();
+        CHECK(mirror.pixels() && mirror.width()==width*4 && mirror.height()==640);
+        CHECK(mirror.logical_width()==width);
+        CHECK(gba::save_device_state(*bus,*native)==gba::save_device_state(*bus,*observed));
+    }
+    mirror.restored(); CHECK(!mirror.pixels());
+    observed->render_scanline(50,0x0401,io.data(),bus->vram_ptr(),bus->oam_ptr(),bus->pal_ptr());
+    observed->mark_framebuffer_latched(); CHECK(!mirror.pixels());
+    observed->set_presentation_observer(nullptr);
+}
 }
 int main() {
     GbaNetplayViewPolicy policy{true,false};
@@ -151,7 +188,7 @@ int main() {
     CHECK(gba_netplay_view_width(GbaNetplayView::Adaptive,100,500)==240);
     CHECK(gba_netplay_view_width(GbaNetplayView::Adaptive,5000,900)==576);
     // Opted-in ceilings, bounded by engine capacity.
-    CHECK(gba::GbaPpu::kMaxRenderWidth==896);
+    CHECK(gba::GbaPpu::kMaxRenderWidth==1280);
     CHECK(gba_netplay_view_width(GbaNetplayView::Adaptive,5000,900,896)==889);
     CHECK(gba_netplay_view_width(GbaNetplayView::Adaptive,9999,1,896)==896);
     CHECK(gba_netplay_view_width(GbaNetplayView::Adaptive,9999,1,100000)==gba::GbaPpu::kMaxRenderWidth);
@@ -188,6 +225,6 @@ int main() {
     parse_gba_netplay_arguments(args,launch);
     CHECK(!launch.enabled && launch.view==GbaNetplayView::Adaptive && launch.view_explicit);
     CHECK((args==std::vector<std::string>{"game","--launcher"}));
-    raster(); anchored_raster(); restores();
+    raster(); anchored_raster(); restores(); independent_resolution();
     std::puts("netplay presentation: raster parity, canonical state, restore and capability gates passed");
 }

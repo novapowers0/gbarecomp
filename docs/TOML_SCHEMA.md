@@ -96,7 +96,7 @@ note          = "ROM code copied to IWRAM before execution"
 addr         = 0x00000168
 stride       = 4
 count        = 43
-format       = "abs32"           # abs32 | abs16 | pcrel_thumb | pcrel_arm
+format       = "abs32"           # also abs16, pcrel_thumb, pcrel_arm, u8_rel_thumb, u16_rel_thumb
 entries_mode = "arm"
 name         = "swi_dispatch_table"
 note         = "SWI 0x00..0x2A handlers"
@@ -117,10 +117,18 @@ reason = "literal pool walked as code by finder pre-vX.Y"
 | `load_address` | int hex | Where the binary's first byte maps in CPU memory. |
 | `size`         | int hex | Byte size of the binary (must match the file on disk). |
 | `entry_pc`     | int hex | Initial PC. Seeded as `[[extra_func]]` automatically; declaring it again is a redundant no-op. |
-| `speculative_literal_harvest` | bool | Optional, default `true`. Harvest plausible callback pointers from PC-relative literal loads. Set `false` for evidence-driven strict-static corpora where runtime-observed `[[extra_func]]` roots are preferred over speculative reachability. Direct branch discovery is unchanged. |
-| `aot_scan_start` / `aot_scan_end` | int hex | Optional half-open executable-ROM range. When both are present, reachable PC-relative literal loads may identify callback tables whose targets fall in this range. Compiler-shaped prologues validate each candidate table before its address-taken entries are recursively explored. Keep compressed graphics and other assets outside this range. Omit both fields to disable this discovery. |
-| `static_resume_all` | bool | Optional, default `false`. Add a static dispatch/resume entry for every aligned instruction inside each emitted native body. Enable this for strict end-to-end AOT builds because an IRQ or SWI may resume at any instruction boundary. |
+| `speculative_literal_harvest` | bool | Optional, default `true`. Harvest plausible callback pointers from PC-relative literal loads. Setting `false` disables weak pointer candidates. Referenced Thumb PUSH-LR entries with validated instruction bytes remain discoverable, including untagged copy sources and ADR references, so their absolute ROM branches and switch cases are compiled too. Direct branch discovery is unchanged. |
+| `aot_scan_start` / `aot_scan_end` | int hex | Optional half-open executable-ROM range. Reachable PC-relative literals can identify callback tables. Referenced ROM objects outside the range also qualify when their first two words are distinct Thumb callbacks: at least one PUSH-LR entry, paired with another PUSH-LR entry or a short stackless RAM-global leaf (store and BX LR, no calls or other branches). Separately address-taken leaves must use the exact RAM-global literal corroborated by a descriptor. Only the two descriptor words are inspected; no table end is guessed. Keep compressed graphics and other assets outside the executable range. Omit both fields to disable table/descriptor discovery; strongly qualified directly referenced Thumb entries remain enabled. A configured range also bounds those entry candidates. |
+| `static_resume_all` | bool | Optional, default `true`. Add a static dispatch/resume entry for every aligned instruction inside each emitted native body. IRQ/SWI returns and host-stack unwinds may resume at any instruction boundary. Explicitly disabling this is for discovery experiments and does not guarantee strict end-to-end AOT coverage. |
 | `codegen_shards` | int | Optional cartridge override, range 2..256. When omitted or `0`, the recompiler chooses an adaptive power-of-two count from 2..64. Cartridge output is never monolithic. `1` is accepted only as legacy input and upgraded to the adaptive count with a warning. Stable address hashing and write-if-changed output keep unrelated shards untouched when a reviewed seed is added. BIOS output remains one small translation unit. |
+
+With an executable AOT scan range, discovery also recognizes base-relative
+Thumb callback tables. A reachable `LDR offset,[base,#slot]; ADD target,base,offset;
+BL <BX-target veneer>` supplies each exact slot offset. A table base loaded by
+reachable code qualifies only when slot zero and another consumed slot resolve
+to distinct validated PUSH-LR entries inside that range. Only consumed slots
+are inspected; neighboring tables are not scanned for an end. This handles
+negative as well as positive table-relative offsets.
 
 ### `[identity]` (required)
 
@@ -273,6 +281,58 @@ addresses while reading opcodes from the source bytes.
 | `name`          | string  | no       | Mapping label (documentation). |
 | `note`          | string  | no       | Free-form documentation. |
 
+The recompiler also emits position-aware native fragments for discovered
+address-taken code and ROM-backed copies, including their direct branch and
+fall-through continuations. These fragments support helpers copied onto a
+moving EWRAM or IWRAM stack without a fixed `runtime_start` hint. They use the
+live RAM PC for operands, literal alignment, links, branches, IRQ resumes and
+fetch timing. The runtime compares the complete fragment against raw RAM before
+entry and checks each instruction again before execution. Unsupported changes
+return to normal dispatch and remain a loud strict-static miss unless
+another AOT fragment matches. Matching has no bus-read or timing side effects;
+it never decodes or compiles code at runtime. No additional configuration is
+required. On Matrix cartridges, the active banked aperture uses the same byte
+verification with cartridge fetch timing and live PC placement. Mapped pages can
+be noncontiguous. Independently linked siblings of a known copied startup module
+are discovered from its exact ARM mode/MSR prefix with separate source mappings;
+these additional bodies enter the guarded catalog. Unknown bytes cannot fall
+back to a stale fixed-address native
+entry. Reviewed mod hooks and immediate overrides still require their exact
+live guest PC. BIOS compilation remains separate.
+
+Copied ARM code can initialize immediate operands in place. For unconditional
+`MOV` and `ADD` without flag updates or PC operands/destinations, the native
+body can read the immediate field as live data. The opcode, condition,
+registers, and flag behavior remain fixed and guarded, including on cached
+entries and instruction resumes. Other fields and instruction forms still
+require an exact match. This is a fixed native operation with a data parameter;
+the runtime does not decode an instruction or choose an operation.
+
+The finder also recognizes an exact `LDR word; CMP word,constant; STREQ`
+compare-and-replace initializer rooted in ROM-backed RAM. A same-address store
+of a known ARM `STR` opcode can produce a second, exact initialized native
+variant. Its span follows the copied routine's non-call control flow through
+split loop/resume labels. Conditional stores with another predicate, changed
+addresses, unknown replacement words, and control-flow replacements do not
+qualify. Matrix module section descriptors additionally map initialized RAM
+sections with checked source, destination, and size bounds.
+
+ARM indexed word tables support backward PC-relative address formation and
+ROM-backed RAM. A sparse table immediately before a known PUSH-LR dispatcher
+can include null slots only after its entire span is checked as null or valid
+code pointers. The dispatcher entry supplies the end of that span. Thumb byte
+and halfword relative tables continue to require a dominating CMP range bound.
+
+`GBARECOMP_STRICT_STATIC=1` rejects explicit interpreter bridges and forced
+interpreter hooks as well as dispatch misses. Coverage counts forced and direct
+bridge instructions; zero misses alone does not imply `FULLY_STATIC`.
+
+Callback fields in record arrays are also recovered when a reachable dispatcher
+forms their exact stride from an unsigned byte index, loads the selected field
+and branches through it. Discovery checks all 256 possible byte values, accepts
+only validated function prologues, and skips null or non-code slots. It does not
+guess a record count from a sentinel or classify the other fields as code.
+
 ### `[[jump_table]]` (zero or more)
 
 Annotated dispatch tables. The finder reads `count` entries of
@@ -289,7 +349,8 @@ covering them).
 | `addr`         | int hex | yes      | First byte of the table. |
 | `stride`       | int     | yes      | Bytes per entry. Typical: 4. |
 | `count`        | int     | yes      | Number of entries. |
-| `format`       | string  | yes      | One of `abs32`, `abs16`, `pcrel_thumb`, `pcrel_arm`. |
+| `format`       | string  | yes      | `abs32`, `abs16`, `pcrel_thumb`, `pcrel_arm`, `u8_rel_thumb`, or `u16_rel_thumb`. |
+| `base`         | int hex | relative Thumb only | Address of the consuming `ADD pc,Rt` instruction + 4. |
 | `entries_mode` | string  | yes      | `"arm"`, `"thumb"`, or `"auto"`. See below. |
 | `name`         | string  | no       | Table label (documentation). |
 | `note`         | string  | no       | Free-form. |
@@ -302,6 +363,25 @@ Format semantics:
   `(entry_address + value) & ~1`, decoded as THUMB. The low interworking
   bit is normalized out of the instruction address.
 - `pcrel_arm` — `int32_t` per entry; target = `entry_address + value`, decoded as ARM.
+- `u8_rel_thumb` / `u16_rel_thumb` — unsigned byte / halfword entries;
+  target = `base + 2 * value`, decoded as THUMB. `stride` must be 1 / 2,
+  respectively; halfword tables must be aligned. `count` must be nonzero.
+  `base` is the Thumb PC value at `ADD pc,Rt`, **without word alignment**.
+  These targets become case blocks and resume entries of the dispatcher host.
+  Discovery recognizes the bounded `ADR` or literal `LDR`, indexed `LDRB` /
+  `LDRH`, `LSLS #1`, `ADD pc` idiom automatically. Manual entries supply the
+  exact table count when its guard cannot be recovered; they are consumed at
+  `base - 4`, which must be a reachable Thumb `ADD pc,Rt` instruction.
+
+```toml
+[[jump_table]]
+addr = 0x080014B8
+base = 0x080014BA # ADD pc,r3 at 0x080014B6 reads PC + 4
+stride = 1
+count = 7
+format = "u8_rel_thumb"
+entries_mode = "thumb"
+```
 
 `entries_mode` semantics:
 
@@ -327,6 +407,8 @@ Mode-keyword combinations:
 | `abs16`         | `"arm"`, `"thumb"`                |
 | `pcrel_arm`     | `"arm"` (must match format)       |
 | `pcrel_thumb`   | `"thumb"` (must match format)     |
+| `u8_rel_thumb`  | `"thumb"` (must match format)     |
+| `u16_rel_thumb` | `"thumb"` (must match format)     |
 
 `abs16` does not support `"auto"`: 16-bit pointers don't span an
 interworking address space on the GBA.

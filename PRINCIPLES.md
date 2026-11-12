@@ -1,7 +1,7 @@
 # gbarecomp Project Principles
 
 These rules are platform-specific specializations of the cross-project
-recomp principles (see `F:\Projects\recomp-template\PRINCIPLES.md`).
+recomp principles in [recomp-template](../../recomp-template/PRINCIPLES.md).
 Platform-agnostic rules still apply; this file adds GBA detail.
 
 ## Ground Truth
@@ -18,118 +18,36 @@ Platform-agnostic rules still apply; this file adds GBA detail.
   and linker knowledge. They are **not** an execution oracle. The
   emulator is.
 
-## BIOS intro must be flawless before ROM (HARD GATE)
+## Maintain the real BIOS reference
 
-No ROM, cartridge, game, or "Phase 5" work happens until the GBA
-BIOS intro is **flawless** on three axes simultaneously:
+The LLE build executes the verified retail BIOS through the generated dispatch
+table. SWIs enter at `0x00000008`; IRQs enter at `0x00000018` and execute the
+original dispatcher, handler and exception return. Maintain the BIOS generation
+configuration, including its reviewed interior entries. Report interpreted or
+healed execution honestly and fix discovery/codegen at its source.
 
-1. **Visually** — the rendered framebuffer matches the mGBA oracle
-   pixel-for-pixel at every PPU frame from boot through the
-   post-intro idle state.
-2. **Audibly** — the startup chime plays correctly. The native
-   audio sample stream matches the oracle's sample stream over the
-   intro duration.
-3. **In-memory** — OAM, VRAM, PAL, IWRAM byte-identical to the
-   oracle at every PPU frame checkpoint. IO is allowed open-bus
-   jitter on documented write-only fields, nothing else.
+The user's BIOS dump is hash-verified; see `bios/README.md`. Its recompiled
+execution is the in-tree LLE reference. mGBA and NanoBoyAdvance provide independent
+evidence for device or timing bugs shared by our CPU implementations.
 
-**Why:** The BIOS intro is the simplest piece of code the
-emulator runs. It requires no cartridge, no game-specific symbols,
-no per-ROM config. If it doesn't render correctly, every higher
-layer is built on a foundation we don't trust. Every cycle of
-"close enough" intro compounds into invisible bugs the moment we
-load a cart.
+The BIOS intro baseline was completed in Phase 2.7. Keep relevant BIOS tests
+working when changing that path. A known BIOS defect must be investigated in
+its affected scope; unrelated cartridge or HLE work does not require proving
+every part of the machine flawless again. Record limitations rather than
+declaring an incomplete reference perfect.
 
-**How to apply:**
-- Treat any OAM / PAL / VRAM / IWRAM drift between native and
-  oracle as a P0 bug. Do not paper over with "we'll come back."
-- The "intro looks close" or "it sort of works" answer is
-  unacceptable. The acceptance criterion is byte equality, not
-  visual approximation.
-- The audio subsystem is part of the gate. `src/gba/gba_audio.cpp`
-  must stand up before the gate closes.
-- The `bios_intro_flawless` ctest must run green for the gate to
-  stay closed. CI failure = gate re-opens.
-- See `docs/ROADMAP.md` Phase 2.7 for the work breakdown.
+### Boot presentation and BIOS services are separate choices
 
-## BIOS is sacred — recompiled and dispatched (with honest self-healing)
+`[bios].skip_intro` selects a documented post-boot handoff instead of replaying
+the logo/chime. It does not select the SWI implementation. Skipping boot can
+change the initial IRQ phase and reachable resume entries, so qualify coverage
+for the actual title configuration.
 
-The GBA BIOS is **recompiled and executed via the dispatch table**,
-not stubbed, not HLE'd, not "fast-forwarded." A missed BIOS PC
-self-heals like any other code (see "Honest self-healing" below) —
-bridged by the interpreter, recompiled on the fly, and reported loudly —
-never silently HLE'd or stubbed, with 100% recompiled BIOS coverage
-the goal by construction. Every game boot path on real hardware
-enters the BIOS at power-on, runs the Nintendo logo intro, then
-hands control to the cartridge at `0x08000000`. When our recompiled
-builds run that intro, they do it the same way — through recompiled
-code, from the very first PC.
-
-### The boot intro is a presentation choice, not a correctness one
-
-Whether the boot logo/chime *plays* is separate from whether the BIOS
-is faithfully executed. `bios_hle_boot_skip()` only synthesizes the
-documented post-boot handoff state (banked SPs, System mode, cleared
-low registers, zeroed user IRQ vector) and jumps to the cart entry. It
-consults no HLE state and changes no SWI semantics.
-
-So `[bios].skip_intro = true` is permitted and needs no HLE: SWI
-servicing stays pure LLE and the recompiled BIOS remains the oracle
-and the IRQ dispatcher. Players should not have to sit through the
-boot animation on every launch.
-
-What remains forbidden is bypassing the real BIOS as the CORRECTNESS
-path — stubbing SWIs, or making a game work by skipping BIOS code it
-actually depends on.
-
-Note that skipping the intro hands off at a different point in the
-frame, which shifts IRQ arrival relative to guest code. A title that
-enables it must re-run its strict-static gate and seed any newly
-reached interior resume points; the skip is not free of coverage work.
-
-- The BIOS image is the user's own dump (`bios/gba_bios.bin`); see
-  `bios/README.md` for hash/policy.
-- The runtime loads the BIOS, refuses to start if the hash is
-  unrecognized, and dispatches every PC < `0x4000` through the
-  BIOS dispatch table emitted by `gba_recompile --bios`.
-- SWIs land at `0x00000008` and the recompiled BIOS code handles
-  them. There is no `if (swi == 0x05) hle_vblank_wait()` hand-written
-  stub — the recompiled BIOS bytes are the SWI implementation. (A
-  missed BIOS handler is bridged + self-healed, never stubbed.)
-- IRQs land at `0x00000018` and the recompiled BIOS IRQ dispatcher
-  does its real work: read `IF`, route to the registered handler at
-  `0x03007FFC`, return through the real exception epilogue.
-- The Nintendo logo check in the BIOS runs against the cartridge's
-  logo bytes at `0x08000004..0x080000A0`. We do not bypass it.
-
-**Why:** Stubbed SWIs and skipped BIOS intros are "HLE-by-accident" —
-a hand-written guess with no recompiled truth beneath it. That stays
-forbidden. Every quirk a real GBA game depends on — timing of
-BIOS-driven DMA, exact behavior of `CpuFastSet` on misaligned buffers,
-the specific cycle cost of an SWI handler — must be correct *by
-construction* in the recompiled bytes. A *silent, permanent*
-interpreter would hide IrOp-lowering bugs until cut-over and stays
-forbidden; a *loud, self-healing* bridge (interpret once, recompile on
-the fly, log + seed the next build) keeps the user playing while we
-fix discovery/codegen at the source. The recompiled bytes are always
-the eventual truth — we may compile them late, but never quietly.
-
-**How to apply:**
-- The runtime exec loop calls `runtime_dispatch(pc)` for every PC.
-  There is no blanket `if (pc < 0x4000) interpreter.step()` branch
-  that bypasses recompiled BIOS. A dispatch MISS is bridged by the
-  interpreter, recompiled on the fly, and logged (see "Honest
-  self-healing"); the miss is still a discovery/codegen gap to fix at
-  the tool level so the next build needs no bridge.
-- Adding a new SWI behavior to the runtime is forbidden. The
-  behavior is in the recompiled BIOS bytes.
-- If something looks wrong "around an SWI," the divergence is in
-  the codegen / runtime ABI / bus / IRQ scheduler — not in the BIOS.
-  Fix the recompiler infrastructure, never the BIOS image.
-- Symbol annotations from public BIOS disassemblies (see
-  `docs/GBA_REFERENCE_NOTES.md` § "GBA BIOS references") are
-  reference material only; the BIOS bytes themselves are the
-  authoritative behavior.
+BIOS services may have native HLE implementations under [the HLE policy](#hle-policy).
+Preserve their caller-required results, memory semantics, continuation and
+completion ordering. Do not return fabricated success or use HLE to hide a
+missing LLE implementation. Exact instruction counts and every internal BIOS
+stall are requirements of the faithful route, not universal HLE requirements.
 
 ## Honest self-healing — interpreter may bridge, must heal to static + report (SHOWSTOPPER)
 
@@ -148,7 +66,10 @@ these conditions, **together**:
 1. **Loudly documented — never silent.** Every fallback is observable
    and honestly reported: a session notice appears on the first miss,
    every PC is counted and dumped in a coverage report at exit, and
-   detail is queryable live. Per-PC console lines are available with
+   detail is queryable live. The proposal frag and coverage JSON are
+   also rewritten on every new distinct miss and flushed from the
+   SIGABRT handler, so an aborted or killed run keeps its harvest
+   (the JSON's `phase` says `running`, `abort` or `exit`). Per-PC console lines are available with
    `GBARECOMP_SELFHEAL_VERBOSE=1`, not emitted by default, because
    synchronous console I/O must not stall gameplay. We must never be
    able to call a half-interpreted run "statically recompiled / done"
@@ -175,8 +96,8 @@ ecosystem is being misrepresented:
   ROM miss is still a finder/codegen bug to fix at the tool level (see
   "Hints Are Not Correctness"). Self-healing keeps the user playing
   while we fix it; it does not replace the fix.
-- A hand-written HLE model of guest behavior on the load-bearing path
-  (a separate ban — see "Verified-enhancement HLE").
+- A replacement that fabricates success, hides missing behavior, or lacks
+  the maintained LLE counterpart required by [HLE.md](HLE.md).
 
 **INFORMED ✅** — the interpreter is also still our offline oracle:
 decode-trace diff harnesses, per-IrOp semantic reference,
@@ -224,50 +145,36 @@ the on-the-fly code cache this session — unless that is reported.
 This is the honesty the old absolute interpreter ban was protecting —
 now made explicit and measurable instead of enforced by prohibition.
 
-## Verified-enhancement HLE is permitted; load-bearing HLE is not
+<a id="hle-policy"></a>
+## HLE and LLE: caller contracts and build selection
 
-The SHOWSTOPPER rules above forbid hand-written **HLE** on the
-load-bearing path — where the program's observable behavior would
-depend on a hand-written model being correct — and require that any
-interpreter *bridging* self-heal to static and be reported honestly.
-That discipline is the heart of this project. (Note: a self-healing
-interpreter bridge is NOT HLE — it runs the real guest bytes, just
-late; the ban here is on hand-written *models* of guest behavior.)
+Follow [HLE.md](HLE.md) and the shared [HLE policy](../../recomp-template/HLE.md)
+verbatim. The developer selects an implementation when building. A qualified
+HLE configuration may be the preferred release build; retain a functioning,
+documented LLE build in maintained source, even when it is slower.
 
-There is exactly one permitted form of HLE, and it is a quality-of-
-life layer that sits **on top of** correctness, never instead of it.
-A high-level shadow of a guest subsystem (e.g. an audio-engine
-re-render) may ship only if **all** of the following hold:
+HLE can replace a whole algorithm or subsystem. Native math, GPU work, batching,
+caches, private state and approximate internal timing are allowed. Preserve
+the inputs, outputs, memory effects, callbacks, continuation and meaningful
+ordering that supported callers observe. Small practically unnoticeable
+differences are authorized for substantial measured gains. Material gameplay
+changes, missing effects and corrupted state are defects or a separate feature
+scope.
 
-1. **The recompiled guest code still runs to completion** and remains
-   the authoritative output. The shadow never replaces execution.
-2. **The canon (recompiled) output stays the verify oracle.** Frame
-   hashes, `verify`, and the differential sweeps are defined on the
-   recompiled output, never on the shadow.
-3. **The shadow is continuously, differentially checked** against the
-   canon stream and substitutes only after a proven window.
-4. **It reverts loudly** (logs `DEGRADED`) the instant it stops
-   matching — never a silent guess.
-5. **It is opt-in and present-time**, off by default, and removing it
-   changes nothing the recompiler is responsible for.
+Do not require original execution underneath HLE, continuous differential
+comparison, live handoff, automatic per-call LLE fallback, cross-build savestate
+compatibility or a player-facing HLE/LLE toggle. Compare separate builds or
+isolated fixtures against their promised contracts. Exact host optimizations
+still preserve their exact promises.
 
-**Why this is allowed where BIOS-HLE is not:** the forbidden kind has
-no canon underneath it — the HLE *is* the behavior, unchecked. A
-verified shadow always has the recompiled truth running beneath it
-and policing it; its worst failure is "you hear the stock hardware
-output," not "the game is subtly wrong." It cannot mask a recompiler
-bug, because the recompiled path it shadows is still the thing being
-hashed and diffed. This is the same always-on differential-oracle
-discipline from the Debug Loop, applied to an enhancement.
+The existing audio shadow and legacy BIOS runtime selectors are historical
+interfaces, not requirements for new HLE. Their existence does not establish
+that those replacements are qualified for every title or netplay profile.
 
-**Test before adding any HLE:** "If my reimplementation is wrong,
-what happens?" If the answer is "the game misbehaves / a recompiler
-bug stays hidden" → forbidden. If it is "we fall back to the
-recompiled output and log it" → permitted under this rule.
-
-The current instance: the MP2K audio shadow mixer (`src/runtime`
-shadow + `src/gba/gba_m4a`), gated behind the `shadow::Verifier`
-differential self-check. Ported from JRickey/gba-recomp.
+Netplay simulation must remain bit-identical across qualified peers. Settle
+the common simulation profile before frame 0 and retain it for the match.
+Local presentation may differ only downstream of guest state, readbacks,
+digests and rollback. See [the netplay policy](../../recomp-template/NETPLAY.md).
 
 ## Tool Skepticism
 
@@ -320,10 +227,9 @@ changes, and exception entry. Treat it as one CPU, not two.
   `^` bit (user-mode bank or SPSR-restore), and write-back interact
   in non-trivial ways. Don't simplify.
 - **SWI entry & BIOS handoff.** SWI traps to BIOS at 0x00000008.
-  The recompiled BIOS code handles it via `runtime_dispatch`. There
-  is no hand-written HLE path; a missed handler self-heals (see "BIOS
-  is sacred — recompiled and dispatched" and "Honest self-healing"
-  above).
+  The LLE build handles it through recompiled BIOS dispatch; a native
+  service selected by an HLE build preserves its documented caller contract.
+  An uncovered LLE handler is a coverage issue, not permission to stub it.
 - **IRQ entry / return.** The GBA IRQ vector model (BIOS-mediated)
   must match hardware ordering of `IE`/`IF`/`IME` and the BIOS IRQ
   return sequence. Save / restore CPSR via SPSR_irq.

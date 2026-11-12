@@ -21,7 +21,7 @@ public final class GbaGameConfig {
     public final String romFile;
     public final boolean biosRequired;
     public final String biosSha1;
-    public final String orientation;   // landscape | portrait | any
+    public final String orientation;   // landscape | landscape-locked | portrait | any
     public final String payloadVersion;
     public final String setupNote;
     public final boolean showGyroStatus;

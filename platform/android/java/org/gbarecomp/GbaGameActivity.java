@@ -70,8 +70,21 @@ public class GbaGameActivity extends SDLActivity {
 
     static int orientationFor(String policy) {
         if ("any".equals(policy)) return ActivityInfo.SCREEN_ORIENTATION_FULL_USER;
+        if ("landscape-locked".equals(policy)) return ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
         if ("portrait".equals(policy)) return ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT;
         return ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE;
+    }
+
+    @Override
+    public void setOrientationBis(int width, int height, boolean resizable, String hint) {
+        // SDL reapplies its native window's orientation hints after onCreate.
+        // A gyro game must keep the display fixed while the phone rotates,
+        // even when the native hint allows both landscape directions.
+        if ("landscape-locked".equals(config.orientation)) {
+            setRequestedOrientation(orientationFor(config.orientation));
+        } else {
+            super.setOrientationBis(width, height, resizable, hint);
+        }
     }
 
     private void reportInsets(WindowInsets insets) {

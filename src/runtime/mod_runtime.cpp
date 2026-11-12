@@ -1,4 +1,6 @@
 #include "mod_runtime.h"
+#include "gba_high_resolution.h"
+#include "codebreaker.h"
 #include "mod_function_hooks.h"
 #include "asset_picker.h"
 
@@ -30,6 +32,11 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 // Deliberately declared in this implementation file only.  This is the
 // runtime-to-engine linkage used around a selected activation callback, not a
@@ -103,6 +110,16 @@ struct RequiredAsset {
     std::string purpose;
 };
 
+// A declarative cheat: CodeBreaker Advance codes owned by one feature. The
+// codes are parsed and range-checked when the manifest is read, so a package
+// with a malformed or out-of-RAM code is rejected before anything can boot.
+struct CheatRecord {
+    std::string feature_id;
+    std::string format;
+    std::vector<std::string> codes;
+    codebreaker::Program program;
+};
+
 struct Package {
     uint32_t format_version = 0;
     std::string id;
@@ -116,6 +133,7 @@ struct Package {
     std::vector<Feature> features;
     std::vector<Option> options;
     std::vector<RequiredAsset> required_assets;
+    std::vector<CheatRecord> cheats;
 };
 
 struct FeatureSelection {
@@ -181,9 +199,19 @@ struct Runtime {
         committed_options;
     std::map<std::string, std::map<std::string, std::string>>
         committed_asset_paths;
+    // Programs of the enabled cheat features from the last successful commit,
+    // in catalog order (package id, then manifest order).
+    struct CommittedCheat {
+        std::string package_id;
+        std::string feature_id;
+        codebreaker::Program program;  // copied: immune to a catalog rescan
+    };
+    std::vector<CommittedCheat> committed_cheats;
     std::string error;
     bool initialized = false;
     bool adaptive_view_enabled = false;
+    int diagnostic_replay_enabled = -1;
+    int internal_resolution = 0;
     int view_width = 0;
 };
 
@@ -439,6 +467,7 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
         Choice,
         Plugin,
         Asset,
+        Cheat,
     };
     Section section = Section::Package;
     Target* target = nullptr;
@@ -446,6 +475,7 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
     Option* option = nullptr;
     Choice* choice = nullptr;
     RequiredAsset* asset = nullptr;
+    CheatRecord* cheat = nullptr;
     std::string plugin_feature;
     std::string plugin_id;
     std::vector<std::string> target_rom_sha1;
@@ -497,6 +527,7 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
             option = nullptr;
             choice = nullptr;
             asset = nullptr;
+            cheat = nullptr;
             if (name == "target") {
                 section = Section::Target;
                 out.targets.emplace_back();
@@ -524,6 +555,10 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
                 section = Section::Asset;
                 out.required_assets.emplace_back();
                 asset = &out.required_assets.back();
+            } else if (name == "cheat") {
+                section = Section::Cheat;
+                out.cheats.emplace_back();
+                cheat = &out.cheats.back();
             } else {
                 set_error(error, "unsupported manifest section [[" + name + "]]");
                 return false;
@@ -654,6 +689,15 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
                     parsed = string_field(asset->purpose);
                 } else known = false;
                 break;
+            case Section::Cheat:
+                cheat = out.cheats.empty() ? nullptr : &out.cheats.back();
+                if (!cheat) parsed = false;
+                else if (key == "feature") parsed = string_field(cheat->feature_id);
+                else if (key == "format") parsed = string_field(cheat->format);
+                else if (key == "codes")
+                    parsed = parse_string_array(value, cheat->codes);
+                else known = false;
+                break;
         }
         if (!known || !parsed) {
             set_error(error, "invalid or unsupported manifest field '" + key +
@@ -720,6 +764,25 @@ bool read_manifest(const fs::path& path, Package& out, std::string* error) {
                             return !valid_extension(extension);
                         })) {
             set_error(error, "manifest has an invalid or duplicate required asset");
+            return false;
+        }
+    }
+    for (CheatRecord& item : out.cheats) {
+        const Feature* owner = find_feature(out, item.feature_id);
+        if (!owner || item.format != "codebreaker") {
+            set_error(error, "cheat has an unknown feature or unsupported format");
+            return false;
+        }
+        // Cheats change simulation state, so they are never on unless the
+        // player enables them: off must stay byte-identical to stock.
+        if (owner->default_enabled) {
+            set_error(error, "cheat feature '" + owner->id +
+                             "' must have default_enabled = false");
+            return false;
+        }
+        std::string code_error;
+        if (!codebreaker::parse(item.codes, &item.program, &code_error)) {
+            set_error(error, "cheat feature '" + owner->id + "': " + code_error);
             return false;
         }
     }
@@ -1062,7 +1125,18 @@ std::string quote_toml(const std::string& value) {
 bool save_state(Runtime& runtime, std::string* error) {
     std::error_code ec;
     fs::create_directories(runtime.root, ec);
-    const fs::path temp = runtime.root / "state.toml.tmp";
+    // Unique temp per process: concurrent launches (parallel harnesses,
+    // multiple instances) publish the same derived state. A shared temp name
+    // let one process's rename consume another's file (ENOENT), whose retry
+    // then removed the freshly published output.
+#ifdef _WIN32
+    const auto publish_pid =
+        static_cast<unsigned long long>(GetCurrentProcessId());
+#else
+    const auto publish_pid = static_cast<unsigned long long>(::getpid());
+#endif
+    const fs::path temp =
+        runtime.root / ("state.toml." + std::to_string(publish_pid) + ".tmp");
     const fs::path output = runtime.root / "state.toml";
     std::ofstream file(temp, std::ios::trunc);
     if (!file) {
@@ -1077,9 +1151,11 @@ bool save_state(Runtime& runtime, std::string* error) {
     for (const auto& [package_id, selection] : runtime.selections) {
         for (const auto& [feature_id, feature] : selection.features) {
             file << "\n[[feature]]\npackage_id = " << quote_toml(package_id)
-                 << "\nid = " << quote_toml(feature_id)
-                 << "\nenabled = " << (feature.enabled ? "true" : "false")
-                 << "\n";
+                 << "\nid = " << quote_toml(feature_id) << "\n";
+            // An inherited value is not an explicit player choice. Retain
+            // that distinction when options or catalog queries create a row.
+            if (feature.has_enabled)
+                file << "enabled = " << (feature.enabled ? "true" : "false") << "\n";
             if (!feature.values.empty()) {
                 file << "\n[feature.values]\n";
                 for (const auto& [key, value] : feature.values)
@@ -2000,6 +2076,7 @@ bool mod_runtime_initialize(const fs::path& root,
     // committed external-asset path reachable through the plugin API.
     runtime.committed_asset_paths.clear();
     runtime.committed_options.clear();
+    runtime.committed_cheats.clear();
     runtime.root = root;
     runtime.game_id = game_id;
     runtime.rom_sha1s = rom_sha1s;
@@ -2061,6 +2138,7 @@ bool mod_runtime_commit_impl(const fs::path& rom_path, bool allow_picker,
     if (!runtime.initialized) return true;
     runtime.committed_asset_paths.clear();
     runtime.committed_options.clear();
+    runtime.committed_cheats.clear();
     if (!rom_path.empty()) {
         std::string digest;
         if (!sha1_file(rom_path, digest, &runtime.error)) {
@@ -2113,6 +2191,12 @@ bool mod_runtime_commit_impl(const fs::path& rom_path, bool allow_picker,
             if (path != selection.asset_paths.end())
                 runtime.committed_asset_paths[package->id][asset.id] = path->second;
         }
+        for (const CheatRecord& cheat : package->cheats) {
+            const Feature* owner = find_feature(*package, cheat.feature_id);
+            if (owner && feature_enabled(runtime, *package, *owner))
+                runtime.committed_cheats.push_back(
+                    {package->id, owner->id, cheat.program});
+        }
     }
     runtime.error.clear();
     return true;
@@ -2126,6 +2210,8 @@ void mod_runtime_activate_plugins() {
     Runtime& runtime = state();
     if (!runtime.initialized) return;
     runtime.adaptive_view_enabled = false;
+    runtime.diagnostic_replay_enabled = -1;
+    runtime.internal_resolution = 0;
     runtime.view_width = 0;
     // Presentation belongs to the currently committed plugin set. Clear the
     // old immutable buffer before reset callbacks so disabling/recommitting a
@@ -2160,6 +2246,22 @@ const RecompLauncherCModProvider* mod_runtime_launcher_provider() {
 #else
     return nullptr;
 #endif
+}
+
+std::size_t mod_runtime_committed_cheat_count() {
+    return state().committed_cheats.size();
+}
+
+std::vector<std::string> mod_runtime_committed_cheat_names() {
+    std::vector<std::string> names;
+    for (const Runtime::CommittedCheat& cheat : state().committed_cheats)
+        names.push_back(cheat.package_id + "/" + cheat.feature_id);
+    return names;
+}
+
+void mod_runtime_run_cheats(const codebreaker::Memory& memory) {
+    for (const Runtime::CommittedCheat& cheat : state().committed_cheats)
+        codebreaker::run(cheat.program, memory);
 }
 
 const char* mod_runtime_required_asset_path(const std::string& package_id,
@@ -2201,6 +2303,16 @@ extern "C" int gba_mod_set_adaptive_view_enabled(int enabled) {
 
 extern "C" int gba_mod_adaptive_view_enabled(void) {
     return gbarecomp::state().adaptive_view_enabled ? 1 : 0;
+}
+
+extern "C" int gba_mod_set_diagnostic_replay_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return 0;
+    gbarecomp::state().diagnostic_replay_enabled = enabled;
+    return 1;
+}
+
+extern "C" int gba_mod_diagnostic_replay_enabled(void) {
+    return gbarecomp::state().diagnostic_replay_enabled;
 }
 
 extern "C" int gba_mod_set_view_width(int width) {
@@ -2376,4 +2488,13 @@ extern "C" const RecompLauncherCModProvider*
 gba_mod_runtime_launcher_provider_c(void) {
     return gbarecomp::state().initialized
         ? gbarecomp::mod_runtime_launcher_provider() : nullptr;
+}
+
+extern "C" int gba_mod_set_internal_resolution(int scale) {
+    if (scale < 0 || scale > int(gba::GbaHighResolutionFrame::kMaxScale)) return 0;
+    gbarecomp::state().internal_resolution = scale;
+    return 1;
+}
+extern "C" int gba_mod_internal_resolution(void) {
+    return gbarecomp::state().internal_resolution;
 }

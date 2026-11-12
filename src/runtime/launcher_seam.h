@@ -28,8 +28,9 @@
 // The launcher is skipped (returns 0 with args untouched) for every headless
 // or explicit-path invocation: --tcp, --steps, --frames, --no-window,
 // --dump-bmp/--dump-png, --load-state, --help, an explicit --rom, or
-// GBARECOMP_NO_LAUNCHER=1. `--launcher` forces it past a persisted
-// skip_launcher=1; `--no-launcher` skips for one run. Both are seam-only
+// GBARECOMP_NO_LAUNCHER=1 — unless `--launcher` is given, which forces the
+// UI past both headless flags and a persisted skip_launcher=1 (netplay
+// still skips); `--no-launcher` skips for one run. Both are seam-only
 // flags, stripped before run_game() parses the args.
 
 #pragma once
@@ -37,6 +38,7 @@
 #if defined(RECOMP_LAUNCHER)
 
 #include "runtime.h"
+#include "launcher_input_cache.h"
 #include "multiplayer_launch.h"
 #include "../gba/gba_bios.h"
 #include "../gba/sha1.h"
@@ -267,24 +269,6 @@ inline std::string exe_dir(const std::vector<std::string>& args) {
     return ".";
 }
 
-inline std::string read_single_line(const std::string& path) {
-    std::ifstream f(path);
-    std::string line;
-    if (f && std::getline(f, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
-                                 line.back() == ' ' || line.back() == '\t'))
-            line.pop_back();
-        return line;
-    }
-    return {};
-}
-
-inline void write_single_line(const std::string& path, const std::string& value) {
-    if (value.empty()) return;
-    std::ofstream f(path, std::ios::trunc);
-    if (f) f << value << "\n";
-}
-
 // Minimal reader for a single `key = "value"` under [section] in game.toml —
 // enough to prefill the launcher from [rom].path / [bios].path without
 // pulling in the full TOML parser. Returns the value resolved relative to the
@@ -333,6 +317,9 @@ struct SeamConfig {
     int  scale = 3;
     int  fullscreen = 0;
     int  linear_filter = 0;
+    int  integer_scale = 0;
+    int  scanlines = 0;
+    int  scanline_strength = 35;
     int  sharp_filter = -1;
     int  affine_filter = -1;
     int  screen_kind = 0;      // kScreenTokens index
@@ -340,6 +327,8 @@ struct SeamConfig {
     int  audio_freq = 0;       // host audio device rate; 0 = engine default
     int  audio_shadow = 0;     // MP2K enhancement mixer ([audio].shadow)
     int  language_index = 0;   // EN/ES boot-dump selection (GameInfo.languages)
+    int player_source = 1;
+    std::string player_guid;
     int  skip_launcher = 0;
     int  widescreen = 0;       // legacy fixed-width toggle
     int  aspect_index = 0;     // games with a launcher_aspect vocabulary only
@@ -358,6 +347,7 @@ struct SeamConfig {
 
 inline void seam_config_load(const std::string& path, SeamConfig* c) {
     std::ifstream f(path);
+    std::fprintf(stderr,"[gbarecomp:launcher-profile] load path=\"%s\" readable=%d\n",path.c_str(),f.good()?1:0);
     if (!f) return;
     std::string line;
     bool in_section = false;
@@ -385,6 +375,9 @@ inline void seam_config_load(const std::string& path, SeamConfig* c) {
         if (key == "scale")         c->scale = std::atoi(val.c_str());
         else if (key == "fullscreen")    c->fullscreen = std::atoi(val.c_str());
         else if (key == "linear_filter") c->linear_filter = std::atoi(val.c_str());
+        else if (key == "integer_scale") c->integer_scale = std::atoi(val.c_str()) != 0;
+        else if (key == "scanlines") c->scanlines = std::atoi(val.c_str()) != 0;
+        else if (key == "scanline_strength") c->scanline_strength = std::clamp(std::atoi(val.c_str()), 0, 100);
         else if (key == "sharp_filter") c->sharp_filter = std::atoi(val.c_str());
         else if (key == "affine_filter") c->affine_filter = std::atoi(val.c_str());
         else if (key == "screen")        c->screen_kind = screen_token_to_index(val);
@@ -392,6 +385,8 @@ inline void seam_config_load(const std::string& path, SeamConfig* c) {
         else if (key == "audio_freq")    c->audio_freq = std::atoi(val.c_str());
         else if (key == "audio_shadow")  c->audio_shadow = std::atoi(val.c_str());
         else if (key == "language_index") c->language_index = std::atoi(val.c_str());
+        else if (key == "player_source") c->player_source=std::clamp(std::atoi(val.c_str()),0,2);
+        else if (key == "player_guid") c->player_guid=val;
         else if (key == "skip_launcher") c->skip_launcher = std::atoi(val.c_str());
         else if (key == "widescreen")    c->widescreen = std::atoi(val.c_str());
         else if (key == "aspect_index")  c->aspect_index = std::atoi(val.c_str());
@@ -450,13 +445,18 @@ inline void seam_config_save(const std::string& path, const SeamConfig& c) {
     while (!kept.empty() && kept.back().empty()) kept.pop_back();
 
     std::ofstream f(path, std::ios::trunc);
-    if (!f) return;
+    if (!f) {
+        std::fprintf(stderr,"[gbarecomp:launcher-profile] save path=\"%s\" written=0\n",path.c_str());return;
+    }
     for (const auto& l : kept) f << l << "\n";
     if (!kept.empty()) f << "\n";
     f << "[Launcher]\n";
     f << "scale = " << c.scale << "\n";
     f << "fullscreen = " << c.fullscreen << "\n";
     f << "linear_filter = " << c.linear_filter << "\n";
+    f << "integer_scale = " << c.integer_scale << "\n";
+    f << "scanlines = " << c.scanlines << "\n";
+    f << "scanline_strength = " << c.scanline_strength << "\n";
     f << "sharp_filter = " << c.sharp_filter << "\n";
     f << "affine_filter = " << c.affine_filter << "\n";
     f << "screen = " << kScreenTokens[c.screen_kind] << "\n";
@@ -464,6 +464,8 @@ inline void seam_config_save(const std::string& path, const SeamConfig& c) {
     f << "audio_freq = " << c.audio_freq << "\n";
     f << "audio_shadow = " << c.audio_shadow << "\n";
     f << "language_index = " << c.language_index << "\n";
+    f << "player_source = " << c.player_source << "\n";
+    f << "player_guid = " << c.player_guid << "\n";
     f << "skip_launcher = " << c.skip_launcher << "\n";
     f << "widescreen = " << c.widescreen << "\n";
     f << "aspect_index = " << c.aspect_index << "\n";
@@ -479,6 +481,8 @@ inline void seam_config_save(const std::string& path, const SeamConfig& c) {
     f << "assist_fast_pad = " << c.assist_fast_pad << "\n";
     f << "rom_patch_enabled = " << c.rom_patch_enabled << "\n";
     f << "rom_patch_path = " << c.rom_patch_path << "\n";
+    f.flush();
+    std::fprintf(stderr,"[gbarecomp:launcher-profile] save path=\"%s\" written=%d volume=%d fullscreen=%d\n",path.c_str(),f.good()?1:0,c.volume,c.fullscreen);
 }
 
 // ---- multi-dump discovery ---------------------------------------------------
@@ -645,6 +649,9 @@ inline void seam_append_setting_args(std::vector<std::string>& args,
     args.push_back(c.audio_shadow ? "1" : "0");
     args.push_back("--linear-filter");
     args.push_back(c.linear_filter ? "1" : "0");
+    args.insert(args.end(), {"--integer-scale", c.integer_scale ? "1" : "0",
+                            "--scanlines", c.scanlines ? "1" : "0",
+                            "--scanline-strength", std::to_string(c.scanline_strength)});
     if (opts.launcher_expose_sharp_filter) {
         args.push_back("--sharp-filter");
         args.push_back(c.sharp_filter ? "1" : "0");
@@ -683,9 +690,10 @@ inline void seam_append_setting_args(std::vector<std::string>& args,
         int idx = c.aspect_index;
         if (idx < 0 || idx >= opts.launcher_num_aspects) idx = 0;
         const std::uint16_t w = opts.launcher_aspect_view_widths[idx];
-        if (w > 240) {
+        if (w >= 240) {
             args.push_back("--view-width");
             args.push_back(std::to_string(w));
+            if (!adaptive_view) args.push_back("--no-resize-view");
         }
     } else if (fixed_view_honored && c.widescreen && !adaptive_view &&
                opts.resize_driven_view &&
@@ -711,28 +719,52 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     using namespace gbarecomp_seam;
 
     // ---- skip decisions -----------------------------------------------------
+    int launcher_mode = 0; // default/show/skip, matching recomp-ui's ABI
     bool force_launcher = false;
     bool skip_once = false;
     bool headless = false;
+#if defined(RECOMP_LAUNCHER_HAS_LAUNCH_OPTIONS)
+    {
+        std::vector<char*> argv;
+        for (auto& arg : args) argv.push_back(arg.data());
+        argv.push_back(nullptr);
+        int argc = static_cast<int>(args.size());
+        launcher_mode = recomp_launcher_parse_cli_args(&argc, argv.data());
+        std::vector<std::string> filtered;
+        for (int i = 0; i < argc; ++i) filtered.emplace_back(argv[i]);
+        args.swap(filtered);
+    }
+    recomp_launcher_set_game_version(opts.launcher_game_version);
+#endif
     {
         std::vector<std::string> filtered;
         filtered.reserve(args.size());
         for (size_t i = 0; i < args.size(); ++i) {
             const std::string& s = args[i];
-            if (i > 0 && s == "--launcher")    { force_launcher = true; continue; }
-            if (i > 0 && s == "--no-launcher") { skip_once = true; continue; }
+            if (i > 0 && s == "--") {
+                filtered.insert(filtered.end(), args.begin() + i, args.end());
+                break;
+            }
+            if (i > 0 && s == "--launcher")    { launcher_mode = 1; continue; }
+            if (i > 0 && s == "--no-launcher") { launcher_mode = 2; continue; }
             if (i > 0 && (s == "--tcp" || s == "--steps" || s == "--frames" ||
                           s == "--no-window" || s == "--dump-bmp" ||
                           s == "--dump-png" || s == "--load-state" ||
+                          s == "--replay-diagnostic" ||
                           s == "--rom" || s == "--help" || s == "-h"))
                 headless = true;
             filtered.push_back(s);
         }
         args.swap(filtered);
     }
+    force_launcher = launcher_mode == 1;
+    skip_once = launcher_mode == 2;
     if (const char* env = std::getenv("GBARECOMP_NO_LAUNCHER"))
         if (env[0] && env[0] != '0') skip_once = true;
-    if (headless || (skip_once && !force_launcher) || (opts.netplay && opts.netplay->enabled)) return 0;
+    // An explicit --launcher forces the UI even for scripted-looking runs
+    // (wrappers that always pass --rom read as headless below); without
+    // it, any headless flag skips the launcher silently.
+    if ((headless && !force_launcher) || (opts.netplay && opts.netplay->enabled)) return 0;
 
     const std::string dir = exe_dir(args);
     const auto state_path = [&](const char* filename,
@@ -785,7 +817,14 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
             opts.assist_fast_forward_multiplier_default, 2, 10);
     SeamSolar solar;
     if (opts.has_solar_sensor) seam_solar_load(config_path, &solar);
-    if (cfg.skip_launcher && !force_launcher &&
+    const bool saved_or_cli_skip =
+#if defined(RECOMP_LAUNCHER_HAS_LAUNCH_OPTIONS)
+        recomp_launcher_cli_should_skip(launcher_mode, cfg.skip_launcher) ||
+        (skip_once && !force_launcher);
+#else
+        (skip_once || cfg.skip_launcher) && !force_launcher;
+#endif
+    if (saved_or_cli_skip &&
         !(opts.launcher_enable_rom_patches && cfg.rom_patch_enabled)) {
         // Boot straight in, but still honor the persisted settings.
         seam_append_setting_args(args, cfg, opts);
@@ -853,6 +892,11 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     ls.window_scale  = cfg.scale;
     ls.fullscreen    = cfg.fullscreen;
     ls.linear_filter = cfg.linear_filter;
+    ls.integer_scale = cfg.integer_scale;
+#if defined(RECOMP_LAUNCHER_HAS_SCANLINES)
+    ls.scanlines = cfg.scanlines;
+    ls.scanline_strength_pct = cfg.scanline_strength;
+#endif
     ls.widescreen    = cfg.widescreen;
     ls.adaptive_view = cfg.adaptive_view;
 #if defined(RECOMP_LAUNCHER_HAS_NETPLAY_VIEW) && defined(RECOMP_UI_HAS_NETPLAY_HOST)
@@ -868,7 +912,10 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     ls.audio_shadow  = cfg.audio_shadow != 0;
     ls.language_index = cfg.language_index;
     ls.volume        = cfg.volume;
-    ls.player_src[0] = 1;                 // keyboard (gbarecomp host input)
+    ls.player_src[0] = cfg.player_source;
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_GAMEPAD_GUID)
+    std::snprintf(ls.player_gamepad_guid[0],sizeof(ls.player_gamepad_guid[0]),"%s",cfg.player_guid.c_str());
+#endif
     ls.skip_launcher = cfg.skip_launcher;
     bool solar_in_launcher = false;
     if (opts.has_solar_sensor) solar_in_launcher = push_solar_settings(ls, solar);
@@ -1106,6 +1153,9 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
         save_display = p.string();
     }
     if (!save_display.empty()) gi.sram_path = save_display.c_str();
+#if defined(RECOMP_LAUNCHER_HAS_NATIVE_SAVE_BYTES)
+    gi.native_save_bytes = opts.launcher_native_save_bytes;
+#endif
 
     std::string title = std::string(gi.name) + " \xE2\x80\x94 Launcher";
 #if defined(RECOMP_UI_HAS_NETPLAY_HOST)
@@ -1117,9 +1167,9 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     int rc = recomp_launcher_run_window(title.c_str(), &ls, &gi, dir.c_str(),
                                         seed_rom.c_str(),
                                         picked_rom, sizeof(picked_rom));
-    if (rc == 1) return 1;    // user closed the launcher: quit without booting
-    if (rc != 0) return 0;    // unavailable: fall back to the asset picker
+    if (rc != 0 && rc != 1) return 0; // unavailable: fall back to the asset picker
 #if defined(RECOMP_UI_HAS_NETPLAY_HOST)
+    if (rc == 0) {
 #if defined(RECOMP_LAUNCHER_HAS_NETPLAY_VIEW)
     if (opts.netplay) {
         opts.netplay->view=gbarecomp_seam::netplay_view_at(ls.netplay_view_index,opts.netplay->view_policy);
@@ -1128,6 +1178,7 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
 #endif
     try { gbarecomp_seam::accept_netplay(ls.netplay_launch,opts); }
     catch (const std::exception& e) { std::fprintf(stderr,"netplay: %s\n",e.what()); return 1; }
+    }
 #endif
 
     // ---- persist + translate the committed settings -------------------------
@@ -1138,6 +1189,11 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     // on every subsequent launch.
     cfg.fullscreen    = (ls.fullscreen >= 0 && ls.fullscreen <= 2) ? ls.fullscreen : 0;
     cfg.linear_filter = ls.linear_filter ? 1 : 0;
+    cfg.integer_scale = ls.integer_scale ? 1 : 0;
+#if defined(RECOMP_LAUNCHER_HAS_SCANLINES)
+    cfg.scanlines = ls.scanlines ? 1 : 0;
+    cfg.scanline_strength = std::clamp(ls.scanline_strength_pct, 0, 100);
+#endif
     cfg.sharp_filter =
         gbarecomp_seam::get_sharp_filter(ls, cfg.sharp_filter != 0) ? 1 : 0;
     cfg.affine_filter =
@@ -1148,6 +1204,10 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     cfg.audio_freq    = ls.audio_freq > 0 ? ls.audio_freq : 0;
     cfg.audio_shadow  = ls.audio_shadow != 0 ? 1 : 0;
     cfg.language_index = ls.language_index >= 0 ? ls.language_index : 0;
+    cfg.player_source=std::clamp(ls.player_src[0],0,2);
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_GAMEPAD_GUID)
+    cfg.player_guid=ls.player_gamepad_guid[0];
+#endif
     cfg.skip_launcher = ls.skip_launcher ? 1 : 0;
     cfg.widescreen    = ls.widescreen ? 1 : 0;
     cfg.adaptive_view = ls.adaptive_view ? 1 : 0;
@@ -1174,6 +1234,10 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     // would just churn the file the game owns.
     if (solar_in_launcher && pull_solar_settings(ls, &solar))
         seam_solar_save(config_path, solar);
+
+    // Closing the launcher still commits its settings. Save before returning
+    // so a player need not start a game just to retain an audio/display edit.
+    if (rc == 1) return 1;
 
     // Boot the cart dump the committed language maps to. The model already
     // mounted it when the user toggled EN/ES (so the region + cover matched

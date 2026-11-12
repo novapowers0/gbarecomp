@@ -38,6 +38,7 @@ enum class ScreenKind {
 
 // Display colorspace the emitted bytes are interpreted in.
 enum class DisplayTarget { Srgb, DisplayP3 };
+enum class UploadPixelOrder { Rgb24, Argb8888, Abgr8888 };
 
 // Parse a config/env token; returns false if unrecognized.
 bool screen_kind_from_name(std::string_view name, ScreenKind& out);
@@ -52,9 +53,15 @@ struct ColorSettings {
 // frame as one indexed lookup per pixel.
 class ColorLut {
 public:
-    explicit ColorLut(const ColorSettings& settings);
+    explicit ColorLut(const ColorSettings& settings,
+                       UploadPixelOrder upload = UploadPixelOrder::Rgb24);
 
     bool is_passthrough() const { return passthrough_; }
+    // Immutable native-color table for a downstream GPU presentation consumer.
+    // Raw passthrough has no table and must retain its original RGB bytes.
+    const std::array<std::array<uint8_t, 3>, 32768>* native_rgb_table() const {
+        return table_.get();
+    }
 
     // Transform a 240×160 RGB888 frame (R,G,B byte order, as the PPU and the
     // SDL RGB24 texture use) into `dst`. The 5-bit hardware index is
@@ -63,10 +70,23 @@ public:
     void map_rgb888(const uint8_t* src, uint8_t* dst,
                     int width, int height) const;
 
+    // Same displayed colors, fused with opaque native-texture packing.
+    // dst holds width*height uint32_t pixels and must not overlap src.
+    // red_low_byte selects ABGR8888; false selects ARGB8888. These are
+    // logical SDL pixel values, independent of the host's byte order.
+    void map_packed8888(const uint8_t* src, uint32_t* dst,
+                        int width, int height, bool red_low_byte) const;
+    static const char* upload_implementation();
+
 private:
     // table_[bgr555] = {R,G,B}.
     std::unique_ptr<std::array<std::array<uint8_t, 3>, 32768>> table_;
     bool passthrough_ = false;
+    // Immutable, prepared once for the selected native texture. LLE/Raw do
+    // not allocate it. Rebuilding screen settings constructs a new table.
+    std::unique_ptr<std::array<uint32_t, 32768>> packed_table_;
+    UploadPixelOrder packed_order_ = UploadPixelOrder::Rgb24;
+    void build_upload_table(UploadPixelOrder order);
 };
 
 }  // namespace gbarecomp::runtime

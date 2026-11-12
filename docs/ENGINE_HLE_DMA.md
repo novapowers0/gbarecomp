@@ -1,5 +1,18 @@
 # Shared-engine HLE opportunities and ordinary-RAM DMA pilot
 
+## High-resolution presentation default (2026-10-19)
+
+Owner 8x/16x MKSC feedback identified a separate CPU bottleneck beyond the
+native scanline HLE below. The build-selected cached affine surface in
+`GBARECOMP_HD_SAMPLER_IMPLEMENTATION=HLE` improves a matched 382x160, 8x Windows
+route from 20.403 to 32.941 FPS (61.5%). Direct tiled sampling remains available
+as `LLE`. The final images and game snapshots match; local two-machine canonical
+state/restore checks pass. The owner confirmed improved gameplay speed and
+authorized default promotion; the cached sampler is integrated on engine and
+MKSC main. It remains short of full speed. This does not qualify a DMA,
+guest CPU, other-game or non-Windows gain. See `INTERNAL_RESOLUTION.md` and the
+title's `docs/HD-PERFORMANCE-2026-10-19.md` for scope, inputs and evidence.
+
 ## Current scanline default (2026-10-09)
 
 Fresh builds now use `GBARECOMP_SCANLINE_IMPLEMENTATION=HLE`. Select the maintained

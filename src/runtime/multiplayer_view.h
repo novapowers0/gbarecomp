@@ -27,6 +27,7 @@ struct GbaNetplayViewPolicy {
     // Game-validated widest logical view, in [240, GbaPpu::kMaxRenderWidth].
     // Adaptive widths clamp to it; a fixed view wider than it is rejected.
     std::uint32_t max_width = kGbaNetplayDefaultMaxViewWidth;
+    gba::HighResolutionAffineProvider high_resolution_affine_provider = nullptr;
 };
 GbaNetplayView parse_gba_netplay_view(std::string_view);
 void validate_gba_netplay_view(GbaNetplayView, const GbaNetplayViewPolicy&);
@@ -40,11 +41,14 @@ unsigned gba_netplay_view_width(GbaNetplayView, int drawable_width = 0, int draw
 // neither this surface nor the window geometry enters a session snapshot/hash.
 class GbaNetplayPresentation final : public gba::GbaPpu::PresentationObserver {
 public:
-    explicit GbaNetplayPresentation(GbaNetplayViewPolicy, bool affine_filter = false);
+    explicit GbaNetplayPresentation(GbaNetplayViewPolicy, bool affine_filter = false,
+                                   unsigned internal_resolution = 1);
     ~GbaNetplayPresentation();
     void request_width(unsigned width);
     const std::uint8_t* pixels() const;
     unsigned width() const;
+    unsigned height() const;
+    unsigned logical_width() const;
     void scanline(const gba::GbaPpu&, std::uint32_t, std::uint16_t,
                   const std::uint8_t*, const std::uint8_t*,
                   const std::uint8_t*, const std::uint8_t*) override;

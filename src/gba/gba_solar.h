@@ -59,6 +59,13 @@ public:
     // stays at its darkest and the comparator never trips.
     void set_provider(LightProvider p) { provider_ = p; }
 
+    // Diagnostic replay: the brightness a reset would latch right now (or -1
+    // when nothing illuminates the sensor), and a playback override that
+    // replaces every host source until cleared with -1. The override is host
+    // input, never serialized guest state.
+    int  diagnostic_brightness() const;
+    void set_diagnostic_brightness(int brightness) { replay_brightness_ = brightness; }
+
     // ── GpioDevice ───────────────────────────────────────────────────
     bool gpio_active() const override { return active_; }
     void gpio_write(uint8_t pins) override;
@@ -95,6 +102,7 @@ private:
     bool selected_ = false;
 
     bool    have_fixed_ = false;   // RECOMP_SOLAR_FIXED override
+    int     replay_brightness_ = -1; // diagnostic playback override
     uint8_t fixed_      = 0;
 };
 

@@ -22,6 +22,8 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -56,6 +58,11 @@ struct FunctionSeed {
     bool alias_candidate = false;
 };
 
+struct FunctionBlock {
+    uint32_t start;
+    uint32_t end;  // exclusive; only decoded code, never inline table bytes
+};
+
 // Output: one entry per discovered function.
 struct Function {
     uint32_t addr;
@@ -88,6 +95,10 @@ struct Function {
     // instead each is a labelled re-entry point and the body emits a resume
     // prologue that goto's the right label. Sorted ascending, deduped.
     std::vector<uint32_t> alias_entries;
+    // Switch cases owned by this host, beyond its initial linear block.
+    // Keep their exact spans: expanding end_addr would decode inline data or
+    // swallow unrelated function roots between the dispatcher and its cases.
+    std::vector<FunctionBlock> switch_blocks;
     // Set during alias consolidation to mark this entry for removal from the
     // function list (it was rolled into its host's alias_entries).
     bool is_alias = false;
@@ -98,11 +109,11 @@ struct Function {
 // detector against the manual ground-truth set. See MC-HP-000.
 struct AutoJumpTable {
     uint32_t base;          // table base address (guest)
-    uint32_t stride;        // bytes per entry (4 = abs32)
+    uint32_t stride;        // bytes per entry (4 = abs32; 1/2 = unsigned Thumb offset)
     uint32_t count;         // entries emitted
-    uint32_t site_pc;       // PC of the indexed load that revealed the table
+    uint32_t site_pc;       // PC of the consuming indirect branch
     CpuMode  site_mode;     // mode of the dispatching code
-    bool     interworking;  // BX/veneer (per-entry bit0 mode) vs MOV pc (mode = site_mode)
+    bool     interworking;  // BX/veneer vs MOV/ADD pc (mode = site_mode)
     bool     bounded;       // count came from an exact CMP bound (vs walk)
 };
 
@@ -139,6 +150,8 @@ struct FinderStats {
     std::size_t aot_pointer_tables = 0;
     std::size_t aot_pointer_seeds = 0;
     std::size_t aot_code_copy_seeds = 0;
+    std::size_t aot_callback_objects = 0;
+    std::size_t aot_callback_seeds = 0;
     // Mid-function aliasing: entries rolled into a host as resume points
     // (not emitted as standalone functions).
     std::size_t alias_entries_total = 0;
@@ -173,6 +186,10 @@ struct DataRangeCollision {
     std::string range_note;
 };
 
+struct ConstantCodePatch {
+    uint32_t runtime_base, marker, replacement;
+};
+
 class FunctionFinder {
 public:
     // ROM bytes; expected to be the cartridge image as loaded into
@@ -184,6 +201,11 @@ public:
     // Add a seed. Duplicate addresses are tolerated; the first
     // seed's mode + name wins.
     void add_seed(const FunctionSeed& seed);
+
+    // Manual unsigned Thumb offset table; target = target_base + 2 * entry.
+    // target_base is the ADD pc instruction's address + 4.
+    void add_thumb_relative_table(uint32_t addr, uint32_t stride,
+                                  uint32_t count, uint32_t target_base);
 
     // Register a byte range as data — the finder will hard-error
     // if control flow ever enters it. Caller supplies `note` for
@@ -229,6 +251,11 @@ public:
     // Sorted-by-address output.
     const std::vector<Function>& functions() const { return functions_; }
     const FinderStats& stats() const { return stats_; }
+    const std::vector<DataRange>& data_ranges() const { return data_ranges_; }
+    const std::vector<CodeCopyRange>& code_copies() const { return code_copies_; }
+    const std::vector<ConstantCodePatch>& constant_code_patches() const {
+        return constant_code_patches_;
+    }
 
     // Jump tables recognized automatically during discovery.
     const std::vector<AutoJumpTable>& auto_jump_tables() const {
@@ -264,6 +291,10 @@ private:
     // confirmation can fire from several overlapping walks). Keeps the
     // emitted / overlap / rejected tallies counting distinct tables.
     std::unordered_set<uint32_t> jt_seen_bases_;
+    struct ThumbRelativeTable {
+        uint32_t addr, stride, count, target_base;
+    };
+    std::vector<ThumbRelativeTable> thumb_relative_tables_;
     // CMP-bound carried across an inverted switch guard. For the
     // `CMP Ri,#N; B{ls,cc} <dispatch>; B <default>` idiom the indexed
     // dispatch lives at the BRANCH TARGET, which the finder walks as its
@@ -276,6 +307,7 @@ private:
 
     std::vector<DataRange>           data_ranges_;
     std::vector<CodeCopyRange>       code_copies_;
+    std::vector<ConstantCodePatch>   constant_code_patches_;
     std::vector<DataRangeCollision>  collisions_;
     std::unordered_set<uint32_t>     excluded_;
     std::unordered_map<uint32_t, std::string> exclude_reasons_;
@@ -295,8 +327,10 @@ private:
     std::vector<FunctionSeed>        aot_pointer_seeds_;
     std::unordered_set<uint32_t>     aot_seen_pointer_tables_;
     std::unordered_set<uint64_t>     aot_seen_seed_keys_;
+    std::unordered_set<uint32_t> relative_callback_bases_, relative_callback_slots_;
+    bool relative_callbacks_dirty_ = false;
     bool speculative_literal_harvest_enabled_ = true;
-    bool static_resume_all_ = false;
+    bool static_resume_all_ = true;
     uint32_t aot_scan_start_ = 0;
     uint32_t aot_scan_end_ = 0;
 
@@ -318,8 +352,26 @@ private:
     bool looks_like_code(uint32_t addr, CpuMode mode, bool strict) const;
     bool is_arm_func_prologue(uint32_t addr) const;
     bool is_thumb_func_prologue(uint32_t addr) const;
-    void harvest_aot_pointer_table(uint32_t table_base);
+    void harvest_aot_reference(uint32_t raw);
+    void harvest_relative_callbacks();
     std::vector<FunctionSeed> collect_code_copy_seeds() const;
+    bool is_thumb_ram_leaf(uint32_t addr, uint32_t* ram_global = nullptr) const;
+    bool is_thumb_callback_leaf(uint32_t addr) const;
+    std::vector<uint32_t> thumb_ram_store_roots(uint32_t addr) const;
+    void harvest_stored_callback(uint32_t raw);
+    enum class CallbackFlow { Direct, ByteDomain, Branch };
+    void harvest_contextual_callbacks(uint32_t callee, uint8_t known_mask,
+                                      const std::array<uint32_t, 4>& arguments,
+                                      unsigned depth = 0, bool local_branch = false,
+                                      CallbackFlow flow = CallbackFlow::Direct);
+    struct ThumbCallEffects {
+        bool valid = false;
+        uint16_t preserved = 0;
+        bool writes_caller_stack = false;
+    };
+    ThumbCallEffects thumb_call_effects(uint32_t entry, CpuMode mode = CpuMode::Thumb,
+                                       unsigned depth = 0);
+    std::vector<FunctionSeed> collect_referenced_callback_seeds();
     void discover_one(uint32_t addr, CpuMode mode,
                       const std::string& name,
                       uint32_t source_addr = 0,
@@ -331,6 +383,18 @@ private:
     // discover_one drops the function instead of hard-erroring.
     bool current_walk_speculative_ = false;
     bool current_walk_dropped_ = false;
+    std::set<std::array<uint32_t, 6>> callback_contexts_;
+    bool callback_context_budget_reported_ = false;
+    std::set<std::array<uint32_t, 6>> callback_byte_contexts_;
+    bool callback_byte_budget_reported_ = false;
+    std::unordered_set<uint32_t> callback_branch_contexts_;
+    bool callback_branch_budget_reported_ = false;
+    std::set<std::array<uint32_t, 6>> callback_branch_call_contexts_;
+    bool callback_branch_call_budget_reported_ = false;
+    std::set<uint32_t> deferred_callback_branches_;
+    std::unordered_map<uint64_t, ThumbCallEffects> thumb_call_effects_;
+    std::unordered_set<uint64_t> thumb_call_effects_active_;
+    std::vector<FunctionSeed> deferred_store_callbacks_;
 };
 
 }  // namespace gbarecomp

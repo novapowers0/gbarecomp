@@ -105,7 +105,7 @@ int run(const GbaNetplayLaunch& launch,const GbaNetplayBoot& boot) {
     const bool adaptive = launch.view == GbaNetplayView::Adaptive;
     const unsigned initial_width = gba_netplay_view_width(launch.view, 0, 0,
                                                           launch.view_policy.max_width);
-    presentation = std::make_unique<GbaNetplayPresentation>(launch.view_policy, boot.affine_filter);
+    presentation = std::make_unique<GbaNetplayPresentation>(launch.view_policy, boot.affine_filter, boot.internal_resolution);
     presentation->request_width(initial_width);
     simulation.input_machine(launch.local_seat).ppu.set_presentation_observer(presentation.get());
     struct DetachPresentation {
@@ -190,17 +190,20 @@ int run(const GbaNetplayLaunch& launch,const GbaNetplayBoot& boot) {
         const auto title=boot.title+" - "+status;
         if (title!=previous_title) { window.set_title(title.c_str()); previous_title=title; }
         if (match.take_output(output)) {
-            // A mid-raster restore waits for a complete host image. Canonical
-            // consoles intentionally retain no pixels; audio still advances.
+            // Canonical consoles keep no raster. After a mid-frame restore,
+            // wait for a complete private presentation, while audio advances.
             if (const auto* pixels=presentation->pixels()) {
-                const unsigned width=presentation->width();
+                const unsigned width=presentation->logical_width();
                 if (!window.set_surface_size(width,160))
                     throw std::runtime_error("cannot resize netplay presentation surface");
                 window.set_view_margins((width-240)/2,(width-240)-(width-240)/2,0,0);
-                window.present(pixels);
+                window.present(pixels,presentation->width(),presentation->height());
             }
-            window.push_audio_block(output.audio.data(),output.audio.size(),
-                                    output.audio_rate);
+            std::size_t offset=0;
+            for (const auto& block:output.audio_blocks) {
+                window.push_audio_block(output.audio.data()+offset,block.count,block.rate);
+                offset+=block.count;
+            }
         }
         if (step==GbaNetplayMatch::Step::Idle) pacer.idle();
     }

@@ -124,8 +124,8 @@ async function pick(kind,file){
 }
 $('pickrom').onclick=()=>$('romfile').click();
 $('pickbios').onclick=()=>$('biosfile').click();
-$('romfile').onchange=()=>{const f=$('romfile').files[0];$('romfile').value='';void pick('rom',f);};
-$('biosfile').onchange=()=>{const f=$('biosfile').files[0];$('biosfile').value='';void pick('bios',f);};
+$('romfile').onchange=()=>{const f=$('romfile').files[0];$('romfile').value='';return pick('rom',f);};
+$('biosfile').onchange=()=>{const f=$('biosfile').files[0];$('biosfile').value='';return pick('bios',f);};
 $('forgetassets').onclick=async()=>{
  if(!confirm('Forget the ROM and BIOS stored in this browser for this site? Saves are kept.'))return;
  await assets.forget();picked={rom:null,bios:null};line('ROM and BIOS removed from this browser');renderAssets();

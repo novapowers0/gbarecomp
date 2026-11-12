@@ -95,9 +95,16 @@ read_io                 io_state              read_rom
 read_save               save_state            scheduler_state
 ppu_state               dma_state             timer_state           irq_state
 audio_state             screenshot
+presentation_screenshot
+mod_cheats              (committed mod cheats + frames applied; docs/MOD_PACKAGES.md)
 ```
 
 ## Ring-buffer queries
+
+`presentation_screenshot` returns the completed enhanced host raster when
+available, with sampled `w`/`h`, selected `scale` and cumulative `affine_lines`
+and `samples`. The ordinary `screenshot` command retains its native accuracy
+surface. Neither command changes simulation state.
 
 ```
 history                 get_frame             frame_range          frame_timeseries

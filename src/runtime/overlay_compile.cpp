@@ -122,11 +122,18 @@ std::string overlay_include_flags() {
 }
 
 #ifdef _WIN32
-// Extract the executable token (skipping an opening quote) from a command line.
+// Extract the executable token from a command line. A quoted token runs to
+// its closing quote, so an install path containing spaces (for example a
+// bundled tcc under "Program Files") still yields the compiler's directory.
 std::string cmd_exe_token(const std::string& cmdline) {
     std::size_t i = 0;
     while (i < cmdline.size() && std::isspace(static_cast<unsigned char>(cmdline[i]))) ++i;
-    if (i < cmdline.size() && (cmdline[i] == '"' || cmdline[i] == '\'')) ++i;
+    if (i < cmdline.size() && (cmdline[i] == '"' || cmdline[i] == '\'')) {
+        const char quote = cmdline[i++];
+        const std::size_t close = cmdline.find(quote, i);
+        if (close == std::string::npos) return cmdline.substr(i);
+        return cmdline.substr(i, close - i);
+    }
     const std::size_t start = i;
     while (i < cmdline.size() && !std::isspace(static_cast<unsigned char>(cmdline[i]))) ++i;
     return cmdline.substr(start, i - start);

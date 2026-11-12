@@ -146,6 +146,30 @@ void GbaSave::configure_eeprom(std::size_t bytes) {
     read_bit_index_ = 0;
 }
 
+bool GbaSave::eeprom_observe_request_length(uint32_t bits) {
+    if (!eeprom_enabled_) return false;
+    uint32_t addr_bits = 0;
+    if (bits == 9u || bits == 73u) addr_bits = 6u;
+    else if (bits == 17u || bits == 81u) addr_bits = 14u;
+    if (addr_bits == 0u || addr_bits == eeprom_addr_bits_) return false;
+
+    const std::size_t bytes = (addr_bits == 6u) ? 512u : 8u * 1024u;
+    // Bytes past the new part's end read as erased; a shrink keeps the bytes
+    // the 6-bit part decodes.
+    for (std::size_t i = std::min(eeprom_size_, bytes); i < eeprom_.size(); ++i)
+        eeprom_[i] = 0xFF;
+    eeprom_size_ = bytes;
+    eeprom_addr_bits_ = addr_bits;
+    eeprom_block_mask_ = static_cast<uint32_t>((bytes / 8u) - 1u);
+    // This DMA starts a fresh request; drop any partial command framed for
+    // the other width.
+    command_bits_.clear();
+    read_active_ = false;
+    read_byte_offset_ = 0;
+    read_bit_index_ = 0;
+    return true;
+}
+
 bool GbaSave::load_eeprom_bytes(const uint8_t* data, std::size_t bytes) {
     if (!eeprom_enabled_ || (!data && bytes != 0) || bytes > eeprom_size_) {
         return false;

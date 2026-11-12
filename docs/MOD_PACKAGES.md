@@ -108,6 +108,16 @@ feature = "adaptive-view"
 id = "example.adaptive-view"
 ```
 
+### Diagnostic replay capture
+
+A trusted diagnostic feature can call `gba_mod_set_diagnostic_replay_enabled(1)`
+when activated and set it to `0` in its reset callback. Each activation pass
+clears the request to `-1` (no catalog request), preserving the title and
+`config.ini` defaults for other games. A committed catalog request takes
+precedence over those defaults; an explicit `GBARECOMP_DIAGNOSTICS` environment
+override still wins. Capture eligibility checks, including the cheat exclusion,
+remain in effect. This controls recording only, never diagnostic playback.
+
 ### User-owned required assets
 
 An enabled package may require a separately dumped, user-owned file without
@@ -166,6 +176,45 @@ label = "Enhanced"
 ```
 
 Supported types are `boolean`, `choice`, and bounded `integer`.
+
+### Cheat codes
+
+Cheats are delivered as ordinary package features; there is no separate
+cheat menu. A `[[cheat]]` record attaches CodeBreaker Advance codes to the
+feature that owns it, so the Mods page toggles them like any other feature:
+
+```toml
+[[feature]]
+id = "max-money"
+name = "Max money"
+description = "Sets your money to 99,999,999."
+group = "Cheats"
+default_enabled = false
+
+[[cheat]]
+feature = "max-money"
+format = "codebreaker"
+codes = ["8300155C E0FF", "8300155E 05F5"]
+```
+
+`codes` lists one code line per string (`XXXXXXXX YYYY`). A feature may own
+several records; they run in manifest order. The package stays data-only:
+codes are parsed by the engine's strict interpreter
+(`src/runtime/codebreaker.h`, semantics pinned to mGBA's CodeBreaker
+implementation) when the manifest is read, and the whole manifest is
+rejected before boot if any line is malformed, encrypted (type `9`), an
+unsupported `D` code, an incomplete slide/fill list, a trailing conditional,
+misaligned, or addresses anything outside EWRAM/IWRAM. A cheat-owning feature
+must declare `default_enabled = false`.
+
+After **Play/Commit**, the runner re-applies the committed cheats once per
+guest frame at frame start through the normal bus. With no cheat feature
+enabled nothing is armed, so frames and savestates are byte-identical to a
+stock run. Diagnostic replay capture is disabled while cheats are enabled,
+and replay playback never applies them. Netplay never loads the package
+catalog, so cheats cannot desync a session; they are unavailable there by
+construction. TCP `{"cmd":"mod_cheats"}` reports the active set and the
+always-on count of frames they were applied.
 
 ## Plugin registration
 

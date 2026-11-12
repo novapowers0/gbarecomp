@@ -5,7 +5,9 @@
 #include "mod_audio.h"
 #include "sha1.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -70,6 +72,7 @@ size_t activation_stream_pull(void*, int16_t* dst, size_t max_frames) {
 
 void activate_view() {
     g_active = true;
+    (void)gba_mod_set_diagnostic_replay_enabled(1);
     (void)gba_mod_set_adaptive_view_enabled(1);
     (void)gba_mod_set_view_width(569);
     g_stream = gba_mod_audio_stream_register_s16_mono(
@@ -90,6 +93,16 @@ bool write_text(const fs::path& path, const std::string& text) {
 }  // namespace
 
 int main() {
+    if (gba_mod_diagnostic_replay_enabled() != -1 ||
+        !gba_mod_set_diagnostic_replay_enabled(1) ||
+        gba_mod_diagnostic_replay_enabled() != 1 ||
+        gba_mod_set_diagnostic_replay_enabled(-1) ||
+        gba_mod_set_diagnostic_replay_enabled(2) ||
+        gba_mod_diagnostic_replay_enabled() != 1 ||
+        !gba_mod_set_diagnostic_replay_enabled(0) ||
+        gba_mod_diagnostic_replay_enabled() != 0) {
+        return fail("diagnostic replay request did not preserve unset/boolean semantics");
+    }
     // The low-level registry is always available, independent of the package
     // catalog. Registration is inert, decline falls through, and a handler
     // owns the callback-authored CPU state.
@@ -376,7 +389,8 @@ int main() {
         return fail("unrelated-feature plan failed: " + error);
     }
     gbarecomp::mod_runtime_activate_plugins();
-    if (g_active || gba_mod_adaptive_view_enabled() ||
+    if (g_active || gba_mod_diagnostic_replay_enabled() != -1 ||
+        gba_mod_adaptive_view_enabled() ||
         gba_mod_required_asset_path("test.adaptive-view", "zelda1-rom"))
         return fail("unrelated feature required or exposed a foreign asset");
 
@@ -394,7 +408,8 @@ int main() {
         return fail("enabled asset plan failed: " + error);
     }
     gbarecomp::mod_runtime_activate_plugins();
-    if (!g_active || !gba_mod_adaptive_view_enabled() ||
+    if (!g_active || gba_mod_diagnostic_replay_enabled() != 1 ||
+        !gba_mod_adaptive_view_enabled() ||
         !g_stream_registered_during_activation || !g_stream_reregistered_in_place)
         return fail("enabled plugin did not activate");
     const char* aspect = gba_mod_option_value("test.adaptive-view", "adaptive-view", "aspect");
@@ -640,7 +655,8 @@ int main() {
     if (!g_reset_saw_foreign_presentation_clear ||
         gba::foreign_presentation_internal::background() != nullptr ||
         gba::foreign_presentation_internal::obj_focus() != nullptr ||
-        g_active || gba_mod_adaptive_view_enabled() || gba_mod_view_width() ||
+        g_active || gba_mod_diagnostic_replay_enabled() != -1 ||
+        gba_mod_adaptive_view_enabled() || gba_mod_view_width() ||
         gba_mod_option_value("test.adaptive-view", "adaptive-view", "aspect"))
         return fail("disabled plugin did not restore native view");
     if (gba_mod_required_asset_path("test.adaptive-view", "zelda1-rom"))
@@ -708,6 +724,183 @@ int main() {
         !rejects_bad_manifest(valid_asset + valid_asset) ||
         !rejects_bad_manifest(unknown_feature_asset))
         return fail("malformed, duplicate, or unknown-owner asset manifest was accepted");
+
+    // ── Declarative cheats ([[cheat]]) ───────────────────────────────────
+    // Every code is validated when the manifest is read, cheat features can
+    // never default on, and only committed, enabled features ever run.
+    const std::string cheat_on_default_feature =
+        "[[feature]]\n"
+        "id = \"default-on\"\n"
+        "name = \"Default on\"\n"
+        "default_enabled = true\n\n"
+        "[[cheat]]\n"
+        "feature = \"default-on\"\n"
+        "format = \"codebreaker\"\n"
+        "codes = [\"83000000 0001\"]\n";
+    const auto cheat_record = [](const std::string& feature,
+                                 const std::string& format,
+                                 const std::string& codes) {
+        return "[[cheat]]\nfeature = \"" + feature + "\"\nformat = \"" +
+               format + "\"\ncodes = " + codes + "\n";
+    };
+    if (!rejects_bad_manifest(cheat_on_default_feature) ||
+        !rejects_bad_manifest(cheat_record("not-a-feature", "codebreaker",
+                                           "[\"83000000 0001\"]")) ||
+        !rejects_bad_manifest(cheat_record("known-feature", "gameshark",
+                                           "[\"83000000 0001\"]")) ||
+        !rejects_bad_manifest(cheat_record("known-feature", "codebreaker", "[]")) ||
+        !rejects_bad_manifest(cheat_record("known-feature", "codebreaker",
+                                           "[\"84000000 0001\"]")) ||
+        !rejects_bad_manifest(cheat_record("known-feature", "codebreaker",
+                                           "[\"9ABCDEF0 1234\"]")) ||
+        !rejects_bad_manifest(cheat_record("known-feature", "codebreaker",
+                                           "[\"73000000 0001\"]")))
+        return fail("invalid cheat manifest was accepted");
+
+    const fs::path cheat_package = mods / "packages" / "test.cheats" / "1.0.0";
+    fs::create_directories(cheat_package, ec);
+    const std::string cheat_manifest =
+        "format_version = 1\n"
+        "id = \"test.cheats\"\n"
+        "version = \"1.0.0\"\n"
+        "name = \"Cheats\"\n"
+        "resolver = \"declarative\"\n\n"
+        "[[target]]\n"
+        "game_id = \"test-game\"\n"
+        "rom_sha1 = \"" + sha1 + "\"\n\n"
+        "[[feature]]\n"
+        "id = \"max-money\"\n"
+        "name = \"Max money\"\n"
+        "group = \"Cheats\"\n"
+        "default_enabled = false\n\n"
+        "[[feature]]\n"
+        "id = \"all-slots\"\n"
+        "name = \"All slots\"\n"
+        "group = \"Cheats\"\n"
+        "default_enabled = false\n\n"
+        "[[cheat]]\n"
+        "feature = \"max-money\"\n"
+        "format = \"codebreaker\"\n"
+        "codes = [\"8300155C E0FF\", \"8300155E 05F5\"]\n\n"
+        "[[cheat]]\n"
+        "feature = \"all-slots\"\n"
+        "format = \"codebreaker\"\n"
+        "codes = [\"43001576 270F\", \"00000008 0068\"]\n";
+    if (ec || !write_text(cheat_package / "manifest.toml", cheat_manifest))
+        return fail("could not write cheat package");
+    const auto write_cheat_state = [&](bool money, bool slots) {
+        return write_text(
+            mods / "state.toml",
+            "format_version = 1\n\n"
+            "[[package]]\n"
+            "id = \"test.cheats\"\n"
+            "version = \"1.0.0\"\n\n"
+            "[[feature]]\n"
+            "package_id = \"test.cheats\"\n"
+            "id = \"max-money\"\n"
+            "enabled = " + std::string(money ? "true\n\n" : "false\n\n") +
+            "[[feature]]\n"
+            "package_id = \"test.cheats\"\n"
+            "id = \"all-slots\"\n"
+            "enabled = " + std::string(slots ? "true\n" : "false\n"));
+    };
+    std::vector<uint8_t> iwram(32 * 1024, 0);
+    gbarecomp::codebreaker::Memory iwram_memory;
+    iwram_memory.ctx = &iwram;
+    iwram_memory.read16 = [](void* c, uint32_t a) {
+        auto& m = *static_cast<std::vector<uint8_t>*>(c);
+        const uint32_t o = a - 0x03000000u;
+        return static_cast<uint16_t>(m.at(o) | (m.at(o + 1) << 8));
+    };
+    iwram_memory.write8 = [](void* c, uint32_t a, uint8_t v) {
+        static_cast<std::vector<uint8_t>*>(c)->at(a - 0x03000000u) = v;
+    };
+    iwram_memory.write16 = [](void* c, uint32_t a, uint16_t v) {
+        auto& m = *static_cast<std::vector<uint8_t>*>(c);
+        const uint32_t o = a - 0x03000000u;
+        m.at(o) = static_cast<uint8_t>(v);
+        m.at(o + 1) = static_cast<uint8_t>(v >> 8);
+    };
+    const auto iwram32 = [&](uint32_t a) {
+        const uint32_t o = a - 0x03000000u;
+        return uint32_t{iwram[o]} | (uint32_t{iwram[o + 1]} << 8) |
+               (uint32_t{iwram[o + 2]} << 16) | (uint32_t{iwram[o + 3]} << 24);
+    };
+
+    // Enabled but not yet committed (and never loaded at all, which is the
+    // netplay path): nothing runs.
+    if (!write_cheat_state(true, false) ||
+        !gbarecomp::mod_runtime_initialize(mods, "test-game", sha1, &error) ||
+        gbarecomp::mod_runtime_committed_cheat_count() != 0)
+        return fail("cheats were armed before commit: " + error);
+    gbarecomp::mod_runtime_run_cheats(iwram_memory);
+    if (std::any_of(iwram.begin(), iwram.end(), [](uint8_t b) { return b; }))
+        return fail("uncommitted cheat wrote guest memory");
+    if (!gbarecomp::mod_runtime_commit(rom_path, &error) ||
+        gbarecomp::mod_runtime_committed_cheat_count() != 1 ||
+        gbarecomp::mod_runtime_committed_cheat_names() !=
+            std::vector<std::string>{"test.cheats/max-money"})
+        return fail("enabled cheat feature was not committed alone: " + error);
+    gbarecomp::mod_runtime_run_cheats(iwram_memory);
+    if (iwram32(0x0300155Cu) != 99999999u || iwram[0x1576] != 0)
+        return fail("committed cheat did not write exactly its own codes");
+
+    // Disabling every cheat feature disarms them completely.
+    std::fill(iwram.begin(), iwram.end(), uint8_t{0});
+    if (!write_cheat_state(false, false) ||
+        !gbarecomp::mod_runtime_initialize(mods, "test-game", sha1, &error) ||
+        !gbarecomp::mod_runtime_commit(rom_path, &error) ||
+        gbarecomp::mod_runtime_committed_cheat_count() != 0)
+        return fail("disabled cheats remained committed: " + error);
+    gbarecomp::mod_runtime_run_cheats(iwram_memory);
+    if (std::any_of(iwram.begin(), iwram.end(), [](uint8_t b) { return b; }))
+        return fail("disabled cheat wrote guest memory");
+
+    // Both enabled: catalog order (manifest order within a package).
+    if (!write_cheat_state(true, true) ||
+        !gbarecomp::mod_runtime_initialize(mods, "test-game", sha1, &error) ||
+        !gbarecomp::mod_runtime_commit(rom_path, &error) ||
+        gbarecomp::mod_runtime_committed_cheat_names() !=
+            std::vector<std::string>{"test.cheats/max-money",
+                                     "test.cheats/all-slots"})
+        return fail("cheat commit order is not catalog order: " + error);
+    gbarecomp::mod_runtime_run_cheats(iwram_memory);
+    if (iwram32(0x0300155Cu) != 99999999u ||
+        iwram[0x1576 + 7 * 0x68] != 0x0F || iwram[0x1576 + 8 * 0x68] != 0)
+        return fail("multiple committed cheats did not all run");
+    // A wrong-target initialize leaves nothing committed.
+    if (gbarecomp::mod_runtime_initialize(mods, "test-game", "nope", &error) ||
+        gbarecomp::mod_runtime_committed_cheat_count() != 0)
+        return fail("failed initialize retained committed cheats");
+
+    // Catalog inspection creates selection rows even when the player has not
+    // overridden a feature. Commit/reload must retain the manifest's default.
+    std::string default_on_manifest = manifest.substr(0, manifest.find("[[asset]]"));
+    const auto inherited_default = default_on_manifest.find("default_enabled = false");
+    default_on_manifest.replace(inherited_default,
+        std::string("default_enabled = false").size(), "default_enabled = true");
+    if (!write_text(package / "manifest.toml", default_on_manifest))
+        return fail("could not write default-on fixture");
+    fs::remove(mods / "state.toml", ec);
+    for (int pass = 0; pass < 2; ++pass) {
+        if (!gbarecomp::mod_runtime_initialize(mods, "test-game", sha1, &error) ||
+            !gbarecomp::mod_runtime_commit(rom_path, &error))
+            return fail("default-on commit failed: " + error);
+        gbarecomp::mod_runtime_activate_plugins();
+        if (!g_active)
+            return fail("inherited default-on feature was lost across commit/reload");
+    }
+    // An explicit player choice must still win over the inherited default.
+    if (!write_state(false, false, {}))
+        return fail("could not write explicit-disabled fixture");
+    for (int pass = 0; pass < 2; ++pass) {
+        if (!gbarecomp::mod_runtime_initialize(mods, "test-game", sha1, &error) ||
+            !gbarecomp::mod_runtime_commit(rom_path, &error))
+            return fail("explicit-disabled commit failed: " + error);
+        gbarecomp::mod_runtime_activate_plugins();
+        if (g_active)
+            return fail("inherited default overrode explicit disabled selection");
+    }
 
     fs::remove_all(sandbox, ec);
     std::cout << "GBA mod runtime: target gate, strict external asset, "

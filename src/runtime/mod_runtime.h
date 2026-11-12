@@ -5,9 +5,12 @@
 #include "../gba/foreign_screen_overlay.h"
 
 #ifdef __cplusplus
+#include <cstddef>
 #include <filesystem>
 #include <string>
 #include <vector>
+
+#include "codebreaker.h"
 
 struct RecompLauncherCModProvider;
 
@@ -36,6 +39,16 @@ const RecompLauncherCModProvider* mod_runtime_launcher_provider();
 const char* mod_runtime_required_asset_path(const std::string& package_id,
                                             const std::string& asset_id);
 
+// Declarative cheats ([[cheat]] records, docs/MOD_PACKAGES.md). The committed
+// set is the enabled cheat features of the last successful commit; it is
+// empty until a commit, after initialize, and whenever the catalog is not
+// loaded at all (netplay never loads it). The runner calls
+// mod_runtime_run_cheats once per guest frame only while the count is
+// non-zero, so a session without enabled cheats is byte-identical to stock.
+std::size_t mod_runtime_committed_cheat_count();
+std::vector<std::string> mod_runtime_committed_cheat_names();
+void mod_runtime_run_cheats(const codebreaker::Memory& memory);
+
 }  // namespace gbarecomp
 #endif
 
@@ -53,6 +66,17 @@ int gba_mod_register_reset_callback(GBAModActivationCallback callback);
 // game's RunOptions capability gate remains authoritative.
 int gba_mod_set_adaptive_view_enabled(int enabled);
 int gba_mod_adaptive_view_enabled(void);
+
+// A trusted diagnostics feature may select replay capture for this launch.
+// -1 means no catalog request: retain the title/config default. Activation
+// clears the request before reset callbacks run. GBARECOMP_DIAGNOSTICS still
+// overrides the selection for automated runs and explicit player requests.
+int gba_mod_set_diagnostic_replay_enabled(int enabled);
+int gba_mod_diagnostic_replay_enabled(void);
+// Optional presentation density, 1..16; 0 clears the request. Reset on each
+// activation pass. This selects pixels, never HLE/LLE simulation backends.
+int gba_mod_set_internal_resolution(int scale);
+int gba_mod_internal_resolution(void);
 
 // Optional initial/fixed logical width; 0 means no plugin request. The runner
 // still clamps this to the game's capability. Reset on every activation pass.

@@ -37,6 +37,9 @@
 
 extern "C" int overlay_runtime_trace_gate_compile_smoke(
     const GbaOverlayCallbacks* callbacks);
+extern "C" void ram_mutation_fixture_0(void);
+extern "C" void ram_mutation_fixture_1(void);
+extern "C" const TestFn kNativeParamFns[2][2];
 
 namespace {
 
@@ -820,6 +823,207 @@ bool run_thumb_alu_immediate_override_cases() {
 
 }  // namespace
 
+namespace {
+uint8_t ram_match_memory[32] = {};
+uint32_t ram_match_base = 0, ram_match_seen_base = 0, ram_match_seen_resume = 0;
+const uint8_t* ram_match_view(uint32_t address, uint32_t size) {
+    if (address < ram_match_base || address - ram_match_base > sizeof(ram_match_memory) ||
+        size > sizeof(ram_match_memory) - (address - ram_match_base)) return nullptr;
+    return ram_match_memory + (address - ram_match_base);
+}
+void ram_match_body() {
+    ram_match_seen_base = g_runtime_native_ram_base;
+    ram_match_seen_resume = g_runtime_resume_pc;
+    g_runtime_resume_pc = 0;
+}
+bool run_native_ram_matching_cases() {
+    const uint8_t code[] = {0x01, 0x20, 0x70, 0x47};
+    const RuntimeNativeRamTemplate templates[] = {{code, sizeof(code), 1, ram_match_body,ram_match_body}};
+    const RuntimeNativeRamEntry entries[] = {{0x4003u, 0, 0}, {0x8EE1u, 0, 2}};
+    const auto previous_view = g_runtime_ram_code_view;
+    g_runtime_ram_code_view = ram_match_view;
+    runtime_register_native_ram_templates(templates, 1, entries, 2);
+    bool ok = true;
+    for (uint32_t base : {0x03001002u, 0x02001002u,0x08001002u,0x0C001002u}) {
+        ram_match_base = base;
+        std::memcpy(ram_match_memory, code, sizeof(code));
+        g_cpu.cpsr = CPSR_T_BIT | 0x1Fu;
+        g_runtime_native_ram_base = 0xA5A5u;
+        g_runtime_resume_pc = 0x5A5Au;
+        const auto ticks = codegen_test::g_ticked_cycles;
+        ok &= runtime_has_static_entry(base, 1) != 0;
+        ok &= runtime_has_static_entry(base+2, 1) != 0;
+        ok &= runtime_has_static_entry(base, 0) == 0;
+        ok &= g_runtime_native_ram_base == 0xA5A5u && g_runtime_resume_pc == 0x5A5Au;
+        ok &= codegen_test::g_ticked_cycles == ticks;
+        runtime_dispatch(base+2);
+        ok &= ram_match_seen_base == base && ram_match_seen_resume ==
+            (base>=0x08000000u ? 0x08000002u : 0x03000002u);
+        ok &= runtime_native_ram_instruction_matches(base, 0x2001u, 2) != 0;
+        // A cache hit must revalidate the complete body, including later bytes.
+        ram_match_memory[2] ^= 1u;
+        ok &= runtime_has_static_entry(base, 1) == 0;
+        codegen_test::g_named_sink_called = false;
+        codegen_test::g_dispatch_called = false;
+        runtime_dispatch(base);
+        ok &= codegen_test::g_dispatch_called &&
+              codegen_test::g_last_dispatch_target == base &&
+              !codegen_test::g_named_sink_called;
+        ok &= runtime_native_ram_instruction_matches(base+2, 0x4770u, 2) == 0;
+        std::memcpy(ram_match_memory, code, sizeof(code));
+        ok &= runtime_has_static_entry(base, 1) != 0;
+        ok &= runtime_has_static_entry(base + sizeof(ram_match_memory) - 2u, 1) == 0;
+    }
+    runtime_register_native_ram_templates(nullptr, 0, nullptr, 0);
+    g_runtime_ram_code_view = previous_view;
+    g_runtime_resume_pc = 0;
+    if (!ok) std::printf("FAIL native RAM byte verification / relocation / resume\n");
+    return ok;
+}
+const uint8_t* ram_fixture_view(uint32_t address, uint32_t size) {
+    const auto base = codegen_test::bus_base();
+    const auto length = codegen_test::bus_size();
+    if (address < base || address - base > length || size > length - (address-base))
+        return nullptr;
+    return codegen_test::bus_data() + (address-base);
+}
+bool run_native_ram_mutation_cases() {
+    const uint8_t a[] = {0x01,0x80,0x01,0x22,0x70,0x47};
+    const uint8_t b[] = {0x01,0x80,0x02,0x22,0x70,0x47};
+    const RuntimeNativeRamTemplate templates[] = {
+        {a, sizeof(a), 1, ram_mutation_fixture_0},
+        {b, sizeof(b), 1, ram_mutation_fixture_1}};
+    const RuntimeNativeRamEntry entries[] = {
+        {0x4403u,0,2},{0x4405u,1,2},
+        {0x8EE1u,0,4},{0x8EE1u,1,4},
+        {0x10003u,0,0},{0x10003u,1,0}};
+    const auto old_view = g_runtime_ram_code_view;
+    g_runtime_ram_code_view = ram_fixture_view;
+    runtime_register_native_ram_templates(templates, 2, entries, 6);
+    bool ok = true;
+    for (uint32_t base : {0x03001000u,0x03001002u,0x02001000u,0x02001002u}) {
+        gba::waits_reset(codegen_test::g_waits);
+        FlatBus reference_bus(32, base);
+        for (unsigned i = 0; i < sizeof(a); ++i) reference_bus.write8(base+i,a[i]);
+        armv4t::CPUState reference{};
+        reference.cpsr = unpack_cpsr(CPSR_T_BIT | 0x1Fu);
+        reference.thumb = true;
+        reference.R[0] = base+2;
+        reference.R[1] = 0x2202u;
+        reference.R[14] = 0x08000101u;
+        reference.R[15] = base;
+        const auto initial_waits = codegen_test::g_waits;
+        uint32_t reference_cycles = 0;
+        for (unsigned i = 0; i < 3; ++i) {
+            const auto pc = reference.R[15];
+            const auto ins = armv4t::ThumbDecoder::decode(reference_bus.read16(pc),pc);
+            uint32_t cycles = 0;
+            armv4t::Interpreter::step(reference,reference_bus,ins,&cycles);
+            reference_cycles += cycles;
+        }
+        codegen_test::g_waits = initial_waits;
+        codegen_test::bus_reset(base,32);
+        codegen_test::bus_write_u32_direct(base,0x22018001u);
+        codegen_test::bus_write_u32_direct(base+4,0x4770u);
+        std::memset(&g_cpu,0,sizeof(g_cpu));
+        g_cpu.cpsr = CPSR_T_BIT | 0x1Fu;
+        g_cpu.R[0] = base+2;
+        g_cpu.R[1] = 0x2202u;
+        g_cpu.R[14] = 0x08000101u;
+        runtime_init(nullptr);
+        runtime_call_push_return(0x08000100u);
+        runtime_dispatch(base);
+        for (unsigned r = 0; r < 16; ++r) ok &= g_cpu.R[r] == reference.R[r];
+        ok &= codegen_test::g_ticked_cycles == reference_cycles;
+        ok &= std::memcmp(codegen_test::bus_data(),reference_bus.mem.data(),32) == 0;
+        ok &= !codegen_test::g_dispatch_called && runtime_call_stack_depth() == 0;
+        const bool reviewed=(base>>24)==3u;
+        ok &= codegen_test::g_mod_entry_calls==(reviewed ? 1u : 0u);
+        if (reviewed) ok &= codegen_test::g_mod_entry_pc==0x03001002u;
+    }
+    runtime_register_native_ram_templates(nullptr,0,nullptr,0);
+    g_runtime_ram_code_view = old_view;
+    if (!ok) std::printf("FAIL native RAM instruction mutation / placement parity\n");
+    return ok;
+}
+
+bool run_native_parameter_cases() {
+    const auto old_view=g_runtime_ram_code_view;
+    g_runtime_ram_code_view=ram_fixture_view;
+    const WaitConfig waits[]={{"parameter-reset",0,0x0D000020u,false},
+                              {"parameter-prefetch",0x4317u,0x0D000020u,true}};
+    unsigned runs=0;
+    for (unsigned region=0;region<2;++region) for (unsigned op=0;op<2;++op)
+    for (uint32_t flags : {0u,0xF0000000u}) for (const auto& wait : waits)
+    for (uint32_t encoded=0;encoded<4096u;++encoded) {
+        TestCase tc{};
+        tc.name="live ARM immediate"; tc.pc=region ? 0x08001000u : 0x03001000u;
+        tc.word=(op ? 0xE2800000u : 0xE3A0A000u)|encoded;
+        tc.r_init[0]=0xFFFFFF00u; tc.r_init[10]=0x87654321u;
+        tc.cpsr_init=0x1Fu|flags; tc.mem_base=tc.pc; tc.mem_size=16u;
+        const TestMemInit code={tc.pc,tc.word}; tc.mem_init=&code; tc.mem_init_count=1;
+        if (!run_case(tc,0,kNativeParamFns[region][op],wait)) {
+            g_runtime_ram_code_view=old_view; return false;
+        }
+        ++runs;
+    }
+    // Masked entry lookup must revalidate the full operation/register/flag
+    // fields, even after a cached match and at an interior resume point.
+    const uint8_t code[]={0,0xA0,0xA0,0xE3,0x1E,0xFF,0x2F,0xE1};
+    const uint8_t masks[]={0,0xF0,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    const RuntimeNativeRamTemplate templates[]={{code,8u,0,ram_match_body,ram_match_body,masks}};
+    const RuntimeNativeRamEntry entries[]={{uint64_t(0xE12FFF1Eu)<<1,0,4},
+                                           {uint64_t(0xE3A0A000u)<<1,0,0}};
+    g_runtime_ram_code_view=ram_match_view;
+    runtime_register_native_ram_templates(templates,1,entries,2);
+    bool ok=true;
+    for (uint32_t base : {0x03001000u,0x02001000u,0x08001000u,0x0C001000u}) {
+        ram_match_base=base; std::memcpy(ram_match_memory,code,sizeof(code));
+        for (uint32_t encoded=0;encoded<4096u;++encoded) {
+            ram_match_memory[0]=uint8_t(encoded);
+            ram_match_memory[1]=uint8_t(0xA0u|(encoded>>8));
+            ok &= runtime_has_static_entry(base,0) && runtime_has_static_entry(base+4u,0);
+            ok &= runtime_native_ram_instruction_matches_masked(base,0xE3A0A000u,4u,0xFFFFF000u)!=0;
+        }
+        for (unsigned byte : {1u,2u,3u,4u}) {
+            ram_match_memory[byte]^=0x10u;
+            ok &= runtime_has_static_entry(base,0)==0;
+            ram_match_memory[byte]^=0x10u;
+        }
+    }
+    runtime_register_native_ram_templates(nullptr,0,nullptr,0);
+    g_runtime_ram_code_view=old_view;
+    std::printf("codegen_tests: %u live ARM immediate differential runs\n",runs);
+    if (!ok) std::printf("FAIL native ARM parameter guard/cache boundaries\n");
+    return ok;
+}
+}  // namespace
+
+static int live_immediate_override(uint32_t,uint32_t original,uint32_t* result) {
+    *result=original+7u;
+    return 1;
+}
+static bool run_live_immediate_cases() {
+    bool ok=true;
+    for (const char* name : {"runtime_pc_ram_reviewed_imm","runtime_pc_cart_reviewed_imm"}) {
+        std::size_t index=0;
+        while (index<kTestCasesCount && std::strcmp(kTestCases[index].name,name)!=0) ++index;
+        if (index==kTestCasesCount) return false;
+        const auto& tc=kTestCases[index];
+        g_runtime_thumb_alu_imm_override=live_immediate_override;
+        for (uint32_t delta : {0u,2u}) {
+            std::memset(&g_cpu,0,sizeof(g_cpu));
+            g_cpu.cpsr=tc.cpsr_init;
+            g_cpu.R[15]=tc.pc+delta;
+            kTestFns[index]();
+            ok &= g_cpu.R[0]==(delta ? 5u : 12u);
+        }
+        g_runtime_thumb_alu_imm_override=nullptr;
+    }
+    if (!ok) std::printf("FAIL live placement exact immediate-hook allowlist\n");
+    return ok;
+}
+
 int main() {
     std::printf("codegen_tests: %zu cases\n", kTestCasesCount);
     if (kTestCasesCount != kTestFnsCount) {
@@ -851,6 +1055,10 @@ int main() {
             tc.pc = rom_relocated_pc(tc.pc);
             ++rom_runs;
             if (!run_case(tc, i, kRomTestFns[i], wc)) ++failures;
+            if (kTestCases[i].runtime_pc_base) {
+                ++rom_runs;
+                if (!run_case(kTestCases[i],i,kTestFns[i],wc)) ++failures;
+            }
         }
     }
     std::printf("codegen_tests: %zu cartridge-ROM wait-state runs\n", rom_runs);
@@ -859,6 +1067,10 @@ int main() {
     if (!run_thumb_alu_immediate_override_cases()) ++failures;
     if (!run_runtime_trace_gate_cases()) ++failures;
     if (!run_overlay_runtime_trace_gate_cases()) ++failures;
+    if (!run_native_ram_matching_cases()) ++failures;
+    if (!run_native_ram_mutation_cases()) ++failures;
+    if (!run_live_immediate_cases()) ++failures;
+    if (!run_native_parameter_cases()) ++failures;
     if (failures) {
         std::printf("\ncodegen_tests: %d / %zu failed\n",
                     failures, kTestCasesCount);

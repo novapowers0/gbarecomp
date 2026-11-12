@@ -60,6 +60,7 @@ struct TestCase {
     // don't touch memory, leave both at 0 to use the defaults.
     uint32_t    mem_base;
     uint32_t    mem_size;
+    bool        runtime_pc_base = false;
 };
 
 extern const TestCase kTestCases[];

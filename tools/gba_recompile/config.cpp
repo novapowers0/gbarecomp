@@ -31,6 +31,8 @@ bool parse_jt_format(const std::string& s, JumpTableFormat& out) {
     if (s == "abs16")       { out = JumpTableFormat::Abs16;      return true; }
     if (s == "pcrel_arm")   { out = JumpTableFormat::PcrelArm;   return true; }
     if (s == "pcrel_thumb") { out = JumpTableFormat::PcrelThumb; return true; }
+    if (s == "u8_rel_thumb") { out = JumpTableFormat::U8RelThumb; return true; }
+    if (s == "u16_rel_thumb") { out = JumpTableFormat::U16RelThumb; return true; }
     return false;
 }
 
@@ -395,7 +397,8 @@ bool parse_jump_tables(const toml::array& arr,
         if (!ok || !parse_jt_format(fmt_s, jt.format)) {
             std::fprintf(stderr,
                 "%s[[jump_table]] entry %zu: format must be one of "
-                "abs32 / abs16 / pcrel_arm / pcrel_thumb (got %s)\n",
+                "abs32 / abs16 / pcrel_arm / pcrel_thumb / "
+                "u8_rel_thumb / u16_rel_thumb (got %s)\n",
                 kAbortHeader, i, fmt_s.c_str());
             return false;
         }
@@ -408,6 +411,23 @@ bool parse_jump_tables(const toml::array& arr,
             return false;
         }
         // Mode/format compatibility (see schema doc).
+        if (jt.format == JumpTableFormat::U8RelThumb ||
+            jt.format == JumpTableFormat::U16RelThumb) {
+            jt.base = get_u32_field(*t, "base", true, ok, err);
+            const uint32_t width = jt.format == JumpTableFormat::U8RelThumb ? 1u : 2u;
+            if (!ok || jt.base < 4 || (jt.base & 1u) || jt.stride != width ||
+                (jt.addr & (width - 1u)) || jt.count == 0 ||
+                static_cast<uint64_t>(jt.addr) +
+                    static_cast<uint64_t>(jt.count) * width > 0xFFFFFFFFull ||
+                jt.entries_mode != JumpTableEntriesMode::Thumb) {
+                std::fprintf(stderr,
+                    "%s[[jump_table]] entry %zu: %s requires an even base "
+                    "(ADD pc address + 4), aligned addr, stride = %u, "
+                    "nonempty nonwrapping count and entries_mode = \"thumb\"\n",
+                    kAbortHeader, i, fmt_s.c_str(), width);
+                return false;
+            }
+        }
         if (jt.format == JumpTableFormat::PcrelArm &&
             jt.entries_mode != JumpTableEntriesMode::Arm) {
             std::fprintf(stderr,
@@ -761,7 +781,7 @@ bool load_config(const std::string& path, Config& out) {
         out.program.aot_scan_start = static_cast<uint32_t>(aot_scan_start);
         out.program.aot_scan_end = static_cast<uint32_t>(aot_scan_end);
         out.program.static_resume_all =
-            t["static_resume_all"].value_or(false);
+            t["static_resume_all"].value_or(true);
         if ((out.program.aot_scan_start == 0) !=
             (out.program.aot_scan_end == 0) ||
             (out.program.aot_scan_start != 0 &&

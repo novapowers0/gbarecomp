@@ -6,8 +6,10 @@
 // before any recompiled cart code executes.
 
 #include "../armv4t/runtime_arm.h"
+#include "../armv4t/runtime_native_region.h"
 #include "../armv4t/runtime_context.h"
 #include "runtime_bus_bridge.h"
+#include "mobile_platform.h"
 #include "multiplayer_slice.h"
 #include "../armv4t/arm_ir.h"
 #include "../armv4t/symbol_lookup.h"
@@ -23,10 +25,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -39,6 +44,7 @@
 // need to inspect (0x08004286) lives inside a single runtime_dispatch,
 // so ordinary step granularity can't enter it. 0 disables (no overhead).
 extern "C" uint32_t g_runtime_break_pc = 0;
+extern "C" unsigned g_runtime_native_region_context = 1;
 
 // Count of PPU VBlank-start events (scanline 159->160), incremented
 // unconditionally in runtime_tick regardless of DISPSTAT IRQ-enable.
@@ -62,6 +68,9 @@ extern "C" unsigned long long g_runtime_vblank_starts = 0;
 // the env var is set. Dumped to stderr at exit.
 extern "C" unsigned long long g_prof_scanline_ns = 0;
 extern "C" unsigned long long g_prof_scanline_count = 0;
+#if defined(GBARECOMP_DETAILED_PHASE_PROFILE)
+static unsigned long long g_prof_device_ns[6]{}, g_prof_device_count[6]{};
+#endif
 // Native event service is deliberately separate from frame presentation and
 // guest input. It keeps a window responsive while one emulated frame spends a
 // long time in translated software-rendering or decode code.
@@ -87,12 +96,37 @@ static const bool g_phase_prof = [] {
                     ? static_cast<double>(g_prof_scanline_ns) /
                           static_cast<double>(g_prof_scanline_count)
                     : 0.0);
+#if defined(GBARECOMP_DETAILED_PHASE_PROFILE)
+            constexpr const char* names[]{"audio", "timers-and-fifo-dma", "serial", "ppu-tick", "hblank-dma", "vblank-latch-dma"};
+            for (unsigned i=0;i<6;++i)
+                std::fprintf(stderr,"[phase] %s: %llu ns over %llu calls\n",
+                    names[i],g_prof_device_ns[i],g_prof_device_count[i]);
+#endif
         });
     }
     return on;
 }();
+#if defined(GBARECOMP_DETAILED_PHASE_PROFILE)
+template<class Work> static auto profile_device(unsigned phase, Work work) {
+    if (!g_phase_prof) return work();
+    const auto start=std::chrono::steady_clock::now();
+    const auto record=[&] {
+        g_prof_device_ns[phase]+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-start).count();
+        ++g_prof_device_count[phase];
+    };
+    if constexpr (std::is_void_v<decltype(work())>) { work(); record(); }
+    else { auto result=work(); record(); return result; }
+}
+#define GBA_DEVICE_PHASE(index, expression) profile_device(index,[&] { return (expression); })
+#else
+#define GBA_DEVICE_PHASE(index, expression) (expression)
+#endif
 static unsigned long long g_runtime_yielded_vblank_start = 0;
 static bool g_session_execution = false;
+static const void* g_session_private_memory_owner = nullptr;
+static std::uint64_t g_session_private_memory_deadline = 0;
+static bool (*g_session_private_memory_owner_check)(const void*, const gba::GbaBus&) = nullptr;
 static bool g_session_instruction_started = false;
 static bool g_session_slice = false, g_session_slice_stopped = false;
 static std::uint64_t g_session_slice_deadline = 0;
@@ -264,6 +298,16 @@ void sync_bios_access() {
 
 void set_active_bus(gba::GbaBus* bus) {
     g_active_bus = bus;
+    g_runtime_ram_code_view = [](uint32_t address, uint32_t size) -> const uint8_t* {
+        return g_active_bus ? g_active_bus->native_code_view(address,size) : nullptr;
+    };
+#if defined(GBARECOMP_NATIVE_RAM_CODE_VIEWS)
+    g_runtime_native_ram_code_source = {
+        g_runtime_ram_code_view,
+        bus ? bus->ewram_ptr() : nullptr,
+        bus ? bus->iwram_ptr() : nullptr
+    };
+#endif
     if (bus) {
         bus->bind_wait_table(&g_runtime_waits);
     } else if (gba::GbaBus* owner = gba::GbaBus::wait_table_owner()) {
@@ -458,14 +502,36 @@ static inline uint32_t apply_bus_write_override(uint32_t addr, uint32_t width,
     return value;
 }
 
+// The native implementation replaces ordinary RAM transactions only. Keep
+// devices, observability, override ordering and idle-loop accounting shared.
+template<unsigned Width> static uint32_t read_memory(uint32_t addr) {
+    auto* bus = gbarecomp::g_active_bus;
+    if (!bus) return 0;
+#if defined(GBARECOMP_NATIVE_MEMORY)
+    uint32_t value;
+    if (bus->native_ram_read<Width>(addr, value)) return value;
+#endif
+    if constexpr (Width == 1) return bus->read8(addr);
+    if constexpr (Width == 2) return bus->read16(addr);
+    return bus->read32(addr);
+}
+template<unsigned Width> static void write_memory(uint32_t addr, uint32_t value) {
+    auto* bus = gbarecomp::g_active_bus;
+    if (!bus) return;
+#if defined(GBARECOMP_NATIVE_MEMORY)
+    if (bus->native_ram_write<Width>(addr, value)) return;
+#endif
+    if constexpr (Width == 1) bus->write8(addr, uint8_t(value));
+    else if constexpr (Width == 2) bus->write16(addr, uint16_t(value));
+    else bus->write32(addr, value);
+}
+
 extern "C" uint32_t bus_read_u32(uint32_t addr) {
     if (is_io_addr(addr)) runtime_mmio_catch_up();
     if (!is_idle_safe_read(addr)) ++g_idle_disturb_epoch;
     note_mmio_read(addr, 4u);
     gbarecomp::sync_bios_access();
-    uint32_t v = gbarecomp::g_active_bus
-        ? gbarecomp::g_active_bus->read32(addr)
-        : 0u;
+    uint32_t v = read_memory<4>(addr);
     v = apply_bus_read_override(addr, 4u, v);
     gbarecomp::trace_unmapped_read(addr, v, 4u);
     return v;
@@ -476,9 +542,7 @@ extern "C" uint16_t bus_read_u16(uint32_t addr) {
     if (!is_idle_safe_read(addr)) ++g_idle_disturb_epoch;
     note_mmio_read(addr, 2u);
     gbarecomp::sync_bios_access();
-    uint16_t v = gbarecomp::g_active_bus
-        ? gbarecomp::g_active_bus->read16(addr)
-        : uint16_t{0};
+    uint16_t v = static_cast<uint16_t>(read_memory<2>(addr));
     v = static_cast<uint16_t>(apply_bus_read_override(addr, 2u, v));
     gbarecomp::trace_unmapped_read(addr, v, 2u);
     return v;
@@ -489,9 +553,7 @@ extern "C" uint8_t bus_read_u8(uint32_t addr) {
     if (!is_idle_safe_read(addr)) ++g_idle_disturb_epoch;
     note_mmio_read(addr, 1u);
     gbarecomp::sync_bios_access();
-    uint8_t v = gbarecomp::g_active_bus
-        ? gbarecomp::g_active_bus->read8(addr)
-        : uint8_t{0};
+    uint8_t v = static_cast<uint8_t>(read_memory<1>(addr));
     v = static_cast<uint8_t>(apply_bus_read_override(addr, 1u, v));
     gbarecomp::trace_unmapped_read(addr, v, 1u);
     return v;
@@ -500,8 +562,8 @@ extern "C" uint8_t bus_read_u8(uint32_t addr) {
 extern "C" void bus_write_u32(uint32_t addr, uint32_t val) {
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
-    val = apply_bus_write_override(addr, 4u, val);
-    if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write32(addr, val);
+    val = static_cast<decltype(val)>(apply_bus_write_override(addr, 4u, val));
+    write_memory<4>(addr, val);
     ++g_idle_disturb_epoch;   // any guest write may change a watched poll value
     if (io) runtime_resync_horizon();
 }
@@ -509,8 +571,8 @@ extern "C" void bus_write_u32(uint32_t addr, uint32_t val) {
 extern "C" void bus_write_u16(uint32_t addr, uint16_t val) {
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
-    val = static_cast<uint16_t>(apply_bus_write_override(addr, 2u, val));
-    if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write16(addr, val);
+    val = static_cast<decltype(val)>(apply_bus_write_override(addr, 2u, val));
+    write_memory<2>(addr, val);
     ++g_idle_disturb_epoch;
     if (io) runtime_resync_horizon();
 }
@@ -518,8 +580,8 @@ extern "C" void bus_write_u16(uint32_t addr, uint16_t val) {
 extern "C" void bus_write_u8(uint32_t addr, uint8_t val) {
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
-    val = static_cast<uint8_t>(apply_bus_write_override(addr, 1u, val));
-    if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write8(addr, val);
+    val = static_cast<decltype(val)>(apply_bus_write_override(addr, 1u, val));
+    write_memory<1>(addr, val);
     ++g_idle_disturb_epoch;
     if (io) runtime_resync_horizon();
 }
@@ -571,7 +633,7 @@ static void tick_devices(gba::GbaBus* bus, gba::GbaPpu* ppu, uint32_t cycles) {
     uint32_t remaining = cycles;
     while (remaining != 0) {
         uint32_t chunk = remaining;
-        uint32_t until_sample = bus->audio().cycles_until_next_sample();
+        uint32_t until_sample = bus->audio().cycles_until_next_shared_event();
         uint32_t until_timer = bus->io().cycles_until_next_timer_event();
         uint32_t until_sio = bus->io().cycles_until_next_sio_event();
         uint32_t until_ppu = ppu->cycles_until_next_event();
@@ -581,13 +643,13 @@ static void tick_devices(gba::GbaBus* bus, gba::GbaPpu* ppu, uint32_t cycles) {
         if (until_ppu < chunk) chunk = until_ppu;
         if (chunk == 0) chunk = 1;
 
-        bus->audio().tick(chunk);
-        bus->io().tick_timers(chunk);
-        bus->io().tick_sio(chunk);
+        GBA_DEVICE_PHASE(0,bus->audio().tick(chunk));
+        GBA_DEVICE_PHASE(1,bus->io().tick_timers(chunk));
+        GBA_DEVICE_PHASE(2,bus->io().tick_sio(chunk));
 
         uint16_t vc_compare = static_cast<uint16_t>(
             (bus->io().dispstat() >> 8) & 0xFFu);
-        auto events = ppu->tick(chunk, vc_compare);
+        auto events = GBA_DEVICE_PHASE(3,ppu->tick(chunk, vc_compare));
         uint16_t ds = bus->io().dispstat();
         if (events.hblank_started &&
             ppu->vcount() < gba::GbaPpu::kLinesVisible) {
@@ -596,9 +658,13 @@ static void tick_devices(gba::GbaBus* bus, gba::GbaPpu* ppu, uint32_t cycles) {
             ppu->render_scanline(ppu->vcount(),
                                  bus->io().read16(0x000),
                                  bus->io().raw(),
-                                 bus->vram_ptr(),
+                                 bus->vram_read_view().data(),
                                  bus->oam_ptr(),
-                                 bus->pal_ptr());
+                                 bus->pal_ptr()
+#if defined(GBARECOMP_NATIVE_DRAW_JOBS)
+                                 , bus->draw_memory_supported() ? bus->draw_memory() : nullptr
+#endif
+                                 );
             if (g_phase_prof) {
                 g_prof_scanline_ns += static_cast<unsigned long long>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -611,12 +677,12 @@ static void tick_devices(gba::GbaBus* bus, gba::GbaPpu* ppu, uint32_t cycles) {
             // the DMA at HBlank N loads the register used by line N+1). This is
             // what walks the per-scanline WIN0H circle table for the transition
             // iris (MC-HP-003).
-            bus->io().run_timed_dma(2);
+            GBA_DEVICE_PHASE(4,bus->io().run_timed_dma(2));
         }
         if (events.vblank_started) {
-            ppu->mark_framebuffer_latched();
+            GBA_DEVICE_PHASE(5,ppu->mark_framebuffer_latched());
             ++g_runtime_vblank_starts;
-            bus->io().run_timed_dma(1);   // VBlank-timed DMA
+            GBA_DEVICE_PHASE(5,bus->io().run_timed_dma(1));   // VBlank-timed DMA
             if (!g_session_execution && g_vblank_input_hook) g_vblank_input_hook();
         }
         if (!g_session_execution && events.frame_completed && g_frame_start_hook) {
@@ -671,7 +737,7 @@ static long long          g_event_budget   = 0;
 static inline void recompute_event_budget(gba::GbaBus* bus, gba::GbaPpu* ppu) {
     uint32_t h  = ppu->cycles_until_next_event();
     uint32_t ut = bus->io().cycles_until_next_timer_event();
-    uint32_t us = bus->audio().cycles_until_next_sample();
+    uint32_t us = bus->audio().cycles_until_next_shared_event();
     uint32_t usio = bus->io().cycles_until_next_sio_event();
     if (ut < h) h = ut;
     if (us < h) h = us;
@@ -744,6 +810,19 @@ extern "C" void runtime_resync_horizon(void) {
     recompute_event_budget(bus, ppu);
 }
 
+static uint32_t g_service_tick_divider = 0;
+static void account_host_service_instructions(uint32_t count) {
+    const uint32_t previous = g_service_tick_divider;
+    g_service_tick_divider += count;
+    if (!g_host_service_hook || (previous & 0x3fffu) + count < 0x4000u) return;
+    static auto last_service = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_service >= std::chrono::milliseconds(8)) {
+        g_host_service_hook();
+        last_service = now;
+    }
+}
+
 extern "C" void runtime_tick(uint32_t cycles) {
     if (g_session_execution) { g_runtime_cycles += cycles; return; }
     // P6 shadow-tick: a healed shard's validation re-run only accumulates its
@@ -759,17 +838,7 @@ extern "C" void runtime_tick(uint32_t cycles) {
     // reaching a GBA frame boundary. Downsample the wall-clock check so native
     // window messages keep flowing without putting a clock read on every guest
     // instruction.
-    if (g_host_service_hook) {
-        static uint32_t service_tick_divider = 0;
-        if ((++service_tick_divider & 0x3FFFu) == 0) {
-            static auto last_service = std::chrono::steady_clock::now();
-            const auto now = std::chrono::steady_clock::now();
-            if (now - last_service >= std::chrono::milliseconds(8)) {
-                g_host_service_hook();
-                last_service = now;
-            }
-        }
-    }
+    if (g_host_service_hook) account_host_service_instructions(1);
 
     cyc_probe("tick", cycles);
     g_runtime_cycles += cycles;
@@ -968,6 +1037,14 @@ std::function<bool()> g_frame_present_hook;
 // unwind (return true) so the guest's whole host call stack pops back to the
 // runner — one return only frees one frame. Cleared when a hook is (re)set.
 bool g_frame_present_quit = false;
+// One-shot (non-sticky) unwind requested from inside the hook: the guest pops
+// back to the runner once and the runner redispatches the published PC.
+// Diagnostic replay playback uses it after restoring its first checkpoint so
+// the restored machine never resumes inside an unrelated host call chain.
+bool g_frame_present_unwind = false;
+// True only while the present hook runs: an unwind request made anywhere else
+// (the runner loop, where the guest is already unwound) has nothing to do.
+bool g_in_frame_present_hook = false;
 
 // Present-in-place deliberately preserves the generated host call chain across
 // frames, but some guest script engines keep a call active for thousands of
@@ -990,9 +1067,46 @@ uint32_t present_in_place_call_depth_limit() {
     return limit;
 }
 
+// Present-in-place keeps the host call chain alive across frames, and the
+// guest call-return depth above does not bound it: non-returning indirect
+// transfers (BX/LDR PC chains through runtime_dispatch) nest host frames that
+// never appear on the guest call stack. Measure the real host stack instead
+// and unwind at a completed VBlank once it passes this budget. The runner
+// redispatches the published PC, so guest execution is unchanged.
+constexpr std::size_t kPresentInPlaceStackBudget = 1024u * 1024u;
+std::uintptr_t g_present_stack_base = 0;
+
+std::size_t present_in_place_stack_budget() {
+    static const std::size_t budget = [] {
+        const char* value = std::getenv("GBARECOMP_PRESENT_IN_PLACE_STACK_KB");
+        if (!value || value[0] == '\0') return kPresentInPlaceStackBudget;
+        const unsigned long kb = std::strtoul(value, nullptr, 0);
+        return kb >= 64u && kb <= 64u * 1024u ? static_cast<std::size_t>(kb) * 1024u
+                                              : kPresentInPlaceStackBudget;
+    }();
+    return budget;
+}
+
+std::size_t present_in_place_stack_used() {
+    if (!g_present_stack_base) return 0;
+    volatile char here = 0;
+    const auto at = reinterpret_cast<std::uintptr_t>(&here);
+    return g_present_stack_base > at ? g_present_stack_base - at : 0;
+}
+
+void runtime_mark_present_stack_base() {
+    volatile char here = 0;
+    g_present_stack_base = reinterpret_cast<std::uintptr_t>(&here);
+}
+
 void runtime_set_frame_present_hook(std::function<bool()> h) {
     g_frame_present_hook = std::move(h);
     g_frame_present_quit = false;
+    g_frame_present_unwind = false;
+}
+
+void runtime_request_present_unwind() {
+    if (g_in_frame_present_hook) g_frame_present_unwind = true;
 }
 
 void runtime_set_host_service_hook(std::function<void()> h) {
@@ -1008,6 +1122,34 @@ void runtime_set_vblank_input_hook(std::function<void()> h) {
 }
 
 extern "C" bool runtime_should_yield(void) {
+    // Host-stack budget guard: branch/dispatch chains that fail to unwind
+    // (e.g. a busy-wait split across generated functions whose wake flag
+    // never arrives) nest host frames without bound on finite-stack threads
+    // (mobile game thread; desktop TCP game thread — armed via
+    // host_stack_guard_arm_current). Unwind at the same instruction-boundary
+    // protocol as the vblank yield, gated the same way (never inside a live
+    // IRQ handler, whose dispatch must complete), before the stack is
+    // exhausted. Inert while no budget is armed.
+    if constexpr (gbarecomp::host_stack_guard_supported()) {
+        char probe;
+        const bool in_handler = g_irq_nest_depth != 0u;
+        const bool fire =
+            (in_handler ? gbarecomp::host_stack_critically_low(&probe)
+                        : gbarecomp::mobile_stack_over_budget(&probe));
+        if (fire) {
+            static unsigned long long guard_unwinds = 0;
+            ++guard_unwinds;
+            if (guard_unwinds <= 4u ||
+                (guard_unwinds & (guard_unwinds - 1u)) == 0u) {
+                std::fprintf(stderr,
+                    "runtime: host-stack guard unwind count=%llu pc=0x%08X"
+                    "%s\n",
+                    guard_unwinds, g_cpu.R[15],
+                    in_handler ? " (nested)" : "");
+            }
+            return true;
+        }
+    }
     if (g_session_execution) {
         if (gbarecomp::runtime_dispatch_suspended()) return true;
         auto* bus = gbarecomp::g_active_bus;
@@ -1080,9 +1222,15 @@ extern "C" bool runtime_should_yield(void) {
             // dispatch-miss. Only unwind (return true) when the hook asks to
             // quit. With no hook (headless/TCP), keep the original unwind path.
             if (g_frame_present_hook) {
+                g_in_frame_present_hook = true;
                 bool quit = g_frame_present_hook();
+                g_in_frame_present_hook = false;
                 if (quit) {
                     g_frame_present_quit = true;  // sticky: full unwind
+                    return true;
+                }
+                if (g_frame_present_unwind) {
+                    g_frame_present_unwind = false;
                     return true;
                 }
                 const uint32_t call_depth = runtime_call_stack_depth();
@@ -1099,6 +1247,20 @@ extern "C" bool runtime_should_yield(void) {
                             "depth=%u limit=%u count=%llu pc=0x%08X\n",
                             call_depth, call_depth_limit, forced_unwinds,
                             g_cpu.R[15]);
+                    }
+                    return true;
+                }
+                const std::size_t stack_used = present_in_place_stack_used();
+                if (stack_used >= present_in_place_stack_budget()) {
+                    static unsigned long long stack_unwinds = 0;
+                    ++stack_unwinds;
+                    if ((stack_unwinds & (stack_unwinds - 1u)) == 0u) {
+                        std::fprintf(stderr,
+                            "runtime: present-in-place host-stack unwind "
+                            "used=%zu budget=%zu guest_depth=%u count=%llu "
+                            "pc=0x%08X\n",
+                            stack_used, present_in_place_stack_budget(),
+                            call_depth, stack_unwinds, g_cpu.R[15]);
                     }
                     return true;
                 }
@@ -1151,6 +1313,18 @@ extern "C" bool runtime_should_yield(void) {
     }
 
     if (g_runtime_break_pc != 0u && g_cpu.R[15] == g_runtime_break_pc) {
+        // Debug breakpoint hit — unwind to the exec loop. Env-gated forensic
+        // hook: dump the instruction ring at the park. The last record is
+        // the instruction that TRANSFERRED to the break pc (with its full
+        // register set), so a breakpoint-caught anomaly is recoverable on
+        // surfaces without an fp_save command (e.g. --tcp-observe).
+        const char* fp = std::getenv("GBARECOMP_BREAK_FP");
+        if (fp != nullptr && *fp != '\0') {
+            const std::uint32_t n = runtime_fp_save_file(fp);
+            std::fprintf(stderr,
+                "runtime_break: pc=0x%08X — instruction ring dumped to %s "
+                "(%u records)\n", g_cpu.R[15], fp, n);
+        }
         return true;  // debug breakpoint hit — unwind to the exec loop
     }
     return halted;
@@ -1163,6 +1337,16 @@ void runtime_capture_timing_context(RuntimeTimingContext& out) {
     out.yielded_vblank = g_runtime_yielded_vblank_start;
     out.pending_cycles = g_pending_cycles;
     out.event_budget = g_event_budget;
+}
+bool native_service_window_allowed() {
+    return !g_session_execution && !g_runtime_shadow_tick;
+}
+void runtime_restore_timing_values(const RuntimeTimingContext& in) {
+    g_runtime_cycles = in.cycles;
+    g_runtime_vblank_starts = in.vblank_starts;
+    g_runtime_yielded_vblank_start = in.yielded_vblank;
+    g_pending_cycles = in.pending_cycles;
+    g_event_budget = in.event_budget;
 }
 void runtime_restore_timing_context(const RuntimeTimingContext& in) {
     g_runtime_cycles = in.cycles;
@@ -1179,9 +1363,13 @@ void runtime_restore_timing_context(const RuntimeTimingContext& in) {
     ++g_runtime_state_epoch;
 }
 void runtime_session_execution(bool enabled) {
+    g_runtime_native_region_context=enabled?0u:1u;
     g_session_execution = enabled;
     g_session_instruction_started = false;
     g_session_slice = false;
+    g_session_private_memory_owner = nullptr;
+    g_session_private_memory_deadline = 0;
+    g_session_private_memory_owner_check = nullptr;
 }
 void runtime_session_begin_instruction() {
     g_session_instruction_started = false; g_session_slice = false;
@@ -1203,7 +1391,192 @@ void runtime_session_ram_dispatch_boundary(std::uint32_t pc) {
     // classifier. Its generated body runs through the reference safe points.
     g_session_slice=false;
 }
+void runtime_session_private_memory_owner(const void* owner, std::uint64_t deadline,
+    bool (*check)(const void*, const gba::GbaBus&)) {
+    g_session_private_memory_owner = owner;
+    g_session_private_memory_deadline = deadline;
+    g_session_private_memory_owner_check = check;
+}
+bool runtime_session_private_memory_begin(RuntimeNativeRegion& region, std::uint32_t cycles) {
+#if defined(GBA_COSIM)
+    return false;
+#else
+    auto* bus = active_bus();
+    auto* ppu = active_ppu();
+    if (!g_session_execution || !g_session_private_memory_owner_check ||
+        g_session_instruction_started || !bus || !ppu ||
+        !g_session_private_memory_owner_check(g_session_private_memory_owner, *bus) ||
+        !cycles || cycles > 65536 || !(g_cpu.cpsr & CPSR_I_BIT) ||
+        g_runtime_cycles > g_session_private_memory_deadline ||
+        cycles > g_session_private_memory_deadline - g_runtime_cycles ||
+        g_runtime_shadow_tick || g_force_interp || g_runtime_force_interp_step_active ||
+        g_runtime_force_interp_hook || g_runtime_fn_entry_hook || g_runtime_insn_trace ||
+        g_runtime_trace_enabled || g_runtime_break_pc || g_runtime_bus_read_override ||
+        g_runtime_bus_write_override ||
+        g_runtime_thumb_alu_imm_override ||
+        gba::g_rom_read16_override || gba::g_rom_read32_override ||
+        bus->has_write_observer() || bus->matrix().active() || bus->io().halted() ||
+        bus->io().pending_dma_steal_cycles() ||
+        gbarecomp::g_sampling.load(std::memory_order_relaxed)) return false;
+    // Neither PPU DMA nor timer/FIFO DMA may observe an intermediate RAM
+    // publication. Audio's intervening sample events consume only its owned
+    // FIFO state. Serial completion changes device registers/IF, not RAM, and
+    // cannot enter a guest handler while CPSR.I remains set.
+    if (cycles >= ppu->cycles_until_next_event() ||
+        cycles >= bus->io().cycles_until_next_timer_event()) return false;
+    region.owner_bus = bus;
+    region.start_cycles = g_runtime_cycles;
+    region.bound = cycles;
+    return true;
+#endif
+}
+void runtime_session_private_memory_end(RuntimeNativeRegion& region) {
+    auto* bus = active_bus();
+    if (!g_session_execution || !bus || region.owner_bus != bus ||
+        region.start_cycles != g_runtime_cycles || region.cycles != region.bound ||
+        g_runtime_cycles > g_session_private_memory_deadline ||
+        region.cycles > g_session_private_memory_deadline - g_runtime_cycles ||
+        !(g_cpu.cpsr & CPSR_I_BIT) || !(region.cpu.cpsr & CPSR_I_BIT)) {
+        std::fprintf(stderr, "runtime: invalid private-memory settlement\n");
+        std::abort();
+    }
+    std::copy_n(region.cpu.R, 16, g_cpu.R);
+    g_cpu.cpsr = region.cpu.cpsr;
+    g_runtime_waits = region.waits;
+    g_idle_disturb_epoch += region.writes;
+    if (region.had_read) {
+        bus->set_bios_access_enabled(false);
+        bus->note_pc(region.last_read_pc, (g_cpu.cpsr & CPSR_T_BIT) != 0);
+    }
+    region.owner_bus = nullptr;
+    g_session_instruction_started = true;
+    g_session_slice_stopped = true;
+    runtime_tick(region.cycles);
+}
 void runtime_session_tick_devices(std::uint32_t cycles) {
     if (g_active_bus && g_active_ppu) tick_devices(g_active_bus, g_active_ppu, cycles);
 }
+bool runtime_session_tick_owned_devices(gba::GbaBus& bus, gba::GbaPpu& ppu,
+    RuntimeTimingContext& timing, std::uint32_t pc, std::uint32_t cycles) {
+#if defined(GBA_COSIM)
+    return false;
+#else
+    // All raster/provider callbacks retain their complete legacy execution
+    // window. DMA observers and cartridge hooks may also inspect guest CPU
+    // state; ordinary hardware audio/timers/SIO operate on their owned devices.
+    if (!g_session_execution || !cycles || cycles >= ppu.cycles_until_next_event() ||
+        bus.has_write_observer() || gba::g_rom_read16_override ||
+        gba::g_rom_read32_override || g_runtime_shadow_tick)
+        return false;
+    set_active_bus(&bus); set_active_ppu(&ppu);
+    runtime_restore_timing_context(timing);
+    // GbaIo records DMA/IRQ diagnostics through runtime_current_pc(). No
+    // instruction/continuation executes in this interval. Restore even when
+    // device advancement throws, leaving the last bound ARM window intact.
+    struct DiagnosticPcScope {
+        std::uint32_t previous = g_cpu.R[15];
+        explicit DiagnosticPcScope(std::uint32_t value) { g_cpu.R[15] = value; }
+        ~DiagnosticPcScope() { g_cpu.R[15] = previous; }
+    } diagnostic_pc(pc);
+    tick_devices(&bus, &ppu, cycles);
+    runtime_capture_timing_context(timing);
+    return true;
+#endif
+}
 } // namespace gbarecomp
+
+#if defined(GBARECOMP_NATIVE_REGIONS)
+namespace {
+uint64_t g_native_region_trials=0, g_native_region_accepted=0, g_native_region_instructions=0;
+struct NativeRegionReport {
+    ~NativeRegionReport() {
+        if(g_native_region_trials) std::fprintf(stderr,
+            "native_regions trials=%llu accepted=%llu instructions=%llu\n",
+            static_cast<unsigned long long>(g_native_region_trials),
+            static_cast<unsigned long long>(g_native_region_accepted),
+            static_cast<unsigned long long>(g_native_region_instructions));
+    }
+} g_native_region_report;
+}
+#endif
+
+extern "C" uint64_t runtime_native_region_instruction_count() {
+#if defined(GBARECOMP_NATIVE_REGIONS)
+    return g_native_region_instructions;
+#else
+    return 0;
+#endif
+}
+
+extern "C" bool runtime_native_region_begin(RuntimeNativeRegion* region,
+    uint32_t count, uint32_t pc, uint32_t thumb) {
+#if !defined(GBARECOMP_NATIVE_REGIONS) || defined(GBA_COSIM)
+    (void)region; (void)count; (void)pc; (void)thumb;
+    return false;
+#else
+    ++g_native_region_trials;
+    auto* bus=gbarecomp::active_bus();
+    auto* ppu=gbarecomp::active_ppu();
+    if(!region || !bus || !ppu || count==0 || count>64 ||
+       g_session_execution || g_runtime_shadow_tick || g_force_interp ||
+       g_runtime_force_interp_step_active || g_runtime_force_interp_hook ||
+       g_runtime_insn_trace || g_runtime_trace_enabled || g_runtime_break_pc ||
+       g_runtime_bus_read_override || g_runtime_bus_write_override ||
+       gba::g_rom_read16_override || gba::g_rom_read32_override ||
+       bus->has_write_observer() || bus->io().halted() ||
+       bus->io().pending_dma_steal_cycles() || bus->matrix().active() ||
+       gbarecomp::g_sampling.load(std::memory_order_relaxed)) return false;
+    static const bool cycle_probe=std::getenv("GBARECOMP_CYC_HI")!=nullptr;
+    if(cycle_probe) return false;
+    const uint32_t code_region=pc>>24;
+    const uint32_t bytes=count*(thumb?2u:4u);
+    const uint32_t offset=pc&0x01ffffffu;
+    if(code_region<8 || code_region>13 || thumb>1 || (pc&(thumb?1u:3u)) || g_cpu.R[15]!=pc ||
+       bool(g_cpu.cpsr&CPSR_T_BIT)!=bool(thumb) ||
+       ((pc+bytes-1)>>24)!=code_region || offset>bus->rom_size() ||
+       bytes>bus->rom_size()-offset || (offset<0xccu && offset+bytes>0xc0u) ||
+       (!(g_cpu.cpsr&CPSR_I_BIT) && bus->io().irq_pending())) return false;
+    if(runtime_should_yield()) return false;
+    // Eligible instructions have no multiply, block transfer, branch or PC
+    // write. Eight cycles cover fixed/internal/shift costs; a positive
+    // prefetch adjustment cannot exceed the active sequential halfword wait.
+    const uint32_t bound=runtime_native_region_bound(g_runtime_waits,count,pc);
+    if(g_event_budget<=bound) return false;
+    region->cpu.cpsr=g_cpu.cpsr;
+    std::copy_n(g_cpu.R,16,region->cpu.R);
+    region->waits=g_runtime_waits;
+    region->ewram=bus->ewram_ptr();region->iwram=bus->iwram_ptr();
+    region->rom=bus->rom_ptr();region->rom_bytes=static_cast<uint32_t>(bus->rom_size());
+    region->cycles=region->writes=region->instructions=region->last_read_pc=0;
+    region->had_read=false;region->bound=bound;
+    region->owner_bus=bus;region->start_cycles=g_runtime_cycles;
+    ++g_native_region_accepted;
+    return true;
+#endif
+}
+
+extern "C" void runtime_native_region_end(RuntimeNativeRegion* region) {
+    auto* bus=gbarecomp::active_bus();
+    if(!region || region->owner_bus!=bus || !bus ||
+       region->start_cycles!=g_runtime_cycles || region->cycles>region->bound ||
+       g_event_budget<=region->cycles) {
+        std::fprintf(stderr,"runtime: invalid native-region settlement\n");
+        std::abort();
+    }
+    std::copy_n(region->cpu.R,16,g_cpu.R);
+    g_cpu.cpsr=region->cpu.cpsr;
+    g_runtime_waits=region->waits;
+    g_idle_disturb_epoch+=region->writes;
+    if(region->had_read) {
+        bus->set_bios_access_enabled(false);
+        bus->note_pc(region->last_read_pc,(g_cpu.cpsr&CPSR_T_BIT)!=0);
+    }
+    const uint32_t instructions=region->instructions;
+#if defined(GBARECOMP_NATIVE_REGIONS)
+    g_native_region_instructions+=instructions;
+#endif
+    region->owner_bus=nullptr;
+    runtime_tick(region->cycles);
+    if(g_host_service_hook && instructions>1)
+        account_host_service_instructions(instructions-1);
+}

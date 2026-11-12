@@ -1,12 +1,15 @@
 # Roadmap
 
+This records the original bring-up sequence. Historical gates and no-HLE
+milestones below are not current implementation-selection rules; use
+[PRINCIPLES.md](../PRINCIPLES.md) and [HLE.md](../HLE.md) for current policy.
+
 Phases are intentionally narrow. Each one must be **measurably**
 done before the next is started. "Looks like it boots" is not a
 phase-completion criterion.
 
 The roadmap pivoted in Phase 1 to make **BIOS execution** first-class
-rather than a Phase-3 sub-bullet (see `PRINCIPLES.md` "BIOS is
-sacred"). The current ordering reflects that:
+rather than a Phase-3 sub-bullet. The historical ordering reflects that:
 
 - Phase 0: scaffold + repo skeleton
 - Phase 1: ARM7TDMI / ARMv4T decoder + IR + interpreter
@@ -37,7 +40,7 @@ sacred"). The current ordering reflects that:
 - [x] Project rule docs: `CLAUDE.md`, `PRINCIPLES.md`, `DEBUG.md`,
       `TCP.md`.
 - [x] Architecture / reference / debugging / roadmap docs.
-- [x] No-stubs / no-HLE policy written down.
+- [x] No-stubs and maintained-LLE/HLE caller-contract policy documented in `HLE.md`.
 - [x] Reference inventory written down.
 
 ---

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -592,7 +593,7 @@ void cmd_state_hash(const TcpDebugServer::Context& ctx, std::string& out) {
     };
     uint64_t iw = fnv(ctx.bus->iwram_ptr(), 32 * 1024);
     uint64_t ew = fnv(ctx.bus->ewram_ptr(), 256 * 1024);
-    uint64_t vr = fnv(ctx.bus->vram_ptr(), 96 * 1024);
+    uint64_t vr = fnv(ctx.bus->vram_read_view().data(), 96 * 1024);
     uint64_t pa = fnv(ctx.bus->pal_ptr(), 1024);
     uint64_t oa = fnv(ctx.bus->oam_ptr(), 1024);
     unsigned long long cyc = g_runtime_cycles;
@@ -790,12 +791,57 @@ void dispatch(const TcpDebugServer::Context& ctx, std::string_view req,
     }
     if (contains("\"read_vram\"")) {
         if (!ctx.bus) { emit_error(out, "bus unavailable"); return; }
-        cmd_read_region(ctx.bus->vram_ptr(), 96 * 1024, req, out, 0x06000000u);
+        cmd_read_region(ctx.bus->vram_read_view().data(), 96 * 1024, req, out, 0x06000000u);
         return;
     }
     if (contains("\"read_iwram\"")) {
         if (!ctx.bus) { emit_error(out, "bus unavailable"); return; }
         cmd_read_region(ctx.bus->iwram_ptr(), 32 * 1024, req, out, 0x03000000u);
+        return;
+    }
+    if (contains("\"read_rom\"")) {
+        if (!ctx.bus || !ctx.bus->rom_ptr() || !ctx.bus->rom_size()) {
+            emit_error(out, "ROM unavailable"); return;
+        }
+        // Immutable backing bytes: inspection must not alter waitstates,
+        // prefetch state or cartridge-device readback.
+        cmd_read_region(ctx.bus->rom_ptr(), ctx.bus->rom_size(), req, out, 0x08000000u);
+        return;
+    }
+    // Debug/validation poke: {"cmd":"write_mem","addr":A,"hex":"0a0b.."}
+    // writes raw bytes into EWRAM/IWRAM/palette/VRAM/OAM backing memory (no
+    // bus side effects). For cheat-assisted coverage runs, never gameplay.
+    if (contains("\"write_mem\"")) {
+        if (!ctx.bus) { emit_error(out, "bus unavailable"); return; }
+        uint64_t addr = 0;
+        std::string hex;
+        if (!extract_uint(req, "\"addr\"", addr) || !extract_string(req, "\"hex\"", hex) ||
+            hex.empty() || (hex.size() & 1u)) {
+            emit_error(out, "missing addr/hex");
+            return;
+        }
+        struct Region { uint32_t base; uint8_t* ptr; std::size_t size; };
+        const Region regions[] = {
+            {0x02000000u, ctx.bus->ewram_ptr(), 256u * 1024u},
+            {0x03000000u, ctx.bus->iwram_ptr(), 32u * 1024u},
+            {0x05000000u, ctx.bus->pal_ptr(), 1024u},
+            {0x06000000u, ctx.bus->vram_ptr(), 96u * 1024u},
+            {0x07000000u, ctx.bus->oam_ptr(), 1024u},
+        };
+        const std::size_t len = hex.size() / 2;
+        for (const Region& r : regions) {
+            if (addr < r.base || addr + len > r.base + r.size) continue;
+            for (std::size_t i = 0; i < len; ++i) {
+                const unsigned long v = std::strtoul(hex.substr(i * 2, 2).c_str(), nullptr, 16);
+                r.ptr[addr - r.base + i] = static_cast<uint8_t>(v);
+            }
+            char ok[96];
+            std::snprintf(ok, sizeof(ok), "{\"ok\":true,\"addr\":%llu,\"len\":%zu}",
+                          static_cast<unsigned long long>(addr), len);
+            out = ok;
+            return;
+        }
+        emit_error(out, "address range is not RAM/palette/VRAM/OAM");
         return;
     }
     if (contains("\"read_ewram\"")) {
@@ -968,7 +1014,8 @@ void dispatch(const TcpDebugServer::Context& ctx, std::string_view req,
         out = body;
         return;
     }
-    if (contains("\"screenshot\"")) {
+    const bool presentation_shot = contains("\"presentation_screenshot\"");
+    if (presentation_shot || contains("\"screenshot\"")) {
         if (!ctx.bus || !ctx.ppu) { emit_error(out, "ppu unavailable"); return; }
         const uint8_t* rgb = nullptr;
         std::vector<uint8_t> live;
@@ -979,16 +1026,31 @@ void dispatch(const TcpDebugServer::Context& ctx, std::string_view req,
             ctx.ppu->render(live.data(),
                             ctx.bus->io().read16(0x000),
                             ctx.bus->io().raw(),
-                            ctx.bus->vram_ptr(),
+                            ctx.bus->vram_read_view().data(),
                             ctx.bus->oam_ptr(),
                             ctx.bus->pal_ptr());
             rgb = live.data();
         }
+        unsigned width = ctx.ppu->render_width(), height = ctx.ppu->render_height();
+        if (presentation_shot && ctx.ppu->high_resolution_framebuffer()) {
+            rgb = ctx.ppu->high_resolution_framebuffer();
+            width = ctx.ppu->high_resolution()->width();
+            height = ctx.ppu->high_resolution()->height();
+        }
+        // Ordinary screenshots remain native for existing accuracy tooling.
+        // The explicit presentation command inspects the completed host raster.
         // Dimensions track the active view (240x160 faithful, wider when
         // view-area expansion is on) so oracle tooling sees the real frame.
-        out = "{\"ok\":true,\"w\":" + std::to_string(ctx.ppu->render_width()) +
-              ",\"h\":" + std::to_string(ctx.ppu->render_height()) + ",\"data\":";
-        json_emit_hex(out, rgb, ctx.ppu->render_bytes());
+        out = "{\"ok\":true,\"w\":" + std::to_string(width) +
+              ",\"h\":" + std::to_string(height);
+        if (presentation_shot) {
+            const auto* hd = ctx.ppu->high_resolution();
+            out += ",\"scale\":" + std::to_string(ctx.ppu->internal_resolution()) +
+                ",\"affine_lines\":" + std::to_string(hd ? hd->affine_lines() : 0) +
+                ",\"samples\":" + std::to_string(hd ? hd->samples() : 0);
+        }
+        out += ",\"data\":";
+        json_emit_hex(out, rgb, size_t(width) * height * 3);
         out += "}";
         return;
     }

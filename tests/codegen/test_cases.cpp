@@ -33,12 +33,19 @@ const TestMemInit mem_word_at_1000_dead[] = {
     {0x1000u, 0xDEADBEEFu},
 };
 
+const TestMemInit mem_runtime_literal[] = {{0x03007D44u,0x12345678u}};
+
 const TestMemInit mem_word_at_1004_cafe[] = {
     {0x1004u, 0xCAFEF00Du},
 };
 
 const TestMemInit mem_word_at_010C[] = {
     {0x010Cu, 0x12345678u},  // ARM LDR r0,[pc,#4] @ pc=0x100 → ea = pc+8+4 = 0x10C
+};
+
+const TestMemInit mem_thumb_switch_entries[] = {
+    {0x2000u, 0x18110A03u},  // unsigned byte offsets, LoG I's first four cases
+    {0x2004u, 0x80010102u},  // unsigned halfwords; both exceed one byte
 };
 
 const TestMemInit mem_hword_neg_at_3000[] = {
@@ -76,6 +83,58 @@ const TestMemInit mem_swp_init[] = {
 #define MODE_FIQ    0x11u
 
 const TestCase kTestCases[] = {
+    {"runtime_pc_ram_reviewed_imm",true,0x03007D3Eu,0x2005u,
+     {},MODE_SYSTEM|(1u<<5),nullptr,0,true,0,0,true},
+    {"runtime_pc_cart_reviewed_imm",true,0x0800103Eu,0x2005u,
+     {},MODE_SYSTEM|(1u<<5),nullptr,0,true,0,0,true},
+    {"runtime_pc_cart_thumb_adr",true,0x0800103Eu,0xA001u,
+     {},MODE_SYSTEM|(1u<<5),nullptr,0,true,0,0,true},
+    {"runtime_pc_cart_arm_operand",false,0x0800103Cu,0xE1A0000Fu,
+     {},MODE_SYSTEM,nullptr,0,true,0,0,true},
+    {"runtime_pc_cart_arm_store_pc",false,0x0800103Cu,0xE580F000u,
+     {0x2000u},MODE_SYSTEM,nullptr,0,true,0,0,true},
+    {"runtime_pc_cart_arm_ldm",false,0x0800103Cu,0xE8B00006u,
+     {0x2000u},MODE_SYSTEM,mem_block_ldm_pattern,4,true,0,0,true},
+    {"runtime_pc_cart_arm_swp",false,0x0800103Cu,0xE1001092u,
+     {0x3000u,0,0x1234u},MODE_SYSTEM,mem_swp_init,1,true,0,0,true},
+    {"runtime_pc_cart_arm_mul",false,0x0800103Cu,0xE0000190u,
+     {3,0x80000000u},MODE_SYSTEM,nullptr,0,true,0,0,true},
+    {"runtime_pc_cart_mirror_arm_operand",false,0x0A00103Cu,0xE1A0000Fu,
+     {},MODE_SYSTEM,nullptr,0,true,0,0,true},
+    {"runtime_pc_cart_mirror_arm_load",false,0x0C00103Cu,0xE5901000u,
+     {0x2000u},MODE_SYSTEM,mem_word_at_2000_target,1,true,0,0,true},
+    {"runtime_pc_cart_arm_branch",false,0x0800103Cu,0xEA000000u,
+     {},MODE_SYSTEM,nullptr,0,true,0,0,true},
+    {"runtime_pc_thumb_adr_unaligned",true,0x03007D3Eu,0xA001u,
+     {},MODE_SYSTEM|(1u<<5),nullptr,0,true,0x03000000u,0x8000u,true},
+    {"runtime_pc_thumb_literal_unaligned",true,0x03007D3Eu,0x4801u,
+     {},MODE_SYSTEM|(1u<<5),mem_runtime_literal,1,true,0x03000000u,0x8000u,true},
+    {"runtime_pc_arm_operand",false,0x03007D3Cu,0xE1A0000Fu,
+     {},MODE_SYSTEM,nullptr,0,true,0x03000000u,0x8000u,true},
+    {"runtime_pc_arm_store_pc",false,0x03007D3Cu,0xE580F000u,
+     {0x03001000u},MODE_SYSTEM,nullptr,0,true,0x03000000u,0x8000u,true},
+    {"runtime_pc_arm_stm_pc",false,0x03007D3Cu,0xE8A08000u,
+     {0x03001000u},MODE_SYSTEM,nullptr,0,true,0x03000000u,0x8000u,true},
+    {"runtime_pc_arm_register_shift_pc",false,0x03007D3Cu,0xE1A0111Fu,
+     {0,1},MODE_SYSTEM,nullptr,0,true,0x03000000u,0x8000u,true},
+    {"runtime_pc_data_immediate_stays_literal",false,0x03007D3Cu,0xE3A00403u,
+     {},MODE_SYSTEM,nullptr,0,true,0x03000000u,0x8000u,true},
+    {"runtime_pc_arm_branch",false,0x03007D3Cu,0xEA000000u,
+     {},MODE_SYSTEM,nullptr,0,true,0x03000000u,0x8000u,true},
+    {"runtime_pc_arm_call",false,0x03007D3Cu,0xEB000000u,
+     {},MODE_SYSTEM,nullptr,0,true,0x03000000u,0x8000u,true},
+    {"runtime_pc_thumb_bl_prefix",true,0x03007D3Eu,0xF000u,
+     {},MODE_SYSTEM|(1u<<5),nullptr,0,true,0x03000000u,0x8000u,true},
+    {"runtime_pc_thumb_bl_suffix",true,0x03007D3Eu,0xF800u,
+     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x03001000u},MODE_SYSTEM|(1u<<5),nullptr,0,true,0x03000000u,0x8000u,true},
+    {"runtime_pc_thumb_add_pc",true,0x03007D3Eu,0x449Fu,
+     {0,0,0,6},MODE_SYSTEM|(1u<<5),nullptr,0,true,0x03000000u,0x8000u,true},
+    {"runtime_pc_ewram_arm_operand",false,0x02001234u,0xE1A0000Fu,
+     {},MODE_SYSTEM,nullptr,0,true,0x02000000u,0x40000u,true},
+    {"runtime_pc_ewram_thumb_adr",true,0x02001236u,0xA001u,
+     {},MODE_SYSTEM|(1u<<5),nullptr,0,true,0x02000000u,0x40000u,true},
+    {"runtime_pc_ewram_arm_branch",false,0x02001234u,0xEA000000u,
+     {},MODE_SYSTEM,nullptr,0,true,0x02000000u,0x40000u,true},
     // ── DP imm: MOV ─────────────────────────────────────────────────
     {
         "arm_mov_imm",
@@ -1160,6 +1219,28 @@ const TestCase kTestCases[] = {
       {0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0, 0x100u},
       (1u<<5) | MODE_SYSTEM,  // T=1, Z=0
       nullptr, 0, /*branches*/ false, 0, 0 },
+
+    // GCC Thumb relative switch: isolate every stage against the interpreter.
+    { "thumb_switch_adr", true, 0x080014B0u, 0xA301u,
+      {}, (1u<<5) | MODE_SYSTEM, nullptr, 0, false, 0, 0 },
+    { "thumb_switch_ldrb", true, 0x108u, 0x5C1Bu,
+      {1,0,0,0x2000u}, (1u<<5) | MODE_SYSTEM,
+      mem_thumb_switch_entries, 2, false, 0, 0 },
+    { "thumb_switch_ldrh_unsigned", true, 0x108u, 0x5A5Bu,
+      {0,2,0,0x2004u}, (1u<<5) | MODE_SYSTEM,
+      mem_thumb_switch_entries, 2, false, 0, 0 },
+    { "thumb_switch_lsl_entry", true, 0x080014B4u, 0x005Bu,
+      {0,0,0,3}, (1u<<5) | MODE_SYSTEM, nullptr, 0, false, 0, 0 },
+    { "thumb_switch_add_pc_unaligned", true, 0x080014B6u, 0x449Fu,
+      {0,0,0,6}, (1u<<5) | MODE_SYSTEM, nullptr, 0, true, 0, 0 },
+    { "thumb_switch_add_pc_halfword", true, 0x080014B6u, 0x449Fu,
+      {0,0,0,0x10002u}, (1u<<5) | MODE_SYSTEM, nullptr, 0, true, 0, 0 },
+    { "thumb_switch_cmp_default", true, 0x080014ACu, 0x2807u,
+      {7}, (1u<<5) | MODE_SYSTEM, nullptr, 0, false, 0, 0 },
+    { "thumb_switch_bcs_default", true, 0x080014AEu, 0xD233u,
+      {7}, (1u<<5) | (1u<<29) | MODE_SYSTEM, nullptr, 0, true, 0, 0 },
+    { "thumb_switch_bcs_in_range", true, 0x080014AEu, 0xD233u,
+      {6}, (1u<<5) | MODE_SYSTEM, nullptr, 0, false, 0, 0 },
 };
 
 const std::size_t kTestCasesCount =

@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace gba { class GbaBios; }
 
@@ -87,6 +88,26 @@ void overlay_counters(uint64_t* healed_native, uint64_t* native_calls_total,
 // True if the self-heal recompiler is currently active (init'd, not yet shut
 // down). Reads false after overlay_loader_shutdown().
 bool overlay_enabled();
+
+// ── Diagnostic replay: reproducible heal adoption ───────────────────────
+// Interpreter-bridged and native execution of the same function are not
+// cycle-identical, so WHEN a healed function starts running natively is part
+// of a session's history. While a capture runs, worker results are parked
+// and only installed at frame boundaries (overlay_adopt_parked), which the
+// recorder logs; playback installs exactly the recorded set at the same
+// boundaries and never adopts on its own. Keys are heal keys
+// ((pc & ~1) << 1 | thumb).
+enum class OverlayAdoptionMode { Immediate, Boundary, Replay };
+void overlay_set_adoption_mode(OverlayAdoptionMode mode);
+// Boundary mode: install parked worker results now; returns their keys.
+std::vector<std::uint64_t> overlay_adopt_parked();
+// Keys currently dispatching natively, sorted.
+std::vector<std::uint64_t> overlay_active_keys();
+// Replay mode: make exactly `keys` native (others are parked, missing ones
+// compile synchronously). False with *err naming keys that could not be made
+// native.
+bool overlay_replay_set_active(const std::vector<std::uint64_t>& keys,
+                               std::string* err);
 
 // True once the heal feature initialized this session; stays true after
 // shutdown, so the exit coverage report states it honestly (the loader is

@@ -30,7 +30,16 @@ void GbaSolarSensor::configure(bool enable) {
     }
 }
 
+int GbaSolarSensor::diagnostic_brightness() const {
+    if (replay_brightness_ >= 0) return replay_brightness_;
+    if (have_fixed_)  return fixed_;
+    if (provider_)    return provider_();
+    return -1;
+}
+
 uint8_t GbaSolarSensor::sample_threshold() {
+    if (replay_brightness_ >= 0)
+        return brightness_to_threshold(static_cast<uint8_t>(replay_brightness_));
     if (have_fixed_)  return brightness_to_threshold(fixed_);
     if (provider_)    return brightness_to_threshold(provider_());
     // No host light source attached: darkest possible, comparator never trips.

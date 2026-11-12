@@ -74,6 +74,8 @@ void bus_reset(uint32_t base, uint32_t size) {
     g_swi_called = false;
     g_fellthrough = false;
     g_named_sink_called = false;
+    g_mod_entry_calls = 0;
+    g_mod_entry_pc = 0;
     g_ticked_cycles = 0;
     g_cpsr_at_first_tick = UINT32_MAX;
     g_unimplemented_called = false;
@@ -122,6 +124,8 @@ uint32_t g_last_swi_imm         = 0;
 bool     g_swi_called           = false;
 bool     g_fellthrough          = false;
 bool     g_named_sink_called    = false;
+unsigned g_mod_entry_calls      = 0;
+uint32_t g_mod_entry_pc         = 0;
 bool     g_unimplemented_called = false;
 const char* g_unimplemented_op  = nullptr;
 uint32_t g_unimplemented_pc     = 0;
@@ -135,8 +139,8 @@ uint32_t g_unimplemented_pc     = 0;
 //   };
 //   extern "C" const DispatchEntry kDispatchTable[];
 //   extern "C" const unsigned kDispatchTableLen;
-// Provide minimal stubs. Empty length means every dispatch falls
-// through to runtime_dispatch_miss, which we override below.
+// Reserve two entries for stale mutable-code regression tests. Other
+// dispatches reach runtime_dispatch_miss, which we override below.
 struct DispatchEntry {
     uint32_t addr;
     uint8_t thumb;
@@ -144,10 +148,12 @@ struct DispatchEntry {
     void (*fn)(void);
 };
 
-extern "C" const DispatchEntry kDispatchTable[1] = {
-    {0xFFFFFFFFu, 0u, 0u, nullptr},
+static void fixed_ram_stub(void) { codegen_test::g_named_sink_called = true; }
+extern "C" const DispatchEntry kDispatchTable[2] = {
+    {0x03001002u, 1u, 0u, fixed_ram_stub},
+    {0x08001002u, 1u, 0u, fixed_ram_stub},
 };
-extern "C" const unsigned kDispatchTableLen = 0u;
+extern "C" const unsigned kDispatchTableLen = 2u;
 
 // BIOS dispatch table — empty for L1 tests. The runtime consults
 // kBiosDispatchTable first for PC < 0x4000; with length 0 every BIOS
@@ -287,4 +293,11 @@ extern "C" uint32_t runtime_mul_cycles(uint32_t rs_value,
                                        uint32_t signed_variant,
                                        uint32_t extra) {
     return armv4t::mul_wait_cycles(rs_value, signed_variant != 0u, extra);
+}
+
+extern "C" int gba_mod_function_entry(uint32_t pc,int thumb,ArmCpuState* cpu) {
+    if (thumb!=1 || cpu!=&g_cpu) std::abort();
+    ++codegen_test::g_mod_entry_calls;
+    codegen_test::g_mod_entry_pc=pc;
+    return 0; // exercise the ordinary native path after a declined reviewed hook
 }

@@ -15,6 +15,7 @@
 
 namespace gbarecomp {
 struct GbaNetplayLaunch;
+struct ViewGeometry;
 
 struct TouchFrameInfo;   // touch_input.h
 class HostOverlay;       // host_overlay.h
@@ -83,6 +84,13 @@ struct RunOptions {
     // inputs, including its fixed/initial width request. Games with unrelated
     // catalogs leave this false.
     bool mod_owns_adaptive_view = false;
+    // Game-authored framing, applied before allocating/presenting the surface.
+    // Drawable dimensions are zero for a fixed/headless view. Null preserves
+    // the existing geometry of every other title; this is not a user setting.
+    void (*view_geometry)(ViewGeometry*, int drawable_width, int drawable_height) = nullptr;
+    // Read-only title authorization for finer affine presentation. Null keeps
+    // internal resolution at 1x and rejects unsupported enhancement requests.
+    bool (*high_resolution_affine_provider)(int bg, int screen_y) = nullptr;
 
     // Extended horizontal view is a game-owned enhancement capability, not a
     // generic emulator toggle. Values above the native 240 are the opt-in;
@@ -146,6 +154,10 @@ struct RunOptions {
     // reusable. Slot hotkeys continue to cover 1-9, while menus can reach 10.
     bool expose_assist_tools = false;
     bool assist_tools_enabled_by_default = true;
+    // Always-on diagnostic replay capture for interactive windowed sessions
+    // (docs/DIAGNOSTIC_REPLAY.md). Players opt out with GBARECOMP_DIAGNOSTICS=0
+    // or config.ini [Diagnostics] replay_capture=0; a title may default it off.
+    bool diagnostic_replay_default = true;
     std::uint8_t assist_fast_forward_multiplier_default = 4;
     // Boot convenience for windowed sessions: run fast-forwarded (frames are
     // still fully emulated and presented sparsely, exactly like the Assist
@@ -162,13 +174,6 @@ struct RunOptions {
     // settings menu (cheats, save states, fast-forward, rewind). The combo is
     // consumed as a host shortcut and never reaches the guest. Off by default.
     bool in_game_menu_start_select = false;
-
-    // Desktop autosave crash guard: when > 0 and the game runs in a window,
-    // snapshot the machine state to the suspend-state file every N seconds and
-    // leave a crash marker; a launch after an unclean exit resumes it (needs
-    // resume_suspend_state_on_launch). 0 disables it, and headless runs never
-    // touch the suspend files.
-    std::uint8_t autosave_interval_seconds = 0;
 
     // Optional CodeBreaker Advance cheat presets (cheat_engine.h). When
     // expose_cheats is set, the runtime appends a "Cheats" section to the
@@ -193,6 +198,14 @@ struct RunOptions {
     bool expose_editor = false;
     const GbaEditField* edit_fields = nullptr;
     std::size_t edit_field_count = 0;
+
+    // Desktop autosave crash guard: when > 0 (and
+    // resume_suspend_state_on_launch is set) interactive windowed play
+    // snapshots the machine to the suspend-state file every N seconds and on
+    // every battery-save flush, leaving the crash marker; a launch after an
+    // unclean exit resumes it. 0 disables it. Headless, --tcp, --load-state
+    // and replay sessions never touch the suspend files.
+    std::uint8_t autosave_interval_seconds = 0;
 
     // Optional game-owned content initializer. Called exactly once, after the
     // first non-native view has been authorized and applied. For a fixed view
@@ -321,6 +334,8 @@ struct RunOptions {
     // seam reads its [rom].path / [bios].path to PREFILL the launcher when no
     // rom.cfg / bios.cfg sidecar exists yet, so a first run isn't blank.
     const char* launcher_game_config = nullptr;
+    // Actual title package/build metadata, shown by opted-in recomp-ui pins.
+    const char* launcher_game_version = nullptr;
     // Optional launcher state/cache filenames, relative to the executable dir.
     // Multi-variant repos can use these to keep side-by-side launchers from
     // sharing one config.ini / rom.cfg in the same build output directory.
@@ -331,6 +346,7 @@ struct RunOptions {
     const char* launcher_save_path = nullptr;   // explicit save file (game.toml
                                                 // [save].path); null => <rom>.sav
                                                 // derived from the seeded ROM
+    std::size_t launcher_native_save_bytes = 0; // optional raw native import size
     // Opt into recomp-ui's verified IPS/IPS32/BPS source-ROM patch surface.
     // Patched images are generated under the executable's mods/rom-patches
     // cache; the original ROM and patch file are never modified.
@@ -369,8 +385,9 @@ struct RunOptions {
     std::uint16_t widescreen_view_width = 0;
     // Game-supplied aspect vocabulary for the launcher's aspect cycle
     // (EXPERIMENTAL-tagged). labels/view_widths are parallel arrays of
-    // num_aspects entries; index 0 must be the native 240 view. The
-    // committed index maps to --view-width <view_widths[index]>.
+    // num_aspects entries. A width of 0 retains the game's mod/default view;
+    // otherwise the committed index maps to an explicit fixed --view-width.
+    // Native entries use 240; Adaptive remains a separate offered mode.
     // e.g. Mega Man Zero: {"3:2 (Native)","9:5 (288 px)","12:5 (384 px)",
     // "6:2 (480 px)"} / {240, 288, 384, 480}.
     const char* const*   launcher_aspect_labels = nullptr;

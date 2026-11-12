@@ -35,7 +35,8 @@ bool self_heal_any_misses();
 // Distinct missed PCs bridged this session.
 std::uint32_t self_heal_distinct_misses();
 
-// Total guest instructions executed in the interpreter bridge this session.
+// Total guest instructions interpreted this session, including explicit forced
+// execution and reference runs which do not create a dispatch miss.
 std::uint64_t self_heal_interpreted_insns();
 
 // Emit the coverage-honesty banner to stdout and, if any misses occurred and
@@ -94,5 +95,18 @@ std::string self_heal_misses_json();
 // read one machine-readable file to confirm FULLY_STATIC or drive the merge
 // loop. Returns false if the path can't be opened. NEVER touches game.toml.
 bool self_heal_write_coverage_json(const char* path);
+
+// Always-on persistence of the two files above. The runner names them once at
+// startup; from then on they are rewritten (temp file + replacing rename) on
+// every new distinct miss, and once more from a SIGABRT handler installed
+// here, so a run that aborts (any std::abort: bridge runaway, interpreter
+// gap, STRICT_STATIC, IRQ storm, std::terminate) or is killed keeps its whole
+// harvest. The coverage JSON carries "phase": "running" (in-session
+// snapshot), "abort" (flushed by the abort handler) or "exit" (final report).
+// Setting the paths writes an initial "running" snapshot so a previous run's
+// file is never mistaken for this one's.
+void self_heal_set_persist_paths(const char* frag_path,
+                                 const char* coverage_path);
+void self_heal_persist(const char* phase);
 
 }  // namespace gbarecomp

@@ -1,6 +1,10 @@
 // host_window.cpp — SDL2-backed window. Stubs out when SDL2 isn't found.
 
 #include "host_window.h"
+#if defined(GBARECOMP_GBA_PAD_BINDS)
+#include "consoles/gba/gba_pad_binds.h"
+#endif
+#include <stdexcept>
 
 #include <algorithm>
 #include <array>
@@ -12,13 +16,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "color_lut.h"
+#include "hd_gpu_renderer.h"
 #include "host_overlay.h"
 #include "presentation_layout.h"
+#include "presentation_settings.h"
 #include "touch_input.h"
 #if defined(GBARECOMP_RUNTIME_UI)
 #include "recomp_runtime_ui.h"
@@ -27,6 +34,7 @@
 #if defined(GBARECOMP_HAVE_SDL2)
 
 #include <SDL.h>
+#include "stereo_audio_stream.h"
 
 #if defined(GBARECOMP_RUNTIME_UI)
 #include "imgui.h"
@@ -343,6 +351,16 @@ struct Backend {
     SDL_Window*   window   = nullptr;
     SDL_Renderer* renderer = nullptr;
     SDL_Texture*  texture  = nullptr;
+    std::unique_ptr<HdGpuRenderer> hd_gpu;
+    bool hd_gpu_checked = false;
+#if defined(GBARECOMP_NATIVE_DRAW_JOBS)
+    std::shared_ptr<const gba::GbaNativeDrawFrame> native_frame;
+#endif
+    SDL_Texture* resident_frame = nullptr;
+    Uint32        texture_format = SDL_PIXELFORMAT_RGB24;
+    std::vector<uint32_t> packed_upload;
+    unsigned      presentation_source_w = 0, presentation_source_h = 0;
+    std::vector<uint8_t> presentation_upload;
     SDL_Texture*  sharp_texture = nullptr;
     int           sharp_texture_w = 0;
     int           sharp_texture_h = 0;
@@ -382,6 +400,9 @@ struct Backend {
     // A game input policy consumes touches (RunOptions::input_frame).
     bool touch_policy = false;
     std::uint32_t touch_claims = 0;
+    // Enhanced (MP2K shadow) audio; saved = the player chose it in the menu.
+    bool audio_enhanced = false;
+    bool audio_enhanced_saved = false;
     bool touch_emulation = false;   // desktop mouse -> touch
     float px_per_mm = 96.0f / 25.4f;
     float logical_px_per_mm = 96.0f / 25.4f;  // SDL-reported (logical) density
@@ -404,14 +425,40 @@ struct Backend {
     rab_bridge    bridge{};
     bool          bridge_ready = false;
     SDL_mutex*    audio_mtx = nullptr;
-    // Diagnostic/direct path: let SDL own format conversion and queue the
-    // engine's verified 65536 Hz mono stream without passing it through RAB.
+    // Diagnostic queued path: persistent SDL conversion at each true source rate.
     bool          audio_direct = false;
     bool          audio_direct_started = false;
     int           audio_direct_rate = 65536;
+    StereoAudioStream audio_direct_stream;
+    std::vector<int16_t> audio_direct_pcm;
+    std::vector<int16_t> mono_stereo_pcm;
     uint64_t      audio_direct_pushes = 0;
     uint64_t      audio_direct_samples = 0;
+    double        audio_direct_seconds = 0;
     uint64_t      audio_direct_underruns = 0;
+    // Session health: one clock read per present, summarised in the log when
+    // the app goes to the background (it may be killed there) and on close.
+    uint64_t      health_frames = 0;
+    uint64_t      health_late = 0;      // present gap > 25 ms: a frame missed
+    uint64_t      health_hitches = 0;   // present gap > 100 ms: a visible stall
+    uint64_t      health_max_gap_us = 0;
+    Uint64        health_prev_present = 0;
+    Uint64        health_first_present = 0;
+    unsigned      health_hitch_lines = 0;  // capped, see note_present_for_health
+    // The latest present gap, counted at the next present. Android delays
+    // the last present before the app leaves the foreground (about 525 ms
+    // on the RG556 when Home is pressed); that gap is the system's
+    // transition, so it is dropped when the session is suspended or ends.
+    uint64_t      health_pending_gap_us = 0;
+    uint64_t      health_pending_frame = 0;
+    Uint64        health_pending_at = 0;
+    // Audio bridge counters (output frames played dry, source frames dropped
+    // on overflow), accumulated only across steady play: the bridge also runs
+    // dry at start-up and while a state is written before the background.
+    uint64_t      health_seen_underrun = 0;
+    uint64_t      health_seen_overflow = 0;
+    uint64_t      health_play_underrun = 0;
+    uint64_t      health_play_overflow = 0;
     uint64_t      audio_direct_probe_samples = 0;
     uint64_t      audio_direct_probe_nonzero = 0;
     long double   audio_direct_probe_square_sum = 0.0;
@@ -432,6 +479,14 @@ struct Backend {
     // whichever menu row appeared under the finger.
     int runtime_ui_suppressed_touch_releases = 0;
     Uint32 runtime_ui_suppress_touch_until = 0;
+    // The menu from a controller: the held direction (a RecompRuntimeUiInput,
+    // or -1) repeats like a held key; the left stick reads as the D-pad; and
+    // the Select+Start chord that opened it stays hidden from the game until
+    // both are released.
+    int runtime_ui_dir = -1;
+    Uint32 runtime_ui_dir_since = 0, runtime_ui_dir_last = 0;
+    int runtime_ui_stick_x = 0, runtime_ui_stick_y = 0;
+    bool runtime_ui_chord_held = false;
 #endif
     int base_w = 240;   // logical surface width  (240 faithful, wider if expanded)
     int base_h = 160;   // logical surface height (160; vertical expansion deferred)
@@ -439,12 +494,24 @@ struct Backend {
     bool resize_driven_view = false;
     bool freely_resizable_window = false;
     bool linear_filter = false;
+    bool integer_scale = false;
+    bool scanlines = false;
+    int scanline_strength = 35;
+    std::string launcher_config_path;
     bool sharp_filter = false;
 
     // ---- rebindable input (see HostWindow::load_input_config) --------------
     // GBA KEYINPUT bit (0..9) per bound SDL scancode; seeded from the
     // built-in defaults, overridden by keybinds.ini [player1].
     SDL_Scancode bind_sc[10] = {};      // indexed by GBA KEYINPUT bit
+#if defined(GBARECOMP_GBA_PAD_BINDS)
+    std::string input_config_dir;
+    std::string preferred_pad_guid;
+    int pad_buttons[10] = {};
+    int pad_axes[10] = {};
+    int pad_axis_dirs[10] = {};
+    int pad_deadzone = 6553;
+#endif
     HotkeyBind   hotkeys[HK_COUNT];     // [KeyMap] bindings
     SDL_Scancode assist_key[2] = {
         SDL_SCANCODE_1, SDL_SCANCODE_2
@@ -466,8 +533,9 @@ struct Backend {
     int          fullscreen = 0;        // 0 windowed, 1 borderless, 2 exclusive
     int          volume = 100;          // 0..100 gain on pushed samples
     std::vector<int16_t> volume_buf;    // scratch for gain != 100
-    // FPS readout (DisplayPerf hotkey): presents/sec in the title bar.
+    // FPS readout (DisplayPerf hotkey): presents/sec in the title bar and on screen.
     bool         fps_readout = false;
+    double       fps_value = 0.0;   // last readout, also drawn on screen
     std::string  title;                 // base window title (readout restores it)
     Uint32       fps_window_start = 0;
     int          fps_presents = 0;
@@ -546,6 +614,29 @@ void close_game_controller(Backend* b) {
     b->controller_gyro = false;
 }
 
+#if defined(GBARECOMP_GBA_PAD_BINDS)
+void load_controller_bindings(Backend* b) {
+    std::string directory=b->input_config_dir;
+    if(directory.empty()) {char* base=SDL_GetBasePath();if(base){directory=base;SDL_free(base);}}
+    const std::string path=directory+"/input.ini";
+    char guid[40]={};
+    if(b->controller) SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(
+        SDL_GameControllerGetJoystick(b->controller)),guid,sizeof(guid));
+    rui_pad_binds_init(&kRuiGbaPadSpec,path.c_str());
+    b->pad_deadzone=std::max(1,rui_pad_binds_deadzone(&kRuiGbaPadSpec,path.c_str(),guid)*32767/100);
+    for(int i=0;i<10;++i) {
+        char source[48];rui_pad_binds_label(&kRuiGbaPadSpec,path.c_str(),guid,i,source,sizeof(source));
+        b->pad_buttons[i]=(int)SDL_GameControllerGetButtonFromString(source);
+        b->pad_axes[i]=-1;b->pad_axis_dirs[i]=0;
+        const size_t size=std::strlen(source);
+        if(size && (source[size-1]=='+' || source[size-1]=='-')) {
+            b->pad_axis_dirs[i]=source[size-1]=='+'?1:-1;source[size-1]=0;
+            b->pad_axes[i]=(int)SDL_GameControllerGetAxisFromString(source);
+        }
+    }
+}
+#endif
+
 bool open_game_controller(Backend* b, int device_index) {
     if (!b || b->controller || device_index < 0 ||
         !SDL_IsGameController(device_index))
@@ -553,9 +644,19 @@ bool open_game_controller(Backend* b, int device_index) {
 
     SDL_GameController* controller = SDL_GameControllerOpen(device_index);
     if (!controller) return false;
+#if defined(GBARECOMP_GBA_PAD_BINDS)
+    if(!b->preferred_pad_guid.empty()) {
+        char guid[40];SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(
+            SDL_GameControllerGetJoystick(controller)),guid,sizeof(guid));
+        if(b->preferred_pad_guid!=guid) {SDL_GameControllerClose(controller);return false;}
+    }
+#endif
     b->controller = controller;
     SDL_Joystick* joystick = SDL_GameControllerGetJoystick(controller);
     b->controller_id = joystick ? SDL_JoystickInstanceID(joystick) : -1;
+#if defined(GBARECOMP_GBA_PAD_BINDS)
+    load_controller_bindings(b);
+#endif
 #if SDL_VERSION_ATLEAST(2, 0, 14)
     if (SDL_GameControllerHasSensor(controller, SDL_SENSOR_GYRO) &&
         SDL_GameControllerSetSensorEnabled(
@@ -1115,7 +1216,9 @@ void save_touch_config(const Backend* b) {
             while (!line.empty() && line.back() == '\r') line.pop_back();
             const size_t s = line.find_first_not_of(" \t");
             const bool header = s != std::string::npos && line[s] == '[';
-            if (header) in_section = line.compare(s, 7, "[Touch]") == 0;
+            if (header)
+                in_section = line.compare(s, 7, "[Touch]") == 0 ||
+                             line.compare(s, 7, "[Audio]") == 0;
             if (in_section) continue;
             kept.push_back(line);
         }
@@ -1131,6 +1234,10 @@ void save_touch_config(const Backend* b) {
     if (b->toggle_pos_saved) {
         f << "toggle_x = " << b->toggle_fx << "\n";
         f << "toggle_y = " << b->toggle_fy << "\n";
+    }
+    if (b->audio_enhanced_saved) {
+        f << "\n[Audio]\n";
+        f << "enhanced = " << (b->audio_enhanced ? 1 : 0) << "\n";
     }
 }
 
@@ -1284,15 +1391,17 @@ runtime::ColorSettings resolve_color_settings(const char* toml_screen) {
     return s;
 }
 
-// SDL audio pull callback: render exactly `len` bytes of device-rate mono S16
+// SDL audio pull callback: render exactly `len` bytes of device-rate stereo S16
 // from the bridge ring. The bridge emits faded silence (not raw zeros) before
 // prime / on underrun, so a momentarily-starved producer no longer clicks.
 void gba_audio_callback(void* userdata, Uint8* stream, int len) {
     auto* b = static_cast<Backend*>(userdata);
-    int frames = len / static_cast<int>(sizeof(int16_t)); // mono
-    if (b && b->bridge_ready) {
+    SDL_memset(stream, 0, len);
+    int frames = len / static_cast<int>(2 * sizeof(int16_t));
+    if (b && b->audio_mtx) {
         SDL_LockMutex(b->audio_mtx);
-        rab_pull(&b->bridge, reinterpret_cast<int16_t*>(stream), frames);
+        if (b->bridge_ready)
+            rab_pull(&b->bridge, reinterpret_cast<int16_t*>(stream), frames);
         SDL_UnlockMutex(b->audio_mtx);
     } else {
         SDL_memset(stream, 0, len);
@@ -1348,12 +1457,31 @@ bool runtime_menu_open(const Backend* b) {
 }
 #endif
 
+// Show FPS: the readout in a corner of the screen, for full-screen and
+// handheld play where there is no title bar to carry it.
+void draw_fps(Backend* b, HostOverlay& ov) {
+    if (!b->fps_readout || b->fps_value <= 0.0 || !ov.text_supported()) return;
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.1f fps", b->fps_value);
+    const float mm = ov.drawable_px_per_mm();
+    const float size = 3.0f * mm, pad = 1.0f * mm;
+    const float w = ov.text_width(text, size, OverlaySpace::Drawable) + pad * 2.0f;
+    const float h = size + pad * 2.0f;
+    const HostOverlay::Insets in = ov.safe_insets();
+    const float x = static_cast<float>(in.left) + pad * 2.0f;
+    const float y = static_cast<float>(in.top) + pad * 2.0f;
+    ov.fill_rect(x, y, w, h, pad, {0, 0, 0, 170}, OverlaySpace::Drawable);
+    ov.text(x + pad, y + pad, size, {255, 255, 255, 235}, text, OverlayAlign::Left,
+            OverlaySpace::Drawable);
+}
+
 // Host chrome drawn over the game image, in order: the game's host overlay,
 // the virtual pad and its toggle, the engine long-press cue, then (runtime UI
 // builds) the settings menu on top. Nothing here reads or writes guest state
 // except through the game's own overlay callback.
 void draw_host_chrome(Backend* b, HostOverlay& ov, bool menu_open) {
     if (menu_open) return;
+    draw_fps(b, ov);
     if (b->host_overlay) b->host_overlay(&ov);
     draw_touch_pad(b, ov);
     draw_pad_toggle(b, ov);
@@ -1367,7 +1495,7 @@ void render_host_layers(Backend* b) {
     const bool menu_open = false;
 #endif
     const bool chrome = !menu_open &&
-        (b->host_overlay || (b->pad_visible && b->touch_controls) ||
+        (b->host_overlay || b->fps_readout || (b->pad_visible && b->touch_controls) ||
          pad_toggle_available(b) || touch_input_enabled(b));
     if (!chrome && !menu_open) return;
 
@@ -1376,7 +1504,13 @@ void render_host_layers(Backend* b) {
     int logical_w = 0;
     int logical_h = 0;
     SDL_Rect viewport{};
+    float scale_x = 1.0f, scale_y = 1.0f;
     SDL_RenderGetLogicalSize(b->renderer, &logical_w, &logical_h);
+    SDL_RenderGetScale(b->renderer, &scale_x, &scale_y);
+    // Query the viewport in drawable pixels. At fractional logical scales,
+    // SDL rounds a logical-coordinate viewport down to whole guest pixels.
+    // Restoring that rounded rectangle would shrink/shift subsequent frames.
+    SDL_RenderSetScale(b->renderer, 1.0f, 1.0f);
     SDL_RenderGetViewport(b->renderer, &viewport);
     SDL_RenderSetLogicalSize(b->renderer, 0, 0);
     SDL_RenderSetViewport(b->renderer, nullptr);
@@ -1403,7 +1537,9 @@ void render_host_layers(Backend* b) {
     }
 
     SDL_RenderSetLogicalSize(b->renderer, logical_w, logical_h);
+    SDL_RenderSetScale(b->renderer, 1.0f, 1.0f);
     SDL_RenderSetViewport(b->renderer, &viewport);
+    SDL_RenderSetScale(b->renderer, scale_x, scale_y);
     SDL_SetRenderDrawBlendMode(b->renderer, SDL_BLENDMODE_NONE);
 }
 
@@ -1485,6 +1621,8 @@ PresentationLayout current_presentation_layout(Backend* b, int* out_w, int* out_
             : compute_presentation_layout(drawable_w, drawable_h, b->base_w, b->base_h);
     }
 #endif
+    if (b->integer_scale)
+        layout = compute_integer_presentation_layout(drawable_w, drawable_h, b->base_w, b->base_h);
     // Portrait top anchoring (per-present game request): the image hugs the
     // top safe edge so host-drawn controls get all of the space below it.
 #if defined(__ANDROID__)
@@ -1492,7 +1630,7 @@ PresentationLayout current_presentation_layout(Backend* b, int* out_w, int* out_
 #else
     // The fixed native desktop path presents through SDL's logical size,
     // which always centres; only explicit-destination paths can anchor.
-    const bool explicit_destination = b->expanded_view || b->resize_driven_view;
+    const bool explicit_destination = b->expanded_view || b->resize_driven_view || b->integer_scale;
 #endif
     if (explicit_destination && b->anchor_top && drawable_h > drawable_w &&
         layout.height > 0 && layout.height < drawable_h) {
@@ -1542,8 +1680,75 @@ void open_runtime_menu_from_touch(Backend* b) {
 
 #if defined(GBARECOMP_RUNTIME_UI)
 
-bool runtime_ui_event(RecompRuntimeUi* ui, const SDL_Event& e) {
+// A direction from the D-pad or the left stick: forwarded, and remembered so
+// runtime_ui_repeat() repeats it while held.
+void runtime_ui_direction(Backend* b, RecompRuntimeUiInput input, bool pressed) {
+    recomp_runtime_ui_handle_input(b->runtime_ui, input, pressed ? 1 : 0, 0);
+    if (pressed) {
+        b->runtime_ui_dir = static_cast<int>(input);
+        b->runtime_ui_dir_since = b->runtime_ui_dir_last = SDL_GetTicks();
+    } else if (b->runtime_ui_dir == static_cast<int>(input)) {
+        b->runtime_ui_dir = -1;
+    }
+}
+
+// Controller buttons and the stick send no repeats of their own: a direction
+// held for 380 ms then steps every 90 ms, as a held arrow key does.
+void runtime_ui_repeat(Backend* b) {
+    RecompRuntimeUi* ui = b->runtime_ui;
+    if (!ui || !recomp_runtime_ui_is_open(ui)) {
+        b->runtime_ui_dir = -1;
+        b->runtime_ui_stick_x = b->runtime_ui_stick_y = 0;
+        return;
+    }
+#if defined(RECOMP_RUNTIME_UI_HAS_TEXT)
+    if (recomp_runtime_ui_wants_text_input(ui)) {
+        b->runtime_ui_dir = -1;
+        b->runtime_ui_stick_x = b->runtime_ui_stick_y = 0;
+        return;
+    }
+#endif
+    if (b->runtime_ui_dir < 0) return;
+    const Uint32 now = SDL_GetTicks();
+    if (now - b->runtime_ui_dir_since < 380 || now - b->runtime_ui_dir_last < 90) return;
+    b->runtime_ui_dir_last = now;
+    recomp_runtime_ui_handle_input(ui, static_cast<RecompRuntimeUiInput>(b->runtime_ui_dir), 1, 1);
+}
+
+void runtime_ui_toggle(RecompRuntimeUi* ui) {
+    if (recomp_runtime_ui_is_open(ui)) recomp_runtime_ui_close(ui);
+    else recomp_runtime_ui_open(ui);
+}
+
+bool runtime_ui_event(Backend* b, const SDL_Event& e) {
+    RecompRuntimeUi* ui = b->runtime_ui;
     if (!ui) return false;
+    // From a controller the menu opens and closes with a stick click (L3/R3,
+    // which GBA games have no use for) or the Select+Start chord, for
+    // handhelds whose Guide/Home button belongs to the system. Start also
+    // closes an open menu.
+    if (e.type == SDL_CONTROLLERBUTTONDOWN || e.type == SDL_CONTROLLERBUTTONUP) {
+        const Uint8 button = e.cbutton.button;
+        const bool down = e.type == SDL_CONTROLLERBUTTONDOWN;
+        SDL_GameController* pad = SDL_GameControllerFromInstanceID(e.cbutton.which);
+        if (button == SDL_CONTROLLER_BUTTON_LEFTSTICK || button == SDL_CONTROLLER_BUTTON_RIGHTSTICK) {
+            if (down) runtime_ui_toggle(ui);
+            return true;
+        }
+        if (down && pad &&
+            ((button == SDL_CONTROLLER_BUTTON_START &&
+              SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK)) ||
+             (button == SDL_CONTROLLER_BUTTON_BACK &&
+              SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START)))) {
+            b->runtime_ui_chord_held = true;
+            runtime_ui_toggle(ui);
+            return true;
+        }
+        if (button == SDL_CONTROLLER_BUTTON_START && recomp_runtime_ui_is_open(ui)) {
+            if (down && !b->runtime_ui_chord_held) recomp_runtime_ui_close(ui);
+            return true;
+        }
+    }
     if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_ESCAPE &&
         !recomp_runtime_ui_is_open(ui)) {
         recomp_runtime_ui_open(ui);
@@ -1561,6 +1766,23 @@ bool runtime_ui_event(RecompRuntimeUi* ui, const SDL_Event& e) {
 #if defined(RECOMP_RUNTIME_UI_HAS_TEXT)
     if (recomp_runtime_ui_wants_text_input(ui)) return true;
 #endif
+    // The left stick moves through an open menu like the D-pad.
+    if (e.type == SDL_CONTROLLERAXISMOTION) {
+        if (!recomp_runtime_ui_is_open(ui)) return false;
+        const bool x_axis = e.caxis.axis == SDL_CONTROLLER_AXIS_LEFTX;
+        if (!x_axis && e.caxis.axis != SDL_CONTROLLER_AXIS_LEFTY) return true;
+        const int dir = e.caxis.value > 16000 ? 1 : e.caxis.value < -16000 ? -1 : 0;
+        int& held = x_axis ? b->runtime_ui_stick_x : b->runtime_ui_stick_y;
+        if (dir == held) return true;
+        auto input = [x_axis](int d) {
+            return x_axis ? (d < 0 ? RECOMP_RUNTIME_UI_INPUT_LEFT : RECOMP_RUNTIME_UI_INPUT_RIGHT)
+                          : (d < 0 ? RECOMP_RUNTIME_UI_INPUT_UP : RECOMP_RUNTIME_UI_INPUT_DOWN);
+        };
+        if (held) runtime_ui_direction(b, input(held), false);
+        held = dir;
+        if (dir) runtime_ui_direction(b, input(dir), true);
+        return true;
+    }
     if (e.type != SDL_KEYDOWN && e.type != SDL_KEYUP &&
         e.type != SDL_CONTROLLERBUTTONDOWN && e.type != SDL_CONTROLLERBUTTONUP)
         return false;
@@ -1594,10 +1816,22 @@ bool runtime_ui_event(RecompRuntimeUi* ui, const SDL_Event& e) {
                     else recomp_runtime_ui_open(ui);
                 }
                 return true;
-            case SDL_CONTROLLER_BUTTON_DPAD_UP: input = RECOMP_RUNTIME_UI_INPUT_UP; break;
-            case SDL_CONTROLLER_BUTTON_DPAD_DOWN: input = RECOMP_RUNTIME_UI_INPUT_DOWN; break;
-            case SDL_CONTROLLER_BUTTON_DPAD_LEFT: input = RECOMP_RUNTIME_UI_INPUT_LEFT; break;
-            case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: input = RECOMP_RUNTIME_UI_INPUT_RIGHT; break;
+            case SDL_CONTROLLER_BUTTON_DPAD_UP:
+            case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
+            case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
+            case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
+                if (recomp_runtime_ui_is_open(ui)) {
+                    const Uint8 button = e.cbutton.button;
+                    runtime_ui_direction(
+                        b,
+                        button == SDL_CONTROLLER_BUTTON_DPAD_UP ? RECOMP_RUNTIME_UI_INPUT_UP
+                        : button == SDL_CONTROLLER_BUTTON_DPAD_DOWN ? RECOMP_RUNTIME_UI_INPUT_DOWN
+                        : button == SDL_CONTROLLER_BUTTON_DPAD_LEFT ? RECOMP_RUNTIME_UI_INPUT_LEFT
+                                                                    : RECOMP_RUNTIME_UI_INPUT_RIGHT,
+                        pressed != 0);
+                    return true;
+                }
+                return false;
             case SDL_CONTROLLER_BUTTON_A: input = RECOMP_RUNTIME_UI_INPUT_ACCEPT; break;
             case SDL_CONTROLLER_BUTTON_B: input = RECOMP_RUNTIME_UI_INPUT_BACK; break;
             default: mapped = false; break;
@@ -1707,7 +1941,9 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, linear_filter ? "linear" : "nearest");
     const int win_w = base_w * scale;
     const int win_h = base_h * scale;
-    Uint32 window_flags = SDL_WINDOW_SHOWN |
+    const char* hidden_env = std::getenv("GBARECOMP_WINDOW_HIDDEN");
+    const bool hidden_window = hidden_env && *hidden_env && *hidden_env != '0';
+    Uint32 window_flags = (hidden_window ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN) |
         ((b->expanded_view || b->resize_driven_view ||
           b->freely_resizable_window)
              ? static_cast<Uint32>(SDL_WINDOW_RESIZABLE) : Uint32{0});
@@ -1763,8 +1999,15 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     // can opt in with GBARECOMP_VSYNC=1. GBARECOMP_NO_VSYNC remains the final
     // override for existing launch scripts and A/B diagnostics.
 #if defined(_WIN32)
+#if defined(GBARECOMP_GPU_HD_EXPERIMENT)
+    const bool renderer_default_owned =
+        SDL_SetHintWithPriority(SDL_HINT_RENDER_DRIVER,"direct3d11",SDL_HINT_DEFAULT);
+#else
     SDL_SetHintWithPriority(SDL_HINT_RENDER_DRIVER, "direct3d11",
                             SDL_HINT_DEFAULT);
+#endif
+#elif defined(GBARECOMP_GPU_HD_EXPERIMENT)
+    const bool renderer_default_owned = !SDL_GetHint(SDL_HINT_RENDER_DRIVER);
 #endif
     const char* vsync_env = std::getenv("GBARECOMP_VSYNC");
     const char* no_vsync_env = std::getenv("GBARECOMP_NO_VSYNC");
@@ -1777,7 +2020,23 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     const Uint32 renderer_flags = SDL_RENDERER_ACCELERATED |
         (want_vsync ? static_cast<Uint32>(SDL_RENDERER_PRESENTVSYNC)
                     : Uint32{0});
+#if defined(GBARECOMP_GPU_HD_EXPERIMENT)
+    int preferred_driver = -1;
+    if (prefer_gpu_hd_ && renderer_default_owned && !std::getenv("SDL_RENDER_DRIVER")) {
+        for (int i=0;i<SDL_GetNumRenderDrivers();++i) {
+            SDL_RendererInfo info{};
+            if (SDL_GetRenderDriverInfo(i,&info)==0 && info.name && !std::strcmp(info.name,"opengl"))
+                preferred_driver=i;
+        }
+    }
+    // Select this window's backend directly. Keep existing process hints and
+    // compatibility with SDL releases before SDL_ResetHint was introduced.
+    b->renderer = SDL_CreateRenderer(b->window, preferred_driver, renderer_flags);
+    if (!b->renderer && preferred_driver>=0)
+        b->renderer=SDL_CreateRenderer(b->window,-1,renderer_flags);
+#else
     b->renderer = SDL_CreateRenderer(b->window, -1, renderer_flags);
+#endif
     if (!b->renderer && want_vsync) {
         std::fprintf(stderr,
                      "host_window: synchronized renderer unavailable; "
@@ -1820,7 +2079,7 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     // Mobile presentation owns the whole drawable: a centered integer-scaled
     // game viewport plus dedicated side rails for touch controls.
     SDL_RenderSetLogicalSize(b->renderer, 0, 0);
-    SDL_SetRenderDrawColor(b->renderer, 7, 11, 20, 255);
+    SDL_SetRenderDrawColor(b->renderer, 0, 0, 0, 255);
 #else
     if (b->expanded_view || b->resize_driven_view) {
         // The destination viewport is computed explicitly in present() so
@@ -1835,10 +2094,28 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     }
 #endif
 
+#if defined(GBARECOMP_NATIVE_PRESENTATION)
+    // Prefer an advertised native 32-bit texture. This folds screen grading
+    // and SDL's otherwise separate RGB24 conversion into one portable pass.
+    SDL_RendererInfo upload_info{};
+    if (SDL_GetRendererInfo(b->renderer, &upload_info) == 0) {
+        for (const Uint32 wanted : {SDL_PIXELFORMAT_ARGB8888, SDL_PIXELFORMAT_ABGR8888}) {
+            for (Uint32 i = 0; i < upload_info.num_texture_formats; ++i) {
+                if (upload_info.texture_formats[i] == wanted) { b->texture_format = wanted; break; }
+            }
+            if (b->texture_format != SDL_PIXELFORMAT_RGB24) break;
+        }
+    }
+#endif
     b->texture = SDL_CreateTexture(b->renderer,
-                                   SDL_PIXELFORMAT_RGB24,
+                                   b->texture_format,
                                    SDL_TEXTUREACCESS_STREAMING,
                                    base_w, base_h);
+    if (!b->texture && b->texture_format != SDL_PIXELFORMAT_RGB24) {
+        b->texture_format = SDL_PIXELFORMAT_RGB24;
+        b->texture = SDL_CreateTexture(b->renderer, b->texture_format,
+            SDL_TEXTUREACCESS_STREAMING, base_w, base_h);
+    }
     if (!b->texture) {
         std::fprintf(stderr, "host_window: SDL_CreateTexture failed: %s\n",
                      SDL_GetError());
@@ -1847,10 +2124,15 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
         delete b;
         return false;
     }
+    SDL_SetTextureBlendMode(b->texture, SDL_BLENDMODE_NONE);
+    std::fprintf(stderr, "host_window: upload_format=%s packing=%u hidden=%u focused=%u\n",
+        SDL_GetPixelFormatName(b->texture_format), b->texture_format != SDL_PIXELFORMAT_RGB24 ? 1u : 0u,
+        (SDL_GetWindowFlags(b->window) & SDL_WINDOW_HIDDEN) ? 1u : 0u,
+        (SDL_GetWindowFlags(b->window) & SDL_WINDOW_INPUT_FOCUS) ? 1u : 0u);
 #if SDL_VERSION_ATLEAST(2, 0, 12)
     SDL_SetTextureScaleMode(
         b->texture,
-        b->linear_filter ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+        b->linear_filter && !b->integer_scale ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
 #endif
 
 #if defined(GBARECOMP_RUNTIME_UI)
@@ -1866,20 +2148,12 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     open_first_game_controller(b);
     open_device_gyro(b);
 
-    // Open the audio device. The GBA mixer natively runs at 65536 Hz after
-    // the BIOS sets SOUNDBIAS resolution=1, so that is the engine default;
-    // opening the device at 32768 (the power-on default) made SDL play at
-    // half speed, hit the 250 ms queue cap, and flush — audible as muffled /
-    // watery chime artifacts. A caller-provided --audio-freq (e.g. the
-    // launcher's 32000/44100/48000 sample-rate choice) overrides it; the RAB
-    // resamples the mixer's native stream to that rate. SDL2 resamples
-    // internally if the host hardware doesn't natively support the rate, so
-    // this is portable. Failure is non-fatal — silent video still works.
-    const int want_freq = audio_freq > 0 ? audio_freq : 65536;
+    // The host device receives stereo S16. Both playback modes convert from
+    // the block's SOUNDBIAS rate; the initial device rate is only a preference.
     SDL_AudioSpec want{};
     want.freq     = want_freq;
     want.format   = AUDIO_S16SYS;
-    want.channels = 1;
+    want.channels = 2;
     want.samples  = 1024;  // ~15 ms callback quantum at 65 kHz
     const char* direct_audio_env = std::getenv("GBARECOMP_AUDIO_DIRECT");
     b->audio_direct =
@@ -1887,24 +2161,22 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     want.callback = b->audio_direct ? nullptr : gba_audio_callback;
     want.userdata = b->audio_direct ? nullptr : b;
     SDL_AudioSpec got{};
-    // In direct mode, disallow application-visible format changes so SDL
-    // converts the exact 65536 Hz mono stream to the physical device itself.
-    // Bridge mode instead opens at the native rate and performs that clock
-    // conversion in RAB.
     const char* audio_device_env = std::getenv("GBARECOMP_AUDIO_DEVICE");
     const char* audio_device_name =
         audio_device_env && *audio_device_env ? audio_device_env : nullptr;
     b->audio_dev = SDL_OpenAudioDevice(audio_device_name, /*iscapture=*/0,
                                        &want, &got,
-                                       b->audio_direct
-                                           ? 0
-                                           : SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+                                       SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+    if (b->audio_dev && (got.channels != 2 || got.format != AUDIO_S16SYS || got.freq <= 0)) {
+        SDL_CloseAudioDevice(b->audio_dev);
+        b->audio_dev = 0;
+    }
     if (b->audio_dev != 0) {
         if (b->audio_direct) {
             b->audio_direct_rate = got.freq;
             std::fprintf(stderr,
                          "host_window: audio=direct-queue driver=%s "
-                         "device=%s format=%dHz mono S16 quantum=%u\n",
+                         "device=%s format=%dHz stereo S16 quantum=%u\n",
                          SDL_GetCurrentAudioDriver()
                              ? SDL_GetCurrentAudioDriver() : "(unknown)",
                          audio_device_name ? audio_device_name : "(default)",
@@ -1925,8 +2197,8 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
             b->audio_mtx = SDL_CreateMutex();
             rab_config cfg;
             rab_config_defaults(&cfg);
-            cfg.channels    = 1;
-            cfg.source_rate = 65536.0;                 // engine's standardized GBA mixer rate
+            cfg.channels    = 2;
+            cfg.source_rate = 65536.0;                 // re-tuned on the first rate-tagged block
             cfg.host_rate   = static_cast<double>(got.freq);
             cfg.target_ms   = 60.0;                     // steady cushion (matches NES)
             cfg.preroll_ms  = 250.0;                    // boot pre-roll: hide the cold-start
@@ -1936,7 +2208,10 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
         }
     }
 
-    b->color_lut = std::make_unique<runtime::ColorLut>(resolve_color_settings(screen));
+    auto upload_order = runtime::UploadPixelOrder::Rgb24;
+    if (b->texture_format == SDL_PIXELFORMAT_ARGB8888) upload_order = runtime::UploadPixelOrder::Argb8888;
+    else if (b->texture_format == SDL_PIXELFORMAT_ABGR8888) upload_order = runtime::UploadPixelOrder::Abgr8888;
+    b->color_lut = std::make_unique<runtime::ColorLut>(resolve_color_settings(screen), upload_order);
     if (!b->color_lut->is_passthrough())
         b->graded_fb.resize(static_cast<std::size_t>(base_w) * base_h * 3);
 
@@ -1951,21 +2226,51 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
 // (We are already inside namespace gbarecomp, so declare it unqualified.)
 uint64_t overlay_game_thread_compile_ns();
 
-void HostWindow::push_audio_block(const int16_t* samples, std::size_t count,
+void HostWindow::push_audio_stereo_block(const int16_t* samples, std::size_t count,
                                   uint32_t rate) {
-    if (!open_ || !impl_ || !samples || count == 0) return;
+    if (!open_ || !impl_ || !samples || count == 0 || count > INT_MAX / 4 ||
+        !(rate == 32768 || rate == 65536 || rate == 131072 || rate == 262144)) return;
     auto* b = static_cast<Backend*>(impl_);
     if (b->audio_dev == 0) return;
 
     // Volume (launcher setting + VolumeUp/Down hotkeys): scale into scratch
     // before the bridge. 100 = passthrough, byte-identical to before.
     if (b->volume != 100) {
-        b->volume_buf.resize(count);
+        b->volume_buf.resize(count * 2);
         const int v = b->volume;
-        for (std::size_t i = 0; i < count; ++i)
+        for (std::size_t i = 0; i < count * 2; ++i)
             b->volume_buf[i] = static_cast<int16_t>(
                 (static_cast<int32_t>(samples[i]) * v) / 100);
         samples = b->volume_buf.data();
+    }
+
+    // Optional output smoothing (GBARECOMP_AUDIO_SMOOTH=1, off by default):
+    // a gentle one-pole low-pass per channel (alpha 830/1024, about 8.5 kHz
+    // at the native 32.768 kHz mixer rate) softens the harshness of 8-bit
+    // Direct Sound streams without the muffling of a stronger filter. It runs
+    // on the interleaved stereo stream before either playback mode, and the
+    // bypass path is byte-identical to the unsmoothed stream.
+    static int s_smooth = -1;
+    static int32_t s_smooth_state[2] = {0, 0};
+    static std::vector<int16_t> s_smooth_buf;
+    if (s_smooth < 0) {
+        const char* e = std::getenv("GBARECOMP_AUDIO_SMOOTH");
+        s_smooth = (e && *e && *e != '0') ? 1 : 0;
+        if (s_smooth)
+            std::fprintf(stderr,
+                         "audio_smooth=ENABLED (one-pole ~8.5kHz, stereo)
+");
+    }
+    if (s_smooth) {
+        s_smooth_buf.resize(count * 2);
+        for (std::size_t i = 0; i < count * 2; ++i) {
+            int32_t& st = s_smooth_state[i & 1u];
+            st += ((static_cast<int32_t>(samples[i]) - st) * 830) >> 10;
+            if (st > 32767) st = 32767;
+            else if (st < -32768) st = -32768;
+            s_smooth_buf[i] = static_cast<int16_t>(st);
+        }
+        samples = s_smooth_buf.data();
     }
 
     if (b->audio_direct) {
@@ -1981,8 +2286,11 @@ void HostWindow::push_audio_block(const int16_t* samples, std::size_t count,
         b->audio_direct_min_bytes =
             std::min(b->audio_direct_min_bytes, queued_before);
 
-        const Uint32 bytes = static_cast<Uint32>(count * sizeof(int16_t));
-        if (SDL_QueueAudio(b->audio_dev, samples, bytes) != 0) {
+        b->audio_direct_pcm.clear();
+        if (!b->audio_direct_stream.convert(samples, count, rate,
+                                             b->audio_direct_rate, b->audio_direct_pcm)) return;
+        const Uint32 bytes = static_cast<Uint32>(b->audio_direct_pcm.size() * sizeof(int16_t));
+        if (bytes && SDL_QueueAudio(b->audio_dev, b->audio_direct_pcm.data(), bytes) != 0) {
             static bool s_reported_queue_failure = false;
             if (!s_reported_queue_failure) {
                 std::fprintf(stderr,
@@ -1998,8 +2306,9 @@ void HostWindow::push_audio_block(const int16_t* samples, std::size_t count,
             std::max(b->audio_direct_max_bytes, queued_after);
         ++b->audio_direct_pushes;
         b->audio_direct_samples += count;
+        b->audio_direct_seconds += static_cast<double>(count) / rate;
 
-        constexpr Uint32 kDirectPrerollBytes = 16384;  // 125 ms at 65536 Hz S16
+        const Uint32 kDirectPrerollBytes = b->audio_direct_rate * 4 / 8; // 125 ms, stereo S16
         if (!b->audio_direct_started &&
             queued_after >= kDirectPrerollBytes) {
             b->audio_direct_started = true;
@@ -2012,7 +2321,7 @@ void HostWindow::push_audio_block(const int16_t* samples, std::size_t count,
             s_direct_probe = (e && *e && *e != '0') ? 1 : 0;
         }
         if (s_direct_probe) {
-            for (std::size_t i = 0; i < count; ++i) {
+            for (std::size_t i = 0; i < count * 2; ++i) {
                 const int sample = samples[i];
                 if (sample != 0) ++b->audio_direct_probe_nonzero;
                 b->audio_direct_probe_peak =
@@ -2020,14 +2329,13 @@ void HostWindow::push_audio_block(const int16_t* samples, std::size_t count,
                 b->audio_direct_probe_square_sum +=
                     static_cast<long double>(sample) * sample;
             }
-            b->audio_direct_probe_samples += count;
+            b->audio_direct_probe_samples += count * 2;
         }
         if (s_direct_probe && (b->audio_direct_pushes % 120ULL) == 0ULL) {
             const double bytes_per_ms =
                 static_cast<double>(b->audio_direct_rate) *
-                sizeof(int16_t) / 1000.0;
-            const double audio_secs =
-                static_cast<double>(b->audio_direct_samples) / 65536.0;
+                (2 * sizeof(int16_t)) / 1000.0;
+            const double audio_secs = b->audio_direct_seconds;
             const double rms = b->audio_direct_probe_samples
                 ? std::sqrt(static_cast<double>(
                       b->audio_direct_probe_square_sum /
@@ -2074,8 +2382,8 @@ void HostWindow::push_audio_block(const int16_t* samples, std::size_t count,
             cfg.source_rate = static_cast<double>(rate);
             rab_free(&b->bridge);
             if (rab_init(&b->bridge, &cfg) != 0) {
-                SDL_UnlockMutex(b->audio_mtx);
                 b->bridge_ready = false;
+                SDL_UnlockMutex(b->audio_mtx);
                 return;
             }
         } else {
@@ -2084,56 +2392,12 @@ void HostWindow::push_audio_block(const int16_t* samples, std::size_t count,
         SDL_UnlockMutex(b->audio_mtx);
     }
 
-    // Producer: append mono frames into the bridge ring. The SDL callback
+    // Producer: append interleaved stereo frames into the bridge ring. The SDL callback
     // (gba_audio_callback) drains it at the device rate with band-limited
     // resampling + a P-only fill servo — no queue underrun, no hard flush.
-    //
-    // Optional output smoothing (GBARECOMP_AUDIO_SMOOTH=1, off by default):
-    // a gentle one-pole low-pass (alpha 830/1024 ≈ 8.5 kHz at the native
-    // 32.768 kHz mixer rate) softens the harshness of 8-bit Direct Sound
-    // streams without the audible "muffling" of a stronger filter. The
-    // bypass path is byte-identical to the unsmoothed stream.
-    static int s_smooth = -1;
-    static int32_t s_smooth_state = 0;
-    static bool s_smooth_logged = false;
-    if (s_smooth < 0) {
-        const char* e = std::getenv("GBARECOMP_AUDIO_SMOOTH");
-        s_smooth = (e && *e && *e != '0') ? 1 : 0;
-        if (s_smooth)
-            std::fprintf(stderr,
-                         "audio_smooth=ENABLED (one-pole ~8.5kHz)\n");
-    }
+
     SDL_LockMutex(b->audio_mtx);
-    if (s_smooth && count > 0) {
-        static int16_t scratch[4096];
-        const std::size_t n = count < 4096 ? count : 4096;
-        long double in_sq = 0.0, out_sq = 0.0;
-        for (std::size_t i = 0; i < n; ++i) {
-            const int32_t x = samples[i];
-            s_smooth_state += ((x - s_smooth_state) * 830) >> 10;
-            if (s_smooth_state > 32767) s_smooth_state = 32767;
-            else if (s_smooth_state < -32768) s_smooth_state = -32768;
-            scratch[i] = static_cast<int16_t>(s_smooth_state);
-            in_sq += static_cast<long double>(x) * x;
-            out_sq += static_cast<long double>(scratch[i]) * scratch[i];
-        }
-        if (!s_smooth_logged) {
-            s_smooth_logged = true;
-            std::fprintf(stderr,
-                "audio_smooth: first block frames=%zu rms_in=%.1f rms_out=%.1f\n",
-                n,
-                static_cast<double>(std::sqrt(
-                    static_cast<double>(in_sq / n))),
-                static_cast<double>(std::sqrt(
-                    static_cast<double>(out_sq / n))));
-        }
-        rab_push(&b->bridge, scratch, static_cast<int>(n));
-        if (count > n)
-            rab_push(&b->bridge, samples + n,
-                     static_cast<int>(count - n));
-    } else {
-        rab_push(&b->bridge, samples, static_cast<int>(count)); // mono: count == frames
-    }
+    rab_push(&b->bridge, samples, static_cast<int>(count));
     SDL_UnlockMutex(b->audio_mtx);
 
     // ── NES-mode crackle probe (measure step) ──────────────────────────
@@ -2144,10 +2408,12 @@ void HostWindow::push_audio_block(const int16_t* samples, std::size_t count,
     if (s_probe < 0) { const char* e = std::getenv("GBARECOMP_AUDIO_PROBE"); s_probe = (e && *e && *e != '0') ? 1 : 0; }
     if (s_probe) {
         static unsigned long long s_pushes = 0, s_samples = 0;
+        static double s_seconds = 0;
         s_pushes++; s_samples += count;
+        s_seconds += static_cast<double>(count) / rate;
         if ((s_pushes % 120ULL) == 0ULL) {
             rab_stats st; rab_get_stats(&b->bridge, &st);
-            double secs = static_cast<double>(s_samples) / 65536.0;
+            double secs = s_seconds;
             double stretch_ms = st.stretch_frames * 1000.0
                               / static_cast<double>(b->bridge.cfg.host_rate);
             // Game-thread codegen time: cumulative + this-window delta. The delta
@@ -2176,6 +2442,31 @@ void HostWindow::push_audio_samples(const int16_t* samples, std::size_t count) {
     push_audio_block(samples, count, 65536u);
 }
 
+void HostWindow::push_audio_block(const int16_t* samples, std::size_t count, uint32_t rate) {
+    if (!impl_ || !samples || count == 0 || count > INT_MAX / 4) return;
+    auto* b = static_cast<Backend*>(impl_);
+    b->mono_stereo_pcm.resize(count * 2);
+    for (std::size_t i = 0; i < count; ++i)
+        b->mono_stereo_pcm[i*2] = b->mono_stereo_pcm[i*2+1] = samples[i];
+    push_audio_stereo_block(b->mono_stereo_pcm.data(), count, rate);
+}
+
+void HostWindow::reset_audio() {
+    if (!impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    if (b->audio_direct) {
+        if (b->audio_dev) { SDL_PauseAudioDevice(b->audio_dev, 1); SDL_ClearQueuedAudio(b->audio_dev); }
+        b->audio_direct_stream.reset();
+        b->audio_direct_started = false;
+    } else if (b->bridge_ready) {
+        SDL_LockMutex(b->audio_mtx);
+        const rab_config cfg = b->bridge.cfg;
+        rab_free(&b->bridge);
+        b->bridge_ready = rab_init(&b->bridge, &cfg) == 0;
+        SDL_UnlockMutex(b->audio_mtx);
+    }
+}
+
 void HostWindow::set_title(const char* title) {
     if (!open_ || !impl_ || !title) return;
     auto* b=static_cast<Backend*>(impl_);
@@ -2183,27 +2474,135 @@ void HostWindow::set_title(const char* title) {
     SDL_SetWindowTitle(b->window,title);
 }
 
+static void commit_pending_gap(Backend* b) {
+    const uint64_t gap_us = b->health_pending_gap_us;
+    if (!gap_us) return;
+    b->health_pending_gap_us = 0;
+    if (gap_us > 25000ull) ++b->health_late;
+    if (gap_us > 100000ull) {
+        ++b->health_hitches;
+        // Where it happened, so it can be matched with what the player was
+        // doing; rare by definition, capped regardless.
+        if (b->health_hitch_lines < 20) {
+            ++b->health_hitch_lines;
+            std::fprintf(stderr,
+                         "host_window: hitch %.1f ms at frame %llu, "
+                         "%.1f s into the session\n",
+                         gap_us / 1000.0,
+                         static_cast<unsigned long long>(b->health_pending_frame),
+                         static_cast<double>(b->health_pending_at - b->health_first_present) /
+                             SDL_GetPerformanceFrequency());
+        }
+    }
+    b->health_max_gap_us = std::max(b->health_max_gap_us, gap_us);
+}
+
+static void note_present_for_health(Backend* b) {
+    const Uint64 now = SDL_GetPerformanceCounter();
+    // Another present came, so the previous gap did not lead out of the
+    // foreground: count it.
+    commit_pending_gap(b);
+    uint64_t gap_us = UINT64_MAX;
+    if (b->health_prev_present) {
+        gap_us = (now - b->health_prev_present) * 1000000ull /
+                 SDL_GetPerformanceFrequency();
+        // Longer gaps are pauses (menus, state loads), not stutter.
+        if (gap_us < 2000000ull) {
+            b->health_pending_gap_us = gap_us;
+            b->health_pending_frame = b->health_frames;
+            b->health_pending_at = now;
+        }
+    }
+    if (!b->health_first_present) b->health_first_present = now;
+    if (b->bridge_ready) {
+        rab_stats st;
+        // The SDL audio callback writes these counters under this mutex.
+        SDL_LockMutex(b->audio_mtx);
+        rab_get_stats(&b->bridge, &st);
+        SDL_UnlockMutex(b->audio_mtx);
+        if (gap_us <= 100000ull) {
+            // A bridge restart (resume or source-rate change) resets counters.
+            // Never subtract a previous epoch's larger unsigned value.
+            if (st.underrun_events >= b->health_seen_underrun)
+                b->health_play_underrun += st.underrun_events - b->health_seen_underrun;
+            if (st.overflow_drops >= b->health_seen_overflow)
+                b->health_play_overflow += st.overflow_drops - b->health_seen_overflow;
+        }
+        b->health_seen_underrun = st.underrun_events;
+        b->health_seen_overflow = st.overflow_drops;
+    }
+    b->health_prev_present = now;
+    ++b->health_frames;
+}
+
+static void log_session_health(Backend* b, const char* when) {
+    // The gap before the last present led out of the foreground (or to the
+    // end): the system's transition, not the game's.
+    if (b->health_pending_gap_us > 100000ull) {
+        std::fprintf(stderr,
+                     "host_window: %.1f ms before the last frame (%s), "
+                     "not counted\n",
+                     b->health_pending_gap_us / 1000.0, when);
+    }
+    b->health_pending_gap_us = 0;
+    // Milliseconds of output played from an empty bridge, and of guest audio
+    // dropped because the bridge was full, during steady play.
+    double dry_ms = 0.0, dropped_ms = 0.0;
+    if (b->bridge_ready) {
+        dry_ms = b->health_play_underrun * 1000.0 / b->bridge.cfg.host_rate;
+        dropped_ms = b->health_play_overflow * 1000.0 / b->bridge.cfg.source_rate;
+    }
+    std::fprintf(stderr,
+                 "host_window: session_health (%s) frames=%llu late_frames=%llu "
+                 "hitches=%llu max_gap_ms=%.1f audio_dry_ms=%.1f "
+                 "audio_dropped_ms=%.1f\n",
+                 when, static_cast<unsigned long long>(b->health_frames),
+                 static_cast<unsigned long long>(b->health_late),
+                 static_cast<unsigned long long>(b->health_hitches),
+                 b->health_max_gap_us / 1000.0, dry_ms, dropped_ms);
+    std::fflush(stderr);
+}
+
 void HostWindow::close() {
     if (!impl_) { open_ = false; return; }
     auto* b = static_cast<Backend*>(impl_);
     b->cadence.dump();  // MC-WS-002: flush the cadence ring (verbose only)
     if (b->audio_dev) SDL_CloseAudioDevice(b->audio_dev);  // stops the callback first
+    log_session_health(b, "exit");
     if (b->bridge_ready) rab_free(&b->bridge);
     if (b->audio_mtx) SDL_DestroyMutex(b->audio_mtx);
     close_game_controller(b);
     if (b->device_gyro) SDL_SensorClose(b->device_gyro);
+#if defined(__ANDROID__)
+    // The process outlives a game session (a launcher Activity can keep it),
+    // but SDL's Android sensor driver binds every event queue to the ALooper
+    // of the thread that initialised the subsystem: this session's game
+    // thread, which ends with it. Quit the subsystem so the next session's
+    // open() initialises it again on its own thread. Otherwise the next
+    // session's SDL_SensorOpen/SDL_SensorClose went through the dead thread's
+    // looper and crashed in Looper::addFd / Looper::removeFd.
+    SDL_QuitSubSystem(SDL_INIT_SENSOR);
+#endif
     if (b->haptic) SDL_HapticClose(b->haptic);
     if (g_haptic_window == this) g_haptic_window = nullptr;
 #if defined(GBARECOMP_RUNTIME_UI)
     runtime_imgui_shutdown(b);
 #endif
     destroy_sharp_texture(b);
+    b->hd_gpu.reset();
     if (b->texture)   SDL_DestroyTexture(b->texture);
     if (b->renderer)  SDL_DestroyRenderer(b->renderer);
     if (b->window)    SDL_DestroyWindow(b->window);
     delete b;
     impl_ = nullptr;
     open_ = false;
+#if defined(__ANDROID__)
+    // The process outlives the session and SDL's event queue with it. When
+    // the Activity is destroyed in the background, SDL queues SDL_QUIT then
+    // SDL_APP_TERMINATING; wait_for_foreground() returns on the first, and the
+    // second used to terminate the next session before its first frame.
+    SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+#endif
 }
 
 bool HostWindow::set_surface_size(int base_w, int base_h) {
@@ -2214,7 +2613,7 @@ bool HostWindow::set_surface_size(int base_w, int base_h) {
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,
                 b->linear_filter ? "linear" : "nearest");
     SDL_Texture* replacement = SDL_CreateTexture(
-        b->renderer, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING,
+        b->renderer, b->texture_format, SDL_TEXTUREACCESS_STREAMING,
         base_w, base_h);
     if (!replacement) {
         std::fprintf(stderr,
@@ -2222,17 +2621,29 @@ bool HostWindow::set_surface_size(int base_w, int base_h) {
                      SDL_GetError());
         return false;
     }
+    SDL_SetTextureBlendMode(replacement, SDL_BLENDMODE_NONE);
 #if SDL_VERSION_ATLEAST(2, 0, 12)
     SDL_SetTextureScaleMode(
         replacement,
-        b->linear_filter ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+        b->linear_filter && !b->integer_scale ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
 #endif
     SDL_DestroyTexture(b->texture);
     destroy_sharp_texture(b);
     b->texture = replacement;
+    b->presentation_source_w = b->presentation_source_h = 0;
     b->base_w = base_w;
     b->base_h = base_h;
     b->expanded_view = base_w != 240 || base_h != 160;
+#if !defined(__ANDROID__)
+    // A live Display choice can cross between SDL's native logical viewport
+    // and the explicit wide destination. Reset both coordinate systems, or
+    // Native -> 16:9 draws drawable coordinates through the old 240x160 scale.
+    const bool explicit_view = b->expanded_view || b->resize_driven_view || b->integer_scale;
+    SDL_RenderSetLogicalSize(b->renderer, explicit_view ? 0 : base_w, explicit_view ? 0 : base_h);
+    if (explicit_view) SDL_RenderSetViewport(b->renderer, nullptr);
+    SDL_SetWindowResizable(b->window,
+        explicit_view || b->freely_resizable_window ? SDL_TRUE : SDL_FALSE);
+#endif
     if (b->color_lut && !b->color_lut->is_passthrough())
         b->graded_fb.resize(static_cast<std::size_t>(base_w) * base_h * 3u);
     return true;
@@ -2268,18 +2679,156 @@ bool HostWindow::drawable_size(int* width, int* height) const {
            *width > 0 && *height > 0;
 }
 
-void HostWindow::present(const uint8_t* rgb888) {
-    if (!open_ || !impl_ || !rgb888) return;
+bool HostWindow::hd_jobs_available() {
+#if defined(GBARECOMP_GPU_HD_EXPERIMENT)
+    if (!open_ || !impl_) return false;
     auto* b = static_cast<Backend*>(impl_);
-    // Present-time color grading (opt-in). Raw is passthrough: the raw
-    // PPU frame is uploaded untouched, so verify/frame-hash are unaffected.
-    if (b->color_lut && !b->color_lut->is_passthrough() &&
-        b->graded_fb.size() == static_cast<std::size_t>(b->base_w) * b->base_h * 3u) {
-        b->color_lut->map_rgb888(rgb888, b->graded_fb.data(), b->base_w, b->base_h);
-        rgb888 = b->graded_fb.data();
+    if (!b->hd_gpu_checked) {
+        b->hd_gpu_checked = true;
+        b->hd_gpu = std::make_unique<HdGpuRenderer>();
+        if (!b->hd_gpu->initialize(b->renderer,b->texture)) b->hd_gpu.reset();
     }
-    SDL_UpdateTexture(b->texture, nullptr, rgb888, b->base_w * 3);
+    return b->hd_gpu && b->hd_gpu->available();
+#else
+    return false;
+#endif
+}
+bool HostWindow::present_hd(const gba::GbaHighResolutionFrame::DrawFrame& frame) {
+    if (!hd_jobs_available()) return false;
+    auto* b = static_cast<Backend*>(impl_);
+#if defined(GBARECOMP_NATIVE_DRAW_JOBS)
+    b->native_frame.reset();
+#endif
+    SDL_Texture* texture = b->hd_gpu->render(frame,b->color_lut.get());
+    if (!texture) return false;
+#if SDL_VERSION_ATLEAST(2,0,12)
+    SDL_SetTextureScaleMode(texture,b->linear_filter && !b->integer_scale ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+#endif
+    b->resident_frame = texture;
+    present(nullptr,frame.width*frame.scale,frame.height*frame.scale);
+    return true;
+}
+bool HostWindow::readback_hd(std::vector<uint8_t>& rgb,unsigned& width,unsigned& height) {
+    if (!open_ || !impl_) return false;
+    auto* b = static_cast<Backend*>(impl_);
+    return b->hd_gpu && b->hd_gpu->readback(rgb,width,height);
+}
+#if defined(GBARECOMP_NATIVE_DRAW_JOBS)
+bool HostWindow::readback_native(const std::shared_ptr<const gba::GbaNativeDrawFrame>& frame,
+                                std::vector<uint8_t>& rgb) {
+    if(!frame || !hd_jobs_available())return false;
+    auto* b=static_cast<Backend*>(impl_);
+    if(b->native_frame!=frame) {
+        if(!b->hd_gpu->render_native(*frame,nullptr))return false;
+        b->native_frame=frame;
+    }
+    return b->hd_gpu->readback_native(rgb);
+}
+bool HostWindow::present_native(const std::shared_ptr<const gba::GbaNativeDrawFrame>& frame) {
+    if(!frame || !hd_jobs_available())return false;
+    auto* b=static_cast<Backend*>(impl_);
+    if(b->native_frame!=frame) {
+        if(!b->hd_gpu->render_native(*frame,nullptr))return false;
+        b->native_frame=frame;
+    }
+    auto* texture=b->hd_gpu->native_display(b->color_lut.get());
+    if(!texture)return false;
+#if SDL_VERSION_ATLEAST(2,0,12)
+    SDL_SetTextureScaleMode(texture,b->linear_filter && !b->integer_scale ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+#endif
+    b->resident_frame=texture;
+    present(nullptr,240,160);
+    return true;
+}
+#endif
+
+void HostWindow::present(const uint8_t* rgb888) { present(rgb888, 0, 0); }
+
+void HostWindow::present(const uint8_t* rgb888, unsigned sampled_w, unsigned sampled_h) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    SDL_Texture* frame_texture = b->resident_frame;
+    b->resident_frame = nullptr;
+    if (!rgb888 && !frame_texture) return;
+    if (!sampled_w) sampled_w = unsigned(b->base_w);
+    if (!sampled_h) sampled_h = unsigned(b->base_h);
+    if (!frame_texture) {
+        int texture_w = 0, texture_h = 0;
+        SDL_QueryTexture(b->texture, nullptr, nullptr, &texture_w, &texture_h);
+        if (b->presentation_source_w != sampled_w || b->presentation_source_h != sampled_h) {
+            unsigned upload_w = sampled_w, upload_h = sampled_h;
+            SDL_RendererInfo info{};
+            SDL_GetRendererInfo(b->renderer, &info);
+            const auto shrink = [&] {
+                upload_w = std::max(1u, upload_w / 2);
+                upload_h = std::max(1u, upload_h / 2);
+            };
+            while ((info.max_texture_width > 0 && upload_w > unsigned(info.max_texture_width)) ||
+                   (info.max_texture_height > 0 && upload_h > unsigned(info.max_texture_height))) shrink();
+            SDL_Texture* replacement = nullptr;
+            while (upload_w != unsigned(texture_w) || upload_h != unsigned(texture_h)) {
+                replacement = SDL_CreateTexture(b->renderer, b->texture_format,
+                    SDL_TEXTUREACCESS_STREAMING, int(upload_w), int(upload_h));
+                if (replacement) break;
+                if (upload_w == 1 && upload_h == 1)
+                    throw std::runtime_error("cannot allocate presentation texture");
+                shrink();
+            }
+            if (replacement) {
+                SDL_SetTextureBlendMode(replacement, SDL_BLENDMODE_NONE);
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+                SDL_SetTextureScaleMode(replacement, b->linear_filter && !b->integer_scale ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+#endif
+                SDL_DestroyTexture(b->texture); destroy_sharp_texture(b);
+                b->texture = replacement;
+            }
+            texture_w = int(upload_w); texture_h = int(upload_h);
+            b->presentation_source_w = sampled_w; b->presentation_source_h = sampled_h;
+            std::fprintf(stderr, "host_window: render surface logical=%dx%d internal=%ux%u upload=%dx%d\n",
+                         b->base_w, b->base_h, sampled_w, sampled_h, texture_w, texture_h);
+        }
+        // Large elective scales can exceed an older GPU's texture limit. Keep the
+        // complete CPU raster and reduce only the upload, preserving logical view
+        // and guest state. Remember the successful size instead of retrying a
+        // failed allocation every frame.
+        if (unsigned(texture_w) != sampled_w || unsigned(texture_h) != sampled_h) {
+            b->presentation_upload.resize(size_t(texture_w) * texture_h * 3);
+            for (int y = 0; y < texture_h; ++y) {
+                const size_t row = size_t(uint64_t(y) * sampled_h / texture_h) * sampled_w;
+                for (int x = 0; x < texture_w; ++x)
+                    std::memcpy(b->presentation_upload.data() + (size_t(y) * texture_w + x) * 3,
+                        rgb888 + (row + uint64_t(x) * sampled_w / texture_w) * 3, 3);
+            }
+            rgb888 = b->presentation_upload.data();
+        }
+        note_present_for_health(b);
+        // Present-time color grading (opt-in). Raw is passthrough: the raw
+        // PPU frame is uploaded untouched, so verify/frame-hash are unaffected.
+        if (b->texture_format != SDL_PIXELFORMAT_RGB24) {
+            b->packed_upload.resize(size_t(texture_w) * texture_h);
+            static const runtime::ColorLut raw_lut(runtime::ColorSettings{});
+            const auto& lut = b->color_lut ? *b->color_lut : raw_lut;
+            lut.map_packed8888(rgb888, b->packed_upload.data(), texture_w, texture_h,
+                b->texture_format == SDL_PIXELFORMAT_ABGR8888);
+            SDL_UpdateTexture(b->texture, nullptr, b->packed_upload.data(), texture_w * 4);
+        } else {
+            if (b->color_lut && !b->color_lut->is_passthrough()) {
+                b->graded_fb.resize(size_t(texture_w) * texture_h * 3);
+                b->color_lut->map_rgb888(rgb888, b->graded_fb.data(), texture_w, texture_h);
+                rgb888 = b->graded_fb.data();
+            }
+            SDL_UpdateTexture(b->texture, nullptr, rgb888, texture_w * 3);
+        }
+        frame_texture = b->texture;
+    } else note_present_for_health(b);
+#if defined(__ANDROID__)
+    // Pure black around the game: on OLED panels (common on Android phones
+    // and handhelds such as the RG556) those pixels are then off, not a dim
+    // navy lit for hours in the same place.
+    SDL_SetRenderDrawColor(b->renderer, 0, 0, 0, 255);
+#else
     SDL_SetRenderDrawColor(b->renderer, 7, 11, 20, 255);
+#endif
     SDL_RenderClear(b->renderer);
 #if defined(__ANDROID__)
     if (!b->insets_from_env && g_android_insets_known.load()) {
@@ -2347,16 +2896,16 @@ void HostWindow::present(const uint8_t* rgb888) {
     if (touch_input_enabled(b)) publish_touch_presentation(b);
 #if defined(__ANDROID__)
     const SDL_Rect destination{layout.x, layout.y, layout.width, layout.height};
-    SDL_RenderCopy(b->renderer, b->texture, nullptr, &destination);
+    SDL_RenderCopy(b->renderer, frame_texture, nullptr, &destination);
 #else
-    if (!b->expanded_view && !b->resize_driven_view) {
-        SDL_RenderCopy(b->renderer, b->texture, nullptr, nullptr);
+    if (!b->expanded_view && !b->resize_driven_view && !b->integer_scale) {
+        SDL_RenderCopy(b->renderer, frame_texture, nullptr, nullptr);
     } else {
         if (layout.width > 0 && layout.height > 0) {
             const SDL_Rect destination = {
                 layout.x, layout.y, layout.width, layout.height};
             bool sharp_presented = false;
-            const int sharp_factor = b->sharp_filter
+            const int sharp_factor = b->sharp_filter && sampled_w == unsigned(b->base_w) && sampled_h == unsigned(b->base_h)
                 ? compute_sharp_prescale_factor(
                       layout, b->base_w, b->base_h)
                 : 0;
@@ -2365,7 +2914,7 @@ void HostWindow::present(const uint8_t* rgb888) {
                 SDL_SetRenderTarget(b->renderer, b->sharp_texture) == 0) {
                 const bool prescaled =
                     SDL_RenderCopy(
-                        b->renderer, b->texture, nullptr, nullptr) == 0;
+                        b->renderer, frame_texture, nullptr, nullptr) == 0;
                 const bool restored =
                     SDL_SetRenderTarget(b->renderer, nullptr) == 0;
                 if (prescaled && restored) {
@@ -2380,11 +2929,30 @@ void HostWindow::present(const uint8_t* rgb888) {
                 // retain the crisp nearest path.
                 SDL_SetRenderTarget(b->renderer, nullptr);
                 SDL_RenderCopy(
-                    b->renderer, b->texture, nullptr, &destination);
+                    b->renderer, frame_texture, nullptr, &destination);
             }
         }
     }
 #endif
+    // Present-time CRT-style bands never alter the guest framebuffer or HD
+    // readback. At less than 2x there is no room for a dark half-scanline.
+    if (b->scanlines && b->scanline_strength > 0 && layout.height >= b->base_h * 2) {
+        int logical_w = 0, logical_h = 0;
+        SDL_RenderGetLogicalSize(b->renderer, &logical_w, &logical_h);
+        SDL_RenderSetLogicalSize(b->renderer, 0, 0);
+        SDL_RenderSetViewport(b->renderer, nullptr);
+        SDL_SetRenderDrawBlendMode(b->renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(b->renderer, 0, 0, 0,
+            static_cast<Uint8>(b->scanline_strength * 255 / 100));
+        for (int y = 0; y < b->base_h; ++y) {
+            const int top = layout.y + (2 * y + 1) * layout.height / (2 * b->base_h);
+            const int bottom = layout.y + (y + 1) * layout.height / b->base_h;
+            const SDL_Rect band{layout.x, top, layout.width, bottom - top};
+            SDL_RenderFillRect(b->renderer, &band);
+        }
+        SDL_SetRenderDrawBlendMode(b->renderer, SDL_BLENDMODE_NONE);
+        SDL_RenderSetLogicalSize(b->renderer, logical_w, logical_h);
+    }
     render_host_layers(b);
     // MC-WS-002: time the present itself (vsync blocks here — or doesn't)
     // and stamp the DWM refresh counter into the cadence ring.
@@ -2404,9 +2972,9 @@ void HostWindow::present(const uint8_t* rgb888) {
         if (b->fps_window_start == 0) b->fps_window_start = now;
         const Uint32 span = now - b->fps_window_start;
         if (span >= 500) {
+            b->fps_value = b->fps_presents * 1000.0 / span;
             char buf[192];
-            std::snprintf(buf, sizeof(buf), "%s — %.1f fps", b->title.c_str(),
-                          b->fps_presents * 1000.0 / span);
+            std::snprintf(buf, sizeof(buf), "%s — %.1f fps", b->title.c_str(), b->fps_value);
             SDL_SetWindowTitle(b->window, buf);
             b->fps_window_start = now;
             b->fps_presents = 0;
@@ -2416,16 +2984,23 @@ void HostWindow::present(const uint8_t* rgb888) {
 
 void HostWindow::load_input_config(const char* dir,
                                    bool assist_tools_default,
-                                   int fast_forward_multiplier_default) {
+                                   int fast_forward_multiplier_default,
+                                   const char* config_filename,
+                                   const char* keybinds_filename) {
     if (!open_ || !impl_ || !dir) return;
     auto* b = static_cast<Backend*>(impl_);
     b->assist_tools = assist_tools_default;
     b->assist_fast_forward_multiplier = std::clamp(
         fast_forward_multiplier_default, 2, 10);
-    const std::string base = std::string(dir) + "/";
+    const std::string config_path=(std::filesystem::path(dir)/(config_filename&&config_filename[0]?config_filename:"config.ini")).string();
+    b->launcher_config_path = config_path;
+    const std::string keybinds_path=(std::filesystem::path(dir)/(keybinds_filename&&keybinds_filename[0]?keybinds_filename:"keybinds.ini")).string();
+#if defined(GBARECOMP_GBA_PAD_BINDS)
+    b->input_config_dir=dir;load_controller_bindings(b);
+#endif
 
     // keybinds.ini [player1] (recomp-ui generic format, scancode names).
-    ini_scan_section((base + "keybinds.ini").c_str(), "player1",
+    ini_scan_section(keybinds_path.c_str(), "player1",
                      [b](const char* key, const char* val) {
         for (const auto& bk : kBindKeys) {
             if (SDL_strcasecmp(key, bk.name) != 0) continue;
@@ -2436,7 +3011,7 @@ void HostWindow::load_input_config(const char* dir,
     });
 
     // config.ini [KeyMap] (keycode names with Ctrl+/Alt+/Shift+ prefixes).
-    ini_scan_section((base + "config.ini").c_str(), "KeyMap",
+    ini_scan_section(config_path.c_str(), "KeyMap",
                      [b](const char* key, const char* val) {
         for (int h = 0; h < HK_COUNT; ++h) {
             if (SDL_strcasecmp(key, kHotkeyNames[h]) != 0) continue;
@@ -2449,7 +3024,7 @@ void HostWindow::load_input_config(const char* dir,
     // scancodes; controller values use recomp-ui's portable button/axis
     // encoding. Keeping these in [Launcher] lets the pre-boot menu and the
     // runtime share one configuration file.
-    ini_scan_section((base + "config.ini").c_str(), "Launcher",
+    ini_scan_section(config_path.c_str(), "Launcher",
                      [b](const char* key, const char* val) {
         if (SDL_strcasecmp(key, "assist_tools") == 0)
             b->assist_tools = std::atoi(val) != 0;
@@ -2464,7 +3039,19 @@ void HostWindow::load_input_config(const char* dir,
             b->assist_pad[0] = std::atoi(val);
         else if (SDL_strcasecmp(key, "assist_fast_pad") == 0)
             b->assist_pad[1] = std::atoi(val);
+#if defined(GBARECOMP_GBA_PAD_BINDS)
+        else if(SDL_strcasecmp(key,"player_guid")==0) b->preferred_pad_guid=val;
+#endif
     });
+#if defined(GBARECOMP_GBA_PAD_BINDS)
+    if(!b->preferred_pad_guid.empty() && b->controller) {
+        char guid[40];SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(
+            SDL_GameControllerGetJoystick(b->controller)),guid,sizeof(guid));
+        if(b->preferred_pad_guid!=guid) close_game_controller(b);
+    }
+    if(!b->controller) for(int i=0;i<SDL_NumJoysticks();++i)
+        if(open_game_controller(b,i))break;
+#endif
 }
 
 bool HostWindow::assist_tools_enabled() const {
@@ -2554,12 +3141,47 @@ void HostWindow::set_linear_filter(bool enabled) {
     b->linear_filter = enabled;
 #if SDL_VERSION_ATLEAST(2, 0, 12)
     SDL_SetTextureScaleMode(b->texture,
-        enabled ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+        enabled && !b->integer_scale ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
 #endif
 }
 
 bool HostWindow::linear_filter() const {
     return open_ && impl_ && static_cast<const Backend*>(impl_)->linear_filter;
+}
+
+void HostWindow::set_integer_scale(bool enabled) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    b->integer_scale = enabled;
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+    SDL_SetTextureScaleMode(b->texture, b->linear_filter && !enabled ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+#endif
+    save_presentation_settings(b->launcher_config_path, b->integer_scale, b->scanlines, b->scanline_strength);
+#if !defined(__ANDROID__)
+    const bool explicit_view = b->expanded_view || b->resize_driven_view || enabled;
+    SDL_RenderSetLogicalSize(b->renderer, explicit_view ? 0 : b->base_w, explicit_view ? 0 : b->base_h);
+    SDL_RenderSetViewport(b->renderer, nullptr);
+#endif
+}
+
+bool HostWindow::integer_scale() const {
+    return open_ && impl_ && static_cast<const Backend*>(impl_)->integer_scale;
+}
+
+void HostWindow::set_scanlines(bool enabled, int strength_pct) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    b->scanlines = enabled;
+    b->scanline_strength = std::clamp(strength_pct, 0, 100);
+    save_presentation_settings(b->launcher_config_path, b->integer_scale, b->scanlines, b->scanline_strength);
+}
+
+bool HostWindow::scanlines() const {
+    return open_ && impl_ && static_cast<const Backend*>(impl_)->scanlines;
+}
+
+int HostWindow::scanline_strength() const {
+    return open_ && impl_ ? static_cast<const Backend*>(impl_)->scanline_strength : 35;
 }
 
 void HostWindow::set_audio_enabled(bool enabled) {
@@ -2578,6 +3200,11 @@ void HostWindow::set_resize_driven_view(bool enabled) {
     if (!open_ || !impl_) return;
     auto* b = static_cast<Backend*>(impl_);
     b->resize_driven_view = enabled;
+#if !defined(__ANDROID__)
+    const bool explicit_view = b->expanded_view || enabled || b->integer_scale;
+    SDL_RenderSetLogicalSize(b->renderer, explicit_view ? 0 : b->base_w, explicit_view ? 0 : b->base_h);
+    if (explicit_view) SDL_RenderSetViewport(b->renderer, nullptr);
+#endif
     SDL_SetWindowResizable(
         b->window,
         enabled || b->expanded_view || b->freely_resizable_window
@@ -2653,6 +3280,29 @@ void HostWindow::set_touch_config_dir(const char* dir) {
             b->toggle_pos_saved = true;
         }
     });
+    ini_scan_section((b->touch_config_dir + "/config.ini").c_str(), "Audio",
+                     [b](const char* key, const char* val) {
+        if (SDL_strcasecmp(key, "enhanced") == 0) {
+            b->audio_enhanced = std::atoi(val) != 0;
+            b->audio_enhanced_saved = true;
+        }
+    });
+}
+
+bool HostWindow::saved_audio_enhanced(bool& enabled) const {
+    if (!open_ || !impl_) return false;
+    auto* b = static_cast<const Backend*>(impl_);
+    if (!b->audio_enhanced_saved) return false;
+    enabled = b->audio_enhanced;
+    return true;
+}
+
+void HostWindow::save_audio_enhanced(bool enabled) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    b->audio_enhanced = enabled;
+    b->audio_enhanced_saved = true;
+    save_touch_config(b);
 }
 
 bool HostWindow::touch_pad_visible() const {
@@ -2704,7 +3354,7 @@ bool HostWindow::wait_for_foreground() {
     if (!open_ || !impl_) return false;
     auto* b = static_cast<Backend*>(impl_);
     std::fprintf(stderr, "host_window: background — emulation suspended\n");
-    std::fflush(stderr);
+    log_session_health(b, "background");
     if (b->audio_dev) SDL_PauseAudioDevice(b->audio_dev, 1);
     TouchHub::instance().cancel_all(touch_clock_ms());
     clear_touches(b);
@@ -2718,7 +3368,9 @@ bool HostWindow::wait_for_foreground() {
         }
     }
     b->backgrounded = false;
+    b->health_prev_present = 0;  // the time away is not a stall
     if (resumed && b->audio_dev) {
+        reset_audio();
         if (b->audio_direct) {
             // Rebuild the cushion rather than replaying a stale queue.
             SDL_ClearQueuedAudio(b->audio_dev);
@@ -2770,6 +3422,7 @@ void HostWindow::set_fps_readout(bool on) {
     b->fps_readout = on;
     b->fps_window_start = 0;
     b->fps_presents = 0;
+    b->fps_value = 0.0;
     if (!on) SDL_SetWindowTitle(b->window, b->title.c_str());
 }
 
@@ -2795,6 +3448,15 @@ HostWindow::Events HostWindow::pump() {
 
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+#if SDL_VERSION_ATLEAST(2,0,4)
+        if (e.type == SDL_RENDER_DEVICE_RESET || e.type == SDL_RENDER_TARGETS_RESET) {
+            if (b->hd_gpu) b->hd_gpu->reset(e.type == SDL_RENDER_DEVICE_RESET);
+            b->hd_gpu.reset(); b->hd_gpu_checked = false; b->resident_frame = nullptr;
+#if defined(GBARECOMP_NATIVE_DRAW_JOBS)
+            b->native_frame.reset();
+#endif
+        }
+#endif
 #if defined(GBARECOMP_RUNTIME_UI)
         const bool finger_event =
             e.type == SDL_FINGERDOWN || e.type == SDL_FINGERMOTION ||
@@ -2826,7 +3488,7 @@ HostWindow::Events HostWindow::pump() {
             ImGui::SetCurrentContext(b->runtime_imgui_context);
             ImGui_ImplSDL2_ProcessEvent(&e);
         }
-        if (runtime_ui_event(b->runtime_ui, e)) continue;
+        if (runtime_ui_event(b, e)) continue;
 #endif
         if (e.type == SDL_QUIT) {
             ev.quit = true;
@@ -3025,6 +3687,9 @@ HostWindow::Events HostWindow::pump() {
         open_runtime_menu_from_touch(b);
 #endif
     }
+#if defined(GBARECOMP_RUNTIME_UI)
+    runtime_ui_repeat(b);
+#endif
 
     // Build the GBA KEYINPUT value from current keyboard state via the
     // rebindable table (keybinds.ini; defaults in kDefaultBinds).
@@ -3040,6 +3705,17 @@ HostWindow::Events HostWindow::pump() {
     // inputs. Keyboard and controller are additive so either can be used at
     // any time, including while testing motion.
     if (b->controller && SDL_GameControllerGetAttached(b->controller)) {
+#if defined(GBARECOMP_GBA_PAD_BINDS)
+        for(int i=0;i<10;++i) {
+            bool pressed=b->pad_buttons[i]>=0 && SDL_GameControllerGetButton(
+                b->controller,(SDL_GameControllerButton)b->pad_buttons[i]);
+            if(b->pad_axes[i]>=0) {
+                const int value=SDL_GameControllerGetAxis(b->controller,(SDL_GameControllerAxis)b->pad_axes[i]);
+                pressed|=b->pad_axis_dirs[i]>0?value>=b->pad_deadzone:value<=-b->pad_deadzone;
+            }
+            if(pressed)keys&=static_cast<uint16_t>(~(1u<<kRuiGbaKeyBits[i]));
+        }
+#else
         const struct {
             int bit;
             SDL_GameControllerButton button;
@@ -3059,6 +3735,7 @@ HostWindow::Events HostWindow::pump() {
             if (SDL_GameControllerGetButton(b->controller, binding.button))
                 keys &= static_cast<uint16_t>(~(1u << binding.bit));
         }
+#endif
     }
     if (b->touch_controls) {
         const uint16_t touch_buttons = active_touch_buttons(b);
@@ -3086,6 +3763,15 @@ HostWindow::Events HostWindow::pump() {
 #if defined(GBARECOMP_RUNTIME_UI)
     if (b->runtime_ui && recomp_runtime_ui_is_open(b->runtime_ui))
         ev.keyinput = 0x03FFu;
+    // The Select+Start chord was for the menu: keep both from the game until
+    // they are released, so closing the menu doesn't hand it a held Start.
+    if (b->runtime_ui_chord_held) {
+        const bool held = b->controller &&
+            (SDL_GameControllerGetButton(b->controller, SDL_CONTROLLER_BUTTON_START) ||
+             SDL_GameControllerGetButton(b->controller, SDL_CONTROLLER_BUTTON_BACK));
+        if (held) ev.keyinput |= (1u << 2) | (1u << 3);
+        else b->runtime_ui_chord_held = false;
+    }
 #endif
 
     int mouse_x = 0;
@@ -3200,11 +3886,21 @@ bool HostWindow::drawable_size(int* /*width*/, int* /*height*/) const {
     return false;
 }
 
+bool HostWindow::hd_jobs_available() { return false; }
+bool HostWindow::present_hd(const gba::GbaHighResolutionFrame::DrawFrame&) { return false; }
+bool HostWindow::readback_hd(std::vector<uint8_t>&,unsigned&,unsigned&) { return false; }
+#if defined(GBARECOMP_NATIVE_DRAW_JOBS)
+bool HostWindow::present_native(const std::shared_ptr<const gba::GbaNativeDrawFrame>&) { return false; }
+bool HostWindow::readback_native(const std::shared_ptr<const gba::GbaNativeDrawFrame>&,std::vector<uint8_t>&) { return false; }
+#endif
 void HostWindow::present(const uint8_t* /*rgb888*/) {}
+void HostWindow::present(const uint8_t*, unsigned, unsigned) {}
 
 void HostWindow::load_input_config(const char* /*dir*/,
                                    bool /*assist_tools_default*/,
-                                   int /*fast_forward_multiplier_default*/) {}
+                                   int /*fast_forward_multiplier_default*/,
+                                   const char* /*config_filename*/,
+                                   const char* /*keybinds_filename*/) {}
 void HostWindow::set_fullscreen(int /*mode*/) {}
 int  HostWindow::fullscreen() const { return 0; }
 void HostWindow::adjust_scale(int /*delta*/) {}
@@ -3213,6 +3909,13 @@ int  HostWindow::volume() const { return 100; }
 int  HostWindow::window_scale() const { return 1; }
 void HostWindow::set_linear_filter(bool /*enabled*/) {}
 bool HostWindow::linear_filter() const { return false; }
+void HostWindow::set_integer_scale(bool) {}
+bool HostWindow::integer_scale() const { return false; }
+void HostWindow::set_scanlines(bool, int) {}
+bool HostWindow::scanlines() const { return false; }
+int HostWindow::scanline_strength() const { return 35; }
+bool HostWindow::saved_audio_enhanced(bool& /*enabled*/) const { return false; }
+void HostWindow::save_audio_enhanced(bool /*enabled*/) {}
 void HostWindow::set_audio_enabled(bool /*enabled*/) {}
 bool HostWindow::audio_enabled() const { return false; }
 void HostWindow::set_resize_driven_view(bool /*enabled*/) {}
@@ -3241,6 +3944,10 @@ int HostWindow::fast_forward_multiplier() const { return 4; }
 
 void HostWindow::push_audio_samples(const int16_t* /*samples*/,
                                     std::size_t /*count*/) {}
+void HostWindow::push_audio_block(const int16_t* /*samples*/,
+                                  std::size_t /*count*/, uint32_t /*rate*/) {}
+void HostWindow::push_audio_stereo_block(const int16_t*, std::size_t, uint32_t) {}
+void HostWindow::reset_audio() {}
 
 void HostWindow::service_events() {}
 

@@ -42,7 +42,9 @@ std::string emit_function_body_str(
     const std::unordered_set<uint32_t>*
         alu_immediate_override_pcs = nullptr,
     const std::unordered_set<uint64_t>*
-        mod_function_hook_keys = nullptr);
+        mod_function_hook_keys = nullptr,
+    bool runtime_ram_placement = false,
+    bool native_regions = false);
 
 // Thin FILE* wrapper: emit_function_body_str + fputs. Used by the offline
 // tool's write_body() so its output stays byte-identical.
@@ -53,6 +55,7 @@ void emit_function_body(
     const std::unordered_set<uint32_t>*
         alu_immediate_override_pcs = nullptr,
     const std::unordered_set<uint64_t>*
-        mod_function_hook_keys = nullptr);
+        mod_function_hook_keys = nullptr,
+    bool native_regions = false);
 
 }  // namespace gbarecomp

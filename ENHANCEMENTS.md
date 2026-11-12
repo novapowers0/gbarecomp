@@ -1,25 +1,22 @@
 # gbarecomp Enhancements — Breaking Faithfulness On Purpose
 
-This project is LLE-first and proven against the oracle (see `PRINCIPLES.md`,
-`CLAUDE.md`). An **enhancement** is the one place we deviate from the faithful
-core on purpose — and only ever as an **opt-in, default-off layer** that reduces
-byte-for-byte to the faithful build when disabled. The shared cross-project rules
-live in `../../recomp-template/ENHANCEMENTS.md` (Rule 1: default is
-system-authentic; Rule 2: runner capability vs game policy; etc.). This file is
-the gbarecomp-specific catalog.
+Elective changes to game presentation are optional and disabled by default.
+Shared mechanisms belong in the engine; scene policy belongs in each game.
+See [the shared enhancement policy](../../recomp-template/ENHANCEMENTS.md).
 
-The invariant that governs all of them: **LLE is the foundation that keeps HLE
-(and every other enhancement) from rotting.** Because a proven-faithful path
-always sits underneath and a default-off switch restores it exactly, the
-enhancement can be aggressive without eroding correctness.
+HLE implementation selection follows [HLE.md](HLE.md). A qualified native
+implementation may be the preferred build, with a separately maintained LLE
+build. It need not run over a live LLE shadow or expose a runtime switch.
+Correctness fixes work by default; HLE is not synonymous with an elective mod.
 
 ---
 
 ## 1. HLE BIOS backend — SHIPPED (2026-07-02)
 
-Opt-in High-Level Emulation of the GBA BIOS, as an *either/or* alternative to the
-recompiled real BIOS (LLE). LLE stays the **default and the correctness oracle**;
-HLE is a switch-in on top.
+Historical runtime interface for native BIOS services. The current configuration
+still defaults to the recompiled BIOS. These legacy selectors describe existing
+behavior; new service selection follows the build-time policy in HLE.md. Their
+presence does not establish cross-title or netplay qualification.
 
 - **Selection:** `[bios].hle = true` in a game's `game.toml` (default `false`);
   `--bios-hle` / `--no-bios-hle`; `GBARECOMP_BIOS_HLE`. Boot-skip sub-toggle:
@@ -30,8 +27,9 @@ HLE is a switch-in on top.
   jumping to the cart entry.
 - **Falls back to LLE** for the machine-state SWIs
   (Halt/Stop/IntrWait/VBlankIntrWait/SoftReset/RegisterRamReset/sound-driver/
-  MultiBoot) and for anything it doesn't implement — so HLE is never load-bearing
-  beyond what it covers, and never breaks a game.
+  MultiBoot) and services it does not implement. This is the existing component
+  boundary, not a universal requirement for HLE. Unsupported caller behavior or
+  timing can still cause defects and must be qualified for the actual title.
 - **Code:** `src/runtime/bios_hle.{h,cpp}` (SWIs ported from mGBA `src/gba/bios.c`,
   MPL-2.0, credited in `THIRD_PARTY_ATTRIBUTION.md`); the seam is one null-by-default
   hook `g_bios_hle_hook` at the top of `runtime_swi()`. Startup banners
@@ -92,8 +90,9 @@ some accuracy cost or the weight of a bundled replacement BIOS. **Decision
 (2026-07-02): not worth building now.** Revisit only if shipping to users without
 a BIOS dump becomes a real requirement.
 
-Per Rule 1 it would land as a further opt-in tier (e.g. `[bios].hle_no_dump`),
-never disturbing the LLE default or the accurate HLE-on-LLE path.
+If revisited, use an explicit build configuration with a documented caller and
+readback contract. Keep the real-BIOS LLE build maintained; a live switch or
+continuous original execution is not required.
 
 ---
 
@@ -122,3 +121,12 @@ literal reads after ROM identity verification, and `g_ws_obj_x_provider` can
 interpret an opted-in game's extended OBJ coordinates in the wide PPU path.
 Neither is consulted by native 240x160 OBJ rendering; games must prove their
 coordinate invariant and leave both hooks unset unless expanded view is active.
+
+## 4. Higher internal resolution
+
+An optional 2x/3x/4x/8x/16x affine presentation surface samples approved backgrounds
+more densely while preserving native sprite/HUD artwork and canonical state.
+Mario Kart: Super Circuit authorizes race BG2 and provides a disabled-by-default
+mod. It supports adaptive view and a separate netplay presentation mirror.
+See [INTERNAL_RESOLUTION.md](docs/INTERNAL_RESOLUTION.md) for ownership,
+subline approximation, diagnostics and validation.

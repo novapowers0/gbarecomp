@@ -11,7 +11,8 @@
 //   romSize, romFile, variant (variants/<variant>/game.toml target path),
 //   gameToml (File: Android runtime TOML), gameRoot (File), engineRoot (File)
 // Optional:
-//   romLabel, biosRequired (false), orientation ("landscape"|"portrait"|"any"),
+//   romLabel, biosRequired (false),
+//   orientation ("landscape"|"landscape-locked"|"portrait"|"any"),
 //   payloadVersion ("1"), setupNote, gyro (false), payloadDirs ([[from:File, into:String]]),
 //   cmakeArguments ([]), recompUiRoot (File), releaseAbis (["arm64-v8a"]),
 //   debugAbis (["arm64-v8a","x86_64"])
@@ -40,6 +41,7 @@ def romShas = (g.romSha1 instanceof Collection ? g.romSha1 : g.romSha1.toString(
     .collect { it.toString().trim().toLowerCase() }
 def orientation = (g.orientation ?: "landscape").toString()
 def activityOrientation = orientation == "any" ? "fullUser"
+    : orientation == "landscape-locked" ? "landscape"
     : orientation == "portrait" ? "sensorPortrait" : "sensorLandscape"
 def stagedPayload = layout.buildDirectory.dir("generated/gbarecompPayload")
 def privateBiosPath = providers.gradleProperty("privateBios").orNull

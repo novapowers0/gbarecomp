@@ -4,6 +4,7 @@
 #include "gba_audio.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -36,7 +37,7 @@ bool fifo_trace_enabled() {
 }  // namespace
 
 GbaAudio::GbaAudio() {
-    ring_.assign(kRingSize, 0);
+    ring_.assign(kRingSize, StereoFrame{});
     ring_rate_.assign(kRingSize, 0);
     cap_ring_.assign(kCapRingSize, CapSample{});
     reset();
@@ -48,12 +49,9 @@ void GbaAudio::serialize(gbarecomp::debug::SnapshotWriter& w) const {
     // are stable within a build and the snapshot version gates layout.
     w.bytes(&ch1_, sizeof(ch1_));
     w.bytes(&ch2_, sizeof(ch2_));
-    // NOTE: ch3_/ch4_/wave_ram_ are intentionally NOT serialized — adding them
-    // would change the blob layout and savestates are version-locked
-    // (snapshot.h kSnapshotVersion), invalidating every existing state file.
-    // Their state is transient (the MP2K driver re-triggers the PSG channels
-    // each frame and rewrites wave RAM per note), so a save/load boundary
-    // re-syncs them within ~1 frame. Revisit if/when kSnapshotVersion bumps.
+    w.bytes(&ch3_, sizeof(ch3_));
+    w.bytes(&ch4_, sizeof(ch4_));
+    w.bytes(wave_ram_, sizeof(wave_ram_));
     w.boolean(master_enable_);
     w.u8(volume_l_);
     w.u8(volume_r_);
@@ -61,6 +59,10 @@ void GbaAudio::serialize(gbarecomp::debug::SnapshotWriter& w) const {
     w.boolean(ch1_right_enable_);
     w.boolean(ch2_left_enable_);
     w.boolean(ch2_right_enable_);
+    w.boolean(ch3_left_enable_);
+    w.boolean(ch3_right_enable_);
+    w.boolean(ch4_left_enable_);
+    w.boolean(ch4_right_enable_);
     w.u8(dmg_volume_ratio_);
     w.bytes(&fifo_a_, sizeof(fifo_a_));
     w.bytes(&fifo_b_, sizeof(fifo_b_));
@@ -77,7 +79,7 @@ void GbaAudio::serialize(gbarecomp::debug::SnapshotWriter& w) const {
     w.u32(cycle_accumulator_);
     // Pending host output ring so playback resumes seamlessly.
     w.u32(static_cast<uint32_t>(ring_.size()));
-    if (!ring_.empty()) w.bytes(ring_.data(), ring_.size() * sizeof(int16_t));
+    if (!ring_.empty()) w.bytes(ring_.data(), ring_.size() * sizeof(StereoFrame));
     w.u64(ring_head_);
     w.u64(ring_tail_);
     w.u64(samples_generated_);
@@ -88,11 +90,9 @@ void GbaAudio::serialize(gbarecomp::debug::SnapshotWriter& w) const {
 void GbaAudio::deserialize(gbarecomp::debug::SnapshotReader& r) {
     r.bytes(&ch1_, sizeof(ch1_));
     r.bytes(&ch2_, sizeof(ch2_));
-    // ch3_/ch4_/wave_ram_ not serialized — see serialize(). Reset them so a
-    // loaded state starts the new channels clean (they re-sync within ~1 frame).
-    ch3_ = Sound3{};
-    ch4_ = Sound4{};
-    std::fill(std::begin(wave_ram_), std::end(wave_ram_), uint8_t{0});
+    r.bytes(&ch3_, sizeof(ch3_));
+    r.bytes(&ch4_, sizeof(ch4_));
+    r.bytes(wave_ram_, sizeof(wave_ram_));
     master_enable_    = r.boolean();
     volume_l_         = r.u8();
     volume_r_         = r.u8();
@@ -100,6 +100,10 @@ void GbaAudio::deserialize(gbarecomp::debug::SnapshotReader& r) {
     ch1_right_enable_ = r.boolean();
     ch2_left_enable_  = r.boolean();
     ch2_right_enable_ = r.boolean();
+    ch3_left_enable_ = r.boolean();
+    ch3_right_enable_ = r.boolean();
+    ch4_left_enable_ = r.boolean();
+    ch4_right_enable_ = r.boolean();
     dmg_volume_ratio_ = r.u8();
     r.bytes(&fifo_a_, sizeof(fifo_a_));
     r.bytes(&fifo_b_, sizeof(fifo_b_));
@@ -115,14 +119,23 @@ void GbaAudio::deserialize(gbarecomp::debug::SnapshotReader& r) {
     cycles_per_sample_ = r.u32();
     cycle_accumulator_ = r.u32();
     uint32_t ring_len = r.u32();
-    ring_.assign(ring_len, 0);
+    if (!r.ok() || ring_len != kRingSize ||
+        r.remaining() < kRingSize * sizeof(StereoFrame) + 28 + sizeof(current_samples_)) {
+        r.reject(); return;
+    }
+    ring_.assign(ring_len, StereoFrame{});
     ring_rate_.assign(ring_len, 0);
-    if (ring_len) r.bytes(ring_.data(), ring_len * sizeof(int16_t));
-    ring_head_         = static_cast<std::size_t>(r.u64());
-    ring_tail_         = static_cast<std::size_t>(r.u64());
+    if (ring_len) r.bytes(ring_.data(), ring_len * sizeof(StereoFrame));
+    const auto head = r.u64(), tail = r.u64();
+    if (head >= kRingSize || tail >= kRingSize) { r.reject(); return; }
+    ring_head_ = static_cast<std::size_t>(head);
+    ring_tail_ = static_cast<std::size_t>(tail);
     samples_generated_ = r.u64();
     r.bytes(current_samples_, sizeof(current_samples_));
     sample_index_      = r.u32();
+    if (sample_index_ > kMaxSamplesPerEvent || volume_l_ > 7 || volume_r_ > 7 ||
+        dmg_volume_ratio_ > 3 || cycles_per_sample_ != (512u >> (soundbias_ >> 14)) ||
+        cycle_accumulator_ > kSampleEventCycles) r.reject();
     std::fill(std::begin(current_sample_rates_), std::end(current_sample_rates_), uint8_t{0});
 }
 
@@ -164,10 +177,11 @@ void GbaAudio::reset() {
     samples_generated_ = 0;
     sample_index_ = 0;
     std::fill(std::begin(current_samples_), std::end(current_samples_),
-              int16_t{0});
+              StereoFrame{});
     trace_write_ = 0;
     trace_count_ = 0;
-    std::fill(ring_.begin(), ring_.end(), int16_t{0});
+    std::fill(ring_.begin(), ring_.end(), StereoFrame{});
+    psg_lp_[0] = {}; psg_lp_[1] = {};
 }
 
 void GbaAudio::write_io8(uint32_t off, uint8_t v) {
@@ -468,7 +482,7 @@ void GbaAudio::ch4_trigger() {
     }
 }
 
-void GbaAudio::ring_push(int16_t s, uint8_t rate_tag) {
+void GbaAudio::ring_push(StereoFrame s, uint8_t rate_tag) {
     ring_[ring_head_] = s;
     ring_rate_[ring_head_] = rate_tag;
     ring_head_ = (ring_head_ + 1) % kRingSize;
@@ -504,27 +518,39 @@ std::size_t GbaAudio::query_capture(uint64_t start, std::size_t count,
     return n;
 }
 
-std::size_t GbaAudio::drain_sample_block(int16_t* out, std::size_t max, uint32_t& rate) {
-    while (ring_tail_ != ring_head_ && !ring_rate_[ring_tail_])
-        ring_tail_ = (ring_tail_ + 1) % kRingSize;
-    if (!max || ring_tail_ == ring_head_) return 0;
-    const uint8_t tag = ring_rate_[ring_tail_];
-    rate = 32768u << (tag - 1);
+std::size_t GbaAudio::drain_output(int16_t* out, std::size_t max,
+                                   bool stereo, uint32_t* rate) {
+    if (!out || !max) return 0;
+    if (rate) {
+        while (ring_tail_ != ring_head_ &&
+               (ring_rate_[ring_tail_]<1 || ring_rate_[ring_tail_]>4))
+            ring_tail_ = (ring_tail_ + 1) % kRingSize;
+    }
+    if (ring_tail_ == ring_head_) return 0;
+    const uint8_t tag=ring_rate_[ring_tail_];
+    if (rate) *rate=32768u << (tag-1);
     std::size_t n = 0;
-    while (n < max && ring_tail_ != ring_head_ && ring_rate_[ring_tail_] == tag) {
-        out[n++] = ring_[ring_tail_];
+    while (n < max && ring_tail_ != ring_head_ &&
+           (!rate || ring_rate_[ring_tail_] == tag)) {
+        const auto frame=ring_[ring_tail_];
+        if (stereo) {out[n*2]=frame.left;out[n*2+1]=frame.right;}
+        else out[n]=frame.mono();
+        ++n;
         ring_tail_ = (ring_tail_ + 1) % kRingSize;
     }
     return n;
 }
-
+std::size_t GbaAudio::drain_sample_block(int16_t* out,std::size_t max,uint32_t& rate) {
+    return drain_output(out,max,false,&rate);
+}
+std::size_t GbaAudio::drain_stereo_sample_block(int16_t* out,std::size_t max,uint32_t& rate) {
+    return drain_output(out,max,true,&rate);
+}
+std::size_t GbaAudio::drain_stereo_samples(int16_t* out,std::size_t max) {
+    return drain_output(out,max,true,nullptr);
+}
 std::size_t GbaAudio::drain_samples(int16_t* out, std::size_t max) {
-    std::size_t n = 0;
-    while (n < max && ring_tail_ != ring_head_) {
-        out[n++] = ring_[ring_tail_];
-        ring_tail_ = (ring_tail_ + 1) % kRingSize;
-    }
-    return n;
+    return drain_output(out,max,false,nullptr);
 }
 
 void GbaAudio::fifo_reset(DirectFifo& fifo) {
@@ -650,19 +676,17 @@ void GbaAudio::sample_until_current_time() {
     uint32_t elapsed = cycle_accumulator_ / cycles_per_sample_;
     if (elapsed > slots) elapsed = slots;
     while (sample_index_ < elapsed) {
-        current_samples_[sample_index_] = mix_one_sample(sample_index_);
-        current_sample_rates_[sample_index_] = 1 + ((soundbias_ >> 14) & 3);
+        mix_slot(sample_index_);
         ++sample_index_;
     }
 }
 
-int16_t GbaAudio::mix_one_sample(uint32_t direct_slot, bool include_direct,
+GbaAudio::StereoFrame GbaAudio::mix_one_sample(uint32_t direct_slot, bool include_direct,
                                  ChannelTap* tap) {
-    if (!master_enable_) return 0;
+    if (!master_enable_) return {};
 
     // Per-channel contributions in the range [-15, +15]. Routing
-    // bits gate whether the channel contributes to either side; we
-    // mix mono for now and treat "either side enabled" as "audible".
+    // bits independently gate the left and right output buses.
     int32_t ch1_sample = 0;
     int32_t ch2_sample = 0;
 
@@ -863,13 +887,15 @@ int16_t GbaAudio::mix_one_sample(uint32_t direct_slot, bool include_direct,
         }
     }
 
-    // Apply routing — channel must be enabled on at least one side
-    // to be audible in our mono mix.
-    int32_t mix = 0;
-    if (ch1_left_enable_ || ch1_right_enable_) mix += ch1_sample;
-    if (ch2_left_enable_ || ch2_right_enable_) mix += ch2_sample;
-    if (ch3_left_enable_ || ch3_right_enable_) mix += ch3_sample;
-    if (ch4_left_enable_ || ch4_right_enable_) mix += ch4_sample;
+    int32_t mix_left=0,mix_right=0;
+    auto route_psg=[&](int32_t value,bool left,bool right) {
+        if(left) mix_left+=value;
+        if(right) mix_right+=value;
+    };
+    route_psg(ch1_sample,ch1_left_enable_,ch1_right_enable_);
+    route_psg(ch2_sample,ch2_left_enable_,ch2_right_enable_);
+    route_psg(ch3_sample,ch3_left_enable_,ch3_right_enable_);
+    route_psg(ch4_sample,ch4_left_enable_,ch4_right_enable_);
 
     // DMG volume ratio (SOUNDCNT_H bits 0..1): 0=25% 1=50% 2=100%.
     // We bake this into the output scale.
@@ -882,18 +908,10 @@ int16_t GbaAudio::mix_one_sample(uint32_t direct_slot, bool include_direct,
         default: dmg_scale_num = 0; dmg_scale_den = 1; break; // prohibited
     }
 
-    // Apply master left/right volume; we average L and R for mono.
-    // SOUNDCNT_L master volume is 0..7 (1/8 per step, with 7 being
-    // full).
-    int32_t master_avg = (volume_l_ + volume_r_);  // 0..14
-    // Combine: mix * (master_avg / 14) * (dmg / 4) * gain.
-    // Mix range: ±30 (both ch active at vol 15). Master 14 (max).
-    // dmg 1/1. Pre-gain magnitude: 30 * 14 / 14 * 1 = 30. We need
-    // headroom for int16; scale by ~1000 leaves margin.
-    int32_t out = (mix * master_avg) / 14;
-    out = (out * dmg_scale_num) / dmg_scale_den;
+    // Retain the established gain policy, independently on each output.
     constexpr int32_t kGain = 600;
-    out *= kGain;
+    int32_t out_left=(((mix_left*volume_l_)/7)*dmg_scale_num/dmg_scale_den)*kGain;
+    int32_t out_right=(((mix_right*volume_r_)/7)*dmg_scale_num/dmg_scale_den)*kGain;
 
     // Direct Sound FIFO contribution. Omitted when the MP2K shadow is
     // substituting (the caller adds the shadow's direct mix instead).
@@ -912,12 +930,10 @@ int16_t GbaAudio::mix_one_sample(uint32_t direct_slot, bool include_direct,
                    direct_a_full_volume_);
         add_direct(fifo_b_, direct_b_left_, direct_b_right_,
                    direct_b_full_volume_);
-        int32_t direct_out = ((direct_left + direct_right) / 2) * 48;
-        out += direct_out;
+        out_left += direct_left*48;
+        out_right += direct_right*48;
     }
 
-    if (out > 32767)  out = 32767;
-    if (out < -32767) out = -32767;
 
     if (tap) {
         // Raw per-channel synthesis values for the always-on capture ring.
@@ -933,7 +949,8 @@ int16_t GbaAudio::mix_one_sample(uint32_t direct_slot, bool include_direct,
         tap->direct_b = include_direct
             ? static_cast<int16_t>(fifo_b_.samples[direct_slot]) : 0;
     }
-    return static_cast<int16_t>(out);
+    return {static_cast<int16_t>(std::clamp(out_left,-32767,32767)),
+            static_cast<int16_t>(std::clamp(out_right,-32767,32767))};
 }
 
 void GbaAudio::configure_shadow(const std::vector<Mp2kSig>& sigs,
@@ -944,11 +961,9 @@ void GbaAudio::configure_shadow(const std::vector<Mp2kSig>& sigs,
     shadow_mem_.rom = rom;       shadow_mem_.rom_len = rom_len;
     shadow_mem_.ewram = ewram;   shadow_mem_.ewram_len = ewram_len;
     shadow_mem_.iwram = iwram;   shadow_mem_.iwram_len = iwram_len;
+    shadow_sigs_ = sigs;
     shadow_.init(sigs);
     shadow_cursor_ = 0;
-    shadow_samples_since_hook_ = 0;
-    shadow_hook_period_ = sample_rate() / 60u;
-    if (shadow_hook_period_ == 0) shadow_hook_period_ = 1097u;
     // Opt-in. `enable_request` is the per-game default ([audio].shadow in
     // game.toml); GBARECOMP_AUDIO_SHADOW overrides it ("0" forces off, any
     // other value forces on). Only takes effect if the ROM links MP2K.
@@ -963,61 +978,156 @@ void GbaAudio::configure_shadow(const std::vector<Mp2kSig>& sigs,
     }
 }
 
+void GbaAudio::set_shadow_enabled(bool on) {
+    if (!shadow_.armed() || on == shadow_enabled_) return;
+    if (on) {
+        shadow_ = Mp2kShadow{};  // voices and verifier start over
+        shadow_.init(shadow_sigs_);
+        shadow_cursor_ = 0;
+    }
+    shadow_enabled_ = on;
+    std::fprintf(stderr, "[audio] MP2K shadow mixer %s by the player\n",
+                 on ? "ARMED" : "off");
+}
+
+std::size_t GbaAudio::shadow_hook_pcs(uint32_t* out, std::size_t max) const {
+    if (!shadow_.armed()) return 0;
+    std::size_t n = 0;
+    for (const auto& sig : shadow_sigs_) {
+        if (n == max) break;
+        out[n++] = sig.sound_main_ram & ~1u;
+    }
+    return n;
+}
+
+void GbaAudio::shadow_driver_tick(uint32_t pc, bool thumb) {
+    // Each tick, at its exact point: a fixed-rate poll drifts against the
+    // driver's VBlank cadence and mostly finds SoundInfo idle (not 'Smsh'+1),
+    // or past the mixer's note-on processing.
+    if (!shadow_enabled_ || sample_rate() != 65536u) return;
+    shadow_.frame_hook(shadow_mem_, shadow_cursor_, thumb ? (pc | 1u) : pc);
+}
+
+void GbaAudio::log_shadow_summary(const char* when) const {
+    if (!shadow_.armed() || shadow_enabled_samples_ == 0) return;
+    const double rate = sample_rate() ? sample_rate() : 65536.0;
+    std::fprintf(stderr,
+                 "[audio] MP2K shadow (%s): live %.1f%% of %.1f s, driver ticks "
+                 "%llu (stale %llu), reverts %llu, unsupported waves %llu\n",
+                 when,
+                 100.0 * static_cast<double>(shadow_live_samples_) /
+                     static_cast<double>(shadow_enabled_samples_),
+                 static_cast<double>(shadow_enabled_samples_) / rate,
+                 static_cast<unsigned long long>(shadow_.hooks()),
+                 static_cast<unsigned long long>(shadow_.stale_ticks()),
+                 static_cast<unsigned long long>(shadow_.pauses()),
+                 static_cast<unsigned long long>(shadow_.bad_waves()));
+}
+
+int16_t GbaAudio::psg_low_pass(int16_t in, PsgLowPass& f) {
+    const uint32_t rate = sample_rate();
+    if (f.rate != rate) {
+        constexpr float kCutoffHz = 8000.0f;
+        constexpr float kQ = 0.70710678f;
+        const float w0 = 6.28318530f * kCutoffHz / static_cast<float>(rate);
+        const float alpha = std::sin(w0) / (2.0f * kQ);
+        const float cw = std::cos(w0);
+        const float a0 = 1.0f + alpha;
+        f.b0 = (1.0f - cw) * 0.5f / a0;
+        f.b1 = (1.0f - cw) / a0;
+        f.b2 = f.b0;
+        f.a1 = -2.0f * cw / a0;
+        f.a2 = (1.0f - alpha) / a0;
+        f.rate = rate;
+        f.primed = false;
+    }
+    const float x = static_cast<float>(in);
+    if (!f.primed) {
+        // Start at the current level: no step when substitution begins.
+        f.x1 = f.x2 = f.y1 = f.y2 = x;
+        f.primed = true;
+    }
+    const float y = f.b0 * x + f.b1 * f.x1 + f.b2 * f.x2 - f.a1 * f.y1 - f.a2 * f.y2;
+    f.x2 = f.x1; f.x1 = x;
+    f.y2 = f.y1; f.y1 = y;
+    return static_cast<int16_t>(std::lround(std::clamp(y, -32767.0f, 32767.0f)));
+}
+
+void GbaAudio::mix_slot(uint32_t slot) {
+    bool substitute = false;
+    float sl = 0.0f, sr = 0.0f;
+    // Mp2kShadow advances on a fixed 65536-Hz grid. Other SOUNDBIAS rates
+    // retain the faithful mixer until rate-aware shadow rendering exists.
+    if (shadow_enabled_ && sample_rate() == 65536u) {
+        std::string degraded;
+        shadow_.render(shadow_mem_, fifo_a_.samples[slot],
+                       fifo_b_.samples[slot], sl, sr, degraded);
+        if (!degraded.empty()) {
+            std::fprintf(stderr, "[audio] MP2K shadow DEGRADED: %s\n",
+                         degraded.c_str());
+        }
+        ++shadow_cursor_;
+        substitute = shadow_.live();
+        ++shadow_enabled_samples_;
+        if (substitute) ++shadow_live_samples_;
+    }
+    // When the shadow is proven-live, mix PSG-only canon + the shadow's
+    // direct-sound render; otherwise the full canon mix (incl. FIFO).
+    ChannelTap tap;
+    StereoFrame s = mix_one_sample(slot, /*include_direct=*/!substitute, &tap);
+    if (substitute) {
+        // The PSG channels are synthesized with ideal hard edges. Under the
+        // canon mix the FIFO's 8-bit sample-and-hold at the driver rate
+        // masks them; next to the clean shadow they are heard as crackle
+        // (MOTHER 3's noise-channel percussion). Smooth them like a
+        // device's output stage would: 2nd-order Butterworth at 8 kHz.
+        s.left = psg_low_pass(s.left, psg_lp_[0]);
+        s.right = psg_low_pass(s.right, psg_lp_[1]);
+
+        // The shadow's right/left are MP2K's FIFO A/B streams in the bus
+        // float domain (full-scale DAC = 0.25, i.e. 128 in s8 units).
+        // Route and scale them exactly as mix_one_sample does the FIFO
+        // bytes (SOUNDCNT_H volume and L/R enables), so the music keeps
+        // its level against the PSG channels. The former fixed 24000
+        // scale played it about 12 dB low (a full-scale DAC gave 6000
+        // against the canon's 24576).
+        const float fifo_a = sr * 512.0f;
+        const float fifo_b = sl * 512.0f;
+        const float a = fifo_a * (direct_a_full_volume_ ? 4.0f : 2.0f);
+        const float b = fifo_b * (direct_b_full_volume_ ? 4.0f : 2.0f);
+        const float direct_left =
+            (direct_a_left_ ? a : 0.0f) + (direct_b_left_ ? b : 0.0f);
+        const float direct_right =
+            (direct_a_right_ ? a : 0.0f) + (direct_b_right_ ? b : 0.0f);
+        s.left = static_cast<int16_t>(std::clamp(
+            static_cast<int32_t>(s.left)+static_cast<int32_t>(direct_left*48.0f),-32767,32767));
+        s.right = static_cast<int16_t>(std::clamp(
+            static_cast<int32_t>(s.right)+static_cast<int32_t>(direct_right*48.0f),-32767,32767));
+    } else {
+        psg_lp_[0].primed = psg_lp_[1].primed = false;
+    }
+    current_samples_[slot] = s;
+    current_sample_rates_[slot] = 1 + ((soundbias_ >> 14) & 3);
+    CapSample& cap = current_caps_[slot];
+    cap.mixed = s.mono();
+    cap.ch[0] = tap.ch[0];
+    cap.ch[1] = tap.ch[1];
+    cap.ch[2] = tap.ch[2];
+    cap.ch[3] = tap.ch[3];
+    cap.direct_a = tap.direct_a;
+    cap.direct_b = tap.direct_b;
+}
+
 void GbaAudio::run_sample_event() {
     uint32_t samples = samples_per_event();
-    CapSample caps[kMaxSamplesPerEvent] = {};
     while (sample_index_ < samples) {
-        uint32_t slot = sample_index_;
-        bool substitute = false;
-        float sl = 0.0f, sr = 0.0f;
-        if (shadow_enabled_) {
-            std::string degraded;
-            shadow_.render(shadow_mem_, fifo_a_.samples[slot],
-                           fifo_b_.samples[slot], sl, sr, degraded);
-            if (!degraded.empty()) {
-                std::fprintf(stderr, "[audio] MP2K shadow DEGRADED: %s\n",
-                             degraded.c_str());
-            }
-            ++shadow_cursor_;
-            if (++shadow_samples_since_hook_ >= shadow_hook_period_) {
-                shadow_.frame_hook(shadow_mem_, shadow_cursor_,
-                                   shadow_.hook_key0());
-                shadow_samples_since_hook_ = 0;
-            }
-            substitute = shadow_.live();
-        }
-        // When the shadow is proven-live, mix PSG-only canon + the shadow's
-        // direct-sound render; otherwise the full canon mix (incl. FIFO).
-        ChannelTap tap;
-        int16_t s = mix_one_sample(slot, /*include_direct=*/!substitute, &tap);
-        if (substitute) {
-            // Shadow output is the bus float domain (full-scale FIFO DAC =
-            // 0.25). kShadowOutputScale maps it to our int16 direct-sound
-            // magnitude — the loudness-match knob to tune in the audio
-            // oracle validation pass.
-            constexpr float kShadowOutputScale = 24000.0f;
-            int32_t shadow_mix =
-                static_cast<int32_t>(((sl + sr) * 0.5f) * kShadowOutputScale);
-            int32_t o = static_cast<int32_t>(s) + shadow_mix;
-            if (o > 32767) o = 32767;
-            if (o < -32767) o = -32767;
-            s = static_cast<int16_t>(o);
-        }
-        current_samples_[slot] = s;
-        current_sample_rates_[slot] = 1 + ((soundbias_ >> 14) & 3);
-        caps[slot].mixed = s;
-        caps[slot].ch[0] = tap.ch[0];
-        caps[slot].ch[1] = tap.ch[1];
-        caps[slot].ch[2] = tap.ch[2];
-        caps[slot].ch[3] = tap.ch[3];
-        caps[slot].direct_a = tap.direct_a;
-        caps[slot].direct_b = tap.direct_b;
+        mix_slot(sample_index_);
         ++sample_index_;
     }
     for (uint32_t i = 0; i < samples; ++i) {
         // cap_push first (keyed by samples_generated_ pre-increment), then
         // ring_push which bumps samples_generated_ — keeps the two aligned.
-        cap_push(caps[i]);
+        cap_push(current_caps_[i]);
         ring_push(current_samples_[i], current_sample_rates_[i]);
     }
     sample_index_ = 0;
@@ -1037,6 +1147,13 @@ void GbaAudio::tick(uint32_t cycles) {
 }
 
 uint32_t GbaAudio::cycles_until_next_sample() const {
+    return cycles_until_next_sample_event();
+}
+
+uint32_t GbaAudio::cycles_until_next_shared_event() const {
+#if defined(GBARECOMP_DEVICE_AUDIO_WINDOWS)
+    if (!shadow_enabled_) return UINT32_MAX;
+#endif
     return cycles_until_next_sample_event();
 }
 

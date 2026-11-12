@@ -13,8 +13,9 @@ This is **not**:
 - A reimplementation. We do not "rewrite Minish Cap in C" — that work
   exists upstream (`zeldaret/tmc`) and is a reference, not our
   artifact.
-- An HLE wrapper. We do not stub SWIs to "what the game expects" or
-  ship a runner that bypasses VRAM/OAM/DMA/IRQ.
+- A collection of stubs. The LLE foundation executes the original program
+  and machine services; build-selected HLE may replace qualified services under
+  [HLE.md](../HLE.md).
 
 The line is sharp. Decomp resources are valuable; we just pull them
 through the right channel.
@@ -35,11 +36,13 @@ through the right channel.
 
 - Decompiled C as an execution oracle. The emulator is the oracle;
   the decomp is at best a hypothesis.
-- PC-port replacement renderers, audio mixers, input handlers.
-- "Convenience" HLE: re-implemented gameplay helpers, fake IRQ
-  dispatch, fake DMA fast paths.
-- Renderer shortcuts that bypass actual VRAM/OAM/PAL writes.
-- Audio shortcuts that bypass FIFO / timer / DMA semantics.
+- Replacement code treated as an independent correctness oracle.
+  Native rendering, mixing and service implementations are allowed under the
+  shared caller-contract policy, with a maintained LLE counterpart.
+- Missing memory effects, false completion or fabricated interrupts. HLE can
+  model a service at a higher level, but must deliver its required effects.
+- Enhanced pixels read back into canonical simulation without a qualified
+  deterministic contract. Presentation-only surfaces stay downstream.
 - Anything that makes a specific game "work" without a documented
   hardware basis.
 
@@ -119,9 +122,9 @@ SVC mode with PC=0, and hands off to the interpreter. From there:
    and IRQs trap to BIOS at `0x00000018`. The interpreter runs those
    bytes just like any other code.
 
-Per `PRINCIPLES.md` "BIOS is sacred," there is no HLE path. The
-BIOS lives at `bios/gba_bios.bin` (user-provided, hash-verified;
-see `bios/README.md`).
+This describes the maintained LLE route. Build-selected BIOS HLE is
+allowed by [HLE.md](../HLE.md). The retail BIOS lives at
+`bios/gba_bios.bin` (user-provided and hash-verified; see `bios/README.md`).
 
 Implications for the architecture:
 

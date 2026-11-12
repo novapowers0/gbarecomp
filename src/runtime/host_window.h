@@ -25,8 +25,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "gba_high_resolution.h"
 
 struct RecompRuntimeUi;
+namespace gba { class GbaNativeDrawFrame; }
 
 namespace gbarecomp {
 
@@ -84,7 +86,9 @@ public:
     // files don't exist.
     void load_input_config(const char* dir,
                            bool assist_tools_default = true,
-                           int fast_forward_multiplier_default = 4);
+                           int fast_forward_multiplier_default = 4,
+                           const char* config_filename = "config.ini",
+                           const char* keybinds_filename = "keybinds.ini");
 
     // Live window/audio controls (hotkey + launcher-driven). All no-ops when
     // the window isn't open or this build has no SDL2.
@@ -99,6 +103,16 @@ public:
     int  window_scale() const;
     void set_linear_filter(bool enabled);
     bool linear_filter() const;
+    void set_integer_scale(bool enabled);
+    bool integer_scale() const;
+    void set_scanlines(bool enabled, int strength_pct = 35);
+    bool scanlines() const;
+    int scanline_strength() const;
+    // The player's enhanced-audio (MP2K shadow) choice, remembered in
+    // config.ini [Audio] next to [Touch]. saved_audio_enhanced() returns
+    // false until the player has chosen.
+    bool saved_audio_enhanced(bool& enabled) const;
+    void save_audio_enhanced(bool enabled);
     void set_audio_enabled(bool enabled);
     bool audio_enabled() const;
     void set_resize_driven_view(bool enabled);
@@ -155,6 +169,21 @@ public:
     // Upload one base_w x base_h RGB888 frame (the dimensions passed to open())
     // and present.
     void present(const uint8_t* rgb888);
+    // Sampled texture dimensions are independent of logical view/touch units.
+    // The enhanced texture is uploaded and presented directly, without a
+    // native-resolution intermediate render target.
+    void present(const uint8_t* rgb888, unsigned width, unsigned height);
+    // Optional resident presentation of immutable HD jobs. False leaves the
+    // same job available for portable CPU rendering, including readback.
+    void prefer_gpu_hd(bool enabled) { prefer_gpu_hd_ = enabled; }
+    bool hd_jobs_available();
+    bool present_hd(const gba::GbaHighResolutionFrame::DrawFrame& frame);
+    bool readback_hd(std::vector<uint8_t>& rgb, unsigned& width, unsigned& height);
+#if defined(GBARECOMP_NATIVE_DRAW_JOBS)
+    bool present_native(const std::shared_ptr<const gba::GbaNativeDrawFrame>&);
+    bool readback_native(const std::shared_ptr<const gba::GbaNativeDrawFrame>&,
+                         std::vector<uint8_t>& rgb);
+#endif
 
     // Push `count` int16_t mono samples assuming the engine's 65.536 kHz
     // source rate. Prefer push_audio_block when the caller knows the real
@@ -167,10 +196,13 @@ public:
     // web backend forwards it to the AudioWorklet. Never blocks the guest.
     void push_audio_block(const int16_t* samples, std::size_t count, uint32_t rate);
 
-#if defined(GBARECOMP_WEB_HOST)
-    // Starts a new playback epoch (pause, state load, overflow). Samples are
-    // not accepted until the AudioWorklet acknowledges the reset.
+    // Interleaved L/R S16. Count and rate are frames, never scalar samples.
+    void push_audio_stereo_block(const int16_t* samples, std::size_t count, uint32_t rate);
+    // Drop pending host PCM after a restore/rewind or other playback epoch.
+    // Web publication waits until the AudioWorklet acknowledges the new epoch.
     void reset_audio();
+
+#if defined(GBARECOMP_WEB_HOST)
     // True while the page is hidden; the runner holds the guest at the frame
     // boundary, distinct from the user's own pause toggle.
     bool auto_paused() const;
@@ -237,6 +269,7 @@ private:
     bool open_ = false;
     void* impl_ = nullptr;  // backend-specific opaque
     int orientation_policy_ = 0;
+    bool prefer_gpu_hd_ = false;
 };
 
 // Engine-wide haptic hook for game input policies (touch_input.h users).

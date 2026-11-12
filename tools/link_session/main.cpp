@@ -3,6 +3,7 @@
 #include "multiplayer_session.h"
 #include "gba_bios.h"
 #include "sha1.h"
+#include "self_heal.h"
 #include <charconv>
 #include <cstdio>
 #include <fstream>
@@ -52,6 +53,7 @@ int main(int argc, char** argv) {
             "GBA_LINK_PROBE_PLAYERS: consoles on the cable, 2 (default) to 4.\n"
             "GBA_LINK_PROBE_SLICES=1 enables experimental native batching.\n"
             "GBA_LINK_PROBE_COSTS=1: per-frame simulate/serialize/digest/restore cost.\n"
+            "GBA_LINK_PROBE_CHECKPOINT_PARTS=1: compare original and checkpoint-derived hash domains.\n"
             "GBA_LINK_PROBE_INPUTS: rows of relative frame, then one button word per console.\n"
             "GBA_LINK_PROBE_STATE_IN / STATE_OUT: paired session snapshots.\n"
             "GBA_LINK_PROBE_CAPTURE_PREFIX: write each console's final PPM.\n"
@@ -148,6 +150,15 @@ int main(int argc, char** argv) {
         Buttons buttons{};
         const auto keys=[&] { return std::span<const std::uint16_t>(buttons.data(),players); };
         const bool costs=std::getenv("GBA_LINK_PROBE_COSTS")!=nullptr;
+        const bool checkpoint_parts=std::getenv("GBA_LINK_PROBE_CHECKPOINT_PARTS")!=nullptr;
+        if (checkpoint_parts && std::getenv("GBA_LINK_PROBE_NET_SEAT"))
+            throw std::runtime_error("checkpoint partition comparison is a local probe option");
+        unsigned checkpoint_checks=0;
+        std::ofstream audio_out;
+        if (const auto* path=std::getenv("GBA_LINK_PROBE_AUDIO_OUT")) {
+            audio_out.open(path,std::ios::binary);
+            if (!audio_out) throw std::runtime_error("cannot open probe audio output");
+        }
         std::vector<double> save_ms, digest_ms, load_ms;
         std::size_t snapshot_bytes=0;
         std::vector<double> frame_ms;
@@ -178,8 +189,32 @@ int main(int argc, char** argv) {
             };
             const auto frame_start=Clock::now();
             session->run_frame(keys());
+            if (audio_out.is_open()) for (unsigned port=0;port<players;++port) {
+                auto& apu=session->machine(port).bus.audio();
+                std::array<std::int16_t,8192> samples{};
+                const auto count=apu.drain_samples(samples.data(),samples.size());
+                const auto rate=apu.sample_rate();
+                for (unsigned i=0;i<4;++i) audio_out.put(char(rate>>(8*i)));
+                for (unsigned i=0;i<4;++i) audio_out.put(char(count>>(8*i)));
+                for (std::size_t i=0;i<count;++i) {
+                    audio_out.put(char(std::uint16_t(samples[i])));
+                    audio_out.put(char(std::uint16_t(samples[i])>>8));
+                }
+                if (!audio_out) throw std::runtime_error("cannot write probe audio output");
+            }
             session->discard_audio_output();
             frame_ms.push_back(elapsed(frame_start));
+            if (checkpoint_parts) {
+                GbaSessionStateLayout layout;
+                const auto state=session->save_state(&layout);
+                const auto original=session->state_hash_parts();
+                const auto derived=GbaMultiplayerSession::state_hash_parts(state,layout);
+                if (original!=derived || state!=session->save_state())
+                    throw std::runtime_error("checkpoint hash domains or live session changed");
+                ++checkpoint_checks;
+                std::printf("checkpoint_parts frame=%u master=%08x parts=%08x,%08x,%08x bytes=%zu\n",
+                    frame+1,GbaMultiplayerSession::state_digest(state),derived[0],derived[1],derived[2],state.size());
+            }
             if (costs) {
                 // What a rollback peer adds per forward tick: one boundary
                 // serialization (shared by the snapshot and the digest), its
@@ -209,6 +244,8 @@ int main(int argc, char** argv) {
                 players,frame_ms.size(),frame_ms.size()*1000.0/total,total/frame_ms.size(),
                 frame_ms[(frame_ms.size()-1)*95/100],frame_ms.back());
         }
+        if (checkpoint_parts)
+            std::printf("checkpoint hash domains matched (%u boundaries)\n",checkpoint_checks);
         if (costs && !save_ms.empty()) {
             const auto summary=[](const char* name,std::vector<double> ms) {
                 double total=0; for (auto v:ms) total+=v;
@@ -256,6 +293,9 @@ int main(int argc, char** argv) {
             if (!out.write(reinterpret_cast<const char*>(session->machine(port).ppu.latched_framebuffer()),
                 gba::GbaPpu::kFramebufferBytes)) throw std::runtime_error("cannot write probe frame");
         }
+        std::printf("coverage dispatch_misses=%u interpreted_insns=%llu\n",
+            gbarecomp::self_heal_distinct_misses(),
+            static_cast<unsigned long long>(gbarecomp::self_heal_interpreted_insns()));
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr,"link probe: %s\n",e.what());

@@ -338,6 +338,7 @@ int64_t GbaRtc::linear_seconds(const Civil& c) const {
 }
 
 int64_t GbaRtc::current_seconds() const {
+    if (replay_clock_) return replay_seconds_ + offset_;
     if (emulated_clock_) return boot_seconds_ + static_cast<int64_t>(emulated_cycles_ / 16777216u) + offset_;
     if (boot_seeded_) {
         const int64_t elapsed = have_fixed_ ? 0 : (steady_seconds() - boot_monotonic_seconds_);

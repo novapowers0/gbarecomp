@@ -1,196 +1,53 @@
-# CLAUDE.md — Project Rules
+# GBA agent entry point
 
----
+Read [PRINCIPLES.md](PRINCIPLES.md), [DEBUG.md](DEBUG.md) and [TCP.md](TCP.md).
+The shared [recomp-template principles](../../recomp-template/PRINCIPLES.md)
+remain authoritative. For HLE, LLE or performance work, read [HLE.md](HLE.md)
+and [the shared optimization policy](../../recomp-template/OPTIMIZATION.md).
 
-# RULE SOURCE
+## Implementation boundaries
 
-All rules live in:
-- `PRINCIPLES.md`
-- `DEBUG.md`
-- `TCP.md`
+- Fix codegen, runtime, hardware models or reviewed game metadata, then
+  regenerate. Do not hand-edit ROM-derived generated C/C++.
+- Maintain a functioning LLE build for every HLE-replaced service. A qualified
+  native HLE build may be preferred. Select implementations at build time.
+- HLE may replace whole services, batch work, use private state and approximate
+  internal timing under the supported caller contract. Do not require live
+  switching, continuous dual execution or cross-build savestate compatibility.
+- Preserve netplay determinism. Presentation can vary only when it cannot feed
+  guest readback, scheduling, state hashes or rollback. Settle qualified CPU and
+  backend capabilities once before frame 0.
+- Gate direct assembly/SIMD and their dependencies by CPU/OS/ABI. Keep a working
+  portable implementation on every supported target.
 
-This file does not redefine rules.
+## Build and coverage
 
----
+Build `gba_recompile`, regenerate from the verified ROM/BIOS plus reviewed
+configuration, then build the title. Use the actual BIOS generation config and
+document which implementations the executable selects. Exact native CPU/LLE
+work uses instruction and state comparisons; deliberate HLE compares its
+documented inputs, outputs, effects and acceptable differences.
 
-# FAILURE MODE
+After runs, inspect coverage and dispatch misses. Interpreted or healed code is
+reported separately from native AOT and intentional HLE; do not call incomplete
+CPU coverage fully static. Keep recovery loud and retain reproducible evidence.
+Review seed proposals before changing game metadata. Correctness fixes work by
+default; elective presentation enhancements remain optional.
 
-If you:
-- guess
-- skip the first divergence
-- trust unvalidated tool output
-- propose a fix without tracing the writer / scheduler / decoder
-- edit generated C to "fix" a symptom
-- add load-bearing HLE behavior to make a game work by accident
-  (the ONLY permitted HLE is a verified, opt-in, present-time shadow
-  that reverts loudly and never becomes the verify oracle — see
-  PRINCIPLES.md "Verified-enhancement HLE is permitted")
-- stub a BIOS SWI or otherwise bypass the real BIOS execution path
-  as the CORRECTNESS path
-  (skipping the boot intro is NOT this — see PRINCIPLES.md
-  "The boot intro is a presentation choice, not a correctness one")
-- let a dispatch miss *silently* interpret forever — no log, no
-  self-heal to static, no miss record (see PRINCIPLES.md "Honest
-  self-healing"); the interpreter may bridge a miss ONLY if it is
-  loudly logged, recompiled on the fly, and fed back to the TOML
-- call a build "statically recompiled / done" while PCs were
-  interpreted or healed-from-cache this session, without reporting it
-  (see PRINCIPLES.md "Coverage honesty is load-bearing")
-- auto-write derived functions into `game.toml` instead of a reviewed
-  proposal file merged by a human
+## Investigation and delivery
 
-→ your response is INVALID
-→ restart from `DEBUG.md`
+Find the first violation of the promised contract. Validate instruments and
+distinguish missing behavior from a wrong result. Diagnostic payload recording
+may be gated in normal builds; retain useful counters and diagnostic tooling.
+Use focused checks and bounded measurements, then normal-audio owner QA.
+Automated/background game runs must remain muted. Respect the owner's central
+Beads hierarchy and solo-work policy. Never ship owned inputs or ROM-derived
+generated sources. Keep unrelated working-tree changes intact.
 
----
+## Player bug reports
 
-# PROJECT OVERVIEW
-
-Static GBA recompilation (ARM7TDMI / ARMv4T, ARM+THUMB interworking)
-→ C/C++ → native.
-
-Fixes belong in:
-- the recompiler (`src/armv4t`, `tools/gba_recompile`)
-- the runtime (`src/gba`, `src/runtime`, `src/debug`)
-- per-game config (`MinishCapRecomp/game.toml`, symbols)
-
-**Never** in `MinishCapRecomp/generated/`.
-
----
-
-# BUILD LOOP
-
-1. Build platform core (`gbarecomp/`).
-2. Run `gba_recompile` over the ROM + config → fresh `generated/*.c`.
-3. Build the game binary (`MinishCapRecomp/`).
-4. Run (normal / verify / oracle-compare mode) **with BIOS path AND
-   ROM path**. Both must hash-verify or the runtime refuses to start.
-5. **Check the coverage report + miss-list** next to the executable.
-   The runtime self-heals misses at runtime (interpret → recompile on
-   the fly) and logs them to `recomp_master_misses.toml.frag`. Review
-   the generated `recomp_seed_proposals.toml`, **manually merge** the
-   real ones into `game.toml`, regenerate, rebuild, re-run. Repeat
-   until the coverage report reads FULLY STATIC (zero interpreted /
-   healed-from-cache).
-
-A dispatch miss no longer breaks the game (it self-heals), but the
-build is NOT done until coverage is fully static. Never auto-write
-`game.toml` — proposals are human-reviewed and merged.
-
-# BIOS RULE — RECOMPILED AND DISPATCHED (SELF-HEALS IF MISSED)
-
-The GBA BIOS at `bios/gba_bios.bin` is **recompiled and executed
-via the dispatch table**, not stubbed, not HLE'd. SWIs and IRQs run
-through the recompiled BIOS bytes via `runtime_dispatch`. There is no
-hand-written HLE path. A missed BIOS PC **self-heals** (bridged,
-recompiled on the fly, logged) — never silently HLE'd or stubbed; 100%
-recompiled BIOS coverage stays the goal.
-
-See `PRINCIPLES.md`:
-- "BIOS is sacred — recompiled and dispatched (with honest self-healing)"
-- "Honest self-healing — interpreter may bridge, must heal to static + report"
-- "Coverage honesty is load-bearing"
-
-When the BIOS intro runs, its render frames are BIOS frames produced by
-recompiled BIOS code — never fast-forwarded or stubbed through. Whether
-it runs at all is a separate, per-game presentation choice
-(`[bios].skip_intro`); skipping it changes no SWI semantics.
-
-If a BIOS PC is interpreted, it must be loud, self-heal to native, and
-seed the next build — never a silent, permanent interpreter path.
-
----
-
-# PHASE 2.7 GATE — BIOS INTRO MUST BE FLAWLESS BEFORE ROM
-
-**STATUS: ✅ CLOSED 2026-05-28 — the BIOS intro is complete.** It boots
-visually + audibly + in-memory correct via `runtime_dispatch`
-(recompiled BIOS), interpreter offline-only; Minish Cap boots through it
-into gameplay. Cart/ROM work (FireRed and other games) is UNBLOCKED. The
-open MC-HP-002 hang is downstream *game* execution, not a BIOS defect.
-See `docs/ROADMAP.md` Phase 2.7. The gate below is satisfied — kept for
-the record and because it re-arms if the BIOS intro ever regresses.
-
-No `--rom`, no `gba_recompile` toward game generation, no
-`MinishCapRecomp` work, no Phase 5 — until the BIOS intro is
-**visually + audibly + in-memory flawless** against the mGBA oracle.
-
-Acceptance:
-- `python oracle/diff_frame.py --scan 1 240 1` → IDENTICAL for
-  OAM, PAL, VRAM, IWRAM at every frame.
-- Per-frame framebuffer pixel-equality vs `emu_screenshot`.
-- Audio sample-stream equality (or agreed perceptual tolerance)
-  across the chime duration.
-- `bios_intro_flawless` ctest green.
-
-See `PRINCIPLES.md` "BIOS intro must be flawless before ROM" and
-`docs/ROADMAP.md` Phase 2.7 for the work breakdown.
-
-If you're tempted to "just try loading a ROM real quick" or
-"check what happens with --rom" — DON'T. The gate exists because
-shortcuts here propagate into invisible bugs everywhere else.
-
----
-
-# DISPATCH MISS RULE
-
-After EVERY game run — manual, scripted, or test — check the coverage
-report (exit banner) and the miss-list `recomp_master_misses.toml.frag`.
-Misses self-heal at runtime, but each is a discovery gap to close.
-
-The miss→proposal writer emits `recomp_seed_proposals.toml` with
-`[[extra_func]]` / `[[jump_table]]` entries:
-
-```
-[[extra_func]]
-addr = 0x08XXXXXX
-mode = "thumb"   # or "arm"
-note = "proposed from miss-log ..."
-```
-
-**A human reviews and merges** the real ones into `game.toml` (never
-an auto-write). Regenerate. Rebuild. Goal: coverage report = FULLY
-STATIC.
-
----
-
-# FILES
-
-Editable:
-- `gbarecomp/src/**`, `gbarecomp/tools/**`, `gbarecomp/tests/**`
-- `MinishCapRecomp/game.toml`
-- `MinishCapRecomp/symbols/*`
-- `MinishCapRecomp/src/main.cpp`, `MinishCapRecomp/src/game_config.*`
-
-Never:
-- `MinishCapRecomp/generated/*`
-
----
-
-# TCP
-
-Default native port: 19842. Oracle (mGBA bridge) on the next port.
-Configurable per project via `debug.ini`.
-
-See `TCP.md`.
-
----
-
-# SYNC RULES
-
-- Sync via **hardware events**, not raw frame numbers.
-  Useful sync points: VBlank IRQ count, DMA completion count, timer
-  overflow count, SWI count, BIOS-IRQ-return count, specific PC at
-  specific function entry.
-- Expect divergence early. The earliest divergence is the only one
-  with a root cause; everything after is consequence.
-- Debug **writes** to VRAM/OAM/PAL, not "what's on screen."
-
-Priority order for early-boot debugging:
-1. BIOS handoff / SWI behavior
-2. Initial CPSR / mode / SP setup
-3. IRQ vector + `IE`/`IME` configuration
-4. DMA channel programming
-5. Timer programming
-6. DISPCNT / BGxCNT initial writes
-7. Palette / VRAM / OAM initial population
+Recorded diagnostic replays can reproduce a player's report. Use
+`tools/replay_diagnostic.py replay <first .replay> --exe ... --rom ... --bios ...`
+to stop at the first divergent frame or re-execute the frame that hung/crashed.
+See [docs/DIAGNOSTIC_REPLAY.md](docs/DIAGNOSTIC_REPLAY.md) for capture defaults
+and controls. Preserve the supplied recordings before investigating.

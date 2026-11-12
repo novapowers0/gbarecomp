@@ -93,8 +93,8 @@ truth.**
 
 ## GBA BIOS references
 
-The BIOS is real, executed code in our runtime (see `PRINCIPLES.md`
-"BIOS is sacred"). It is **not** redistributed in this repo — the
+The LLE configuration executes the original BIOS; native services follow
+[HLE.md](../HLE.md). BIOS data is **not** redistributed in this repo — the
 user provides their own dump at `bios/gba_bios.bin`. The references
 below cover the BIOS structure, SWI entry points, and known
 function boundaries so we can annotate behavior without lifting the
@@ -118,8 +118,8 @@ BIOS bytes themselves remain the authoritative behavior.
 | Source                                  | What it gives us                                                                 |
 |-----------------------------------------|----------------------------------------------------------------------------------|
 | **GBATEK** § "GBA BIOS Functions"       | SWI numbers, calling conventions, semantics for each documented SWI.             |
-| **Endrift's mGBA source**               | Functional reference for SWI behavior in C (DO NOT lift; cross-check only).      |
-| **PineappleEA / Normmatt BIOS replacement** | Open-source HLE replacement; valuable as a *behavior reference*, NEVER the runner. |
+| **Endrift's mGBA source**               | SWI behavior reference; any import must satisfy licensing, attribution and the HLE caller contract.      |
+| **PineappleEA / Normmatt BIOS replacement** | HLE behavior reference; not an independent substitute for the maintained original-BIOS LLE oracle. |
 | **Various community disassemblies** (search "gba bios disassembly") | Function boundaries, BIOS variable layout, IRQ dispatcher structure. |
 
 ### What we may pull from BIOS disassemblies
@@ -135,8 +135,8 @@ BIOS bytes themselves remain the authoritative behavior.
 
 - Decompiled / pseudo-C BIOS source as truth. Same rule as game
   decomps: bytes are the oracle, anything else is a hypothesis.
-- HLE replacement implementations. Our interpreter runs the real
-  bytes, period.
+- HLE replacements treated as proof of original BIOS behavior. Native services
+  are allowed under [HLE.md](../HLE.md), with the original-BIOS LLE route retained.
 - BIOS bytes themselves into committed source.
 
 ### Where BIOS symbols land in this repo

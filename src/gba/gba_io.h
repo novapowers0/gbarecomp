@@ -107,6 +107,7 @@ public:
     // to DMAxCNT_H silently store the register without copying any
     // bytes and the BIOS's VRAM/PAL/OAM uploads vanish.
     void set_bus(armv4t::Bus* b) { bus_ = b; }
+    armv4t::Bus* bus() const { return bus_; }
     void set_audio(GbaAudio* a) { audio_ = a; }
 
     // Bus-side entry points. `off` is the offset into the IO region
@@ -235,6 +236,7 @@ public:
     // DMA loops accumulate their GBATEK transfer cost here; the runtime drains
     // it (charging the master clock + advancing devices) at a safe point. Read
     // and reset in one call. (GBATEK § "GBA DMA Transfers" timing.)
+    uint32_t pending_dma_steal_cycles() const { return dma_steal_cycles_; }
     uint32_t take_dma_steal_cycles() {
         uint32_t c = dma_steal_cycles_;
         dma_steal_cycles_ = 0;
@@ -291,6 +293,12 @@ private:
     // quiet by default and bounded when GBARECOMP_VERBOSE_IO_WARNINGS is set.
     void warn_unhandled(uint32_t off, uint32_t value, bool is_write, uint8_t width);
     void run_sound_fifo_dma(int channel);
+    // write16 body with per-call MMIO-ring record control: write32's synthetic
+    // halves pass record=false (one size-4 entry), while REENTRANT writes —
+    // e.g. a DMA transfer kicked from the CNT_H half of a 32-bit CNT store —
+    // keep recording. A global split flag used to swallow reentrant transfers
+    // (the MMIO-cap guest-DMA gap, fixed 2026-10-08).
+    void write16_commit(uint32_t off, uint16_t v, bool record);
 };
 
 }  // namespace gba

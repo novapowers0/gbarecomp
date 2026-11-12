@@ -56,6 +56,14 @@ public:
     // Host time and environment overrides cannot affect this timeline.
     void set_emulated_clock(std::int64_t seed_seconds, std::uint64_t cycles = 0);
     void advance_emulated_clock(std::uint32_t cycles);
+    // Diagnostic replay: the host-derived part of the clock (everything except
+    // the game-set offset, which is guest state). Playback pins it frame by
+    // frame so an RTC game replays against the recorded wall clock.
+    std::int64_t diagnostic_host_seconds() const { return current_seconds() - offset_; }
+    void set_diagnostic_host_seconds(std::int64_t seconds) {
+        replay_clock_ = true;
+        replay_seconds_ = seconds;
+    }
 
 private:
     friend class SimulationStateCodec;
@@ -110,6 +118,8 @@ private:
     int64_t boot_monotonic_seconds_ = 0;
 
     bool    have_fixed_ = false;  // RECOMP_RTC_EPOCH override
+    bool    replay_clock_ = false;   // diagnostic playback pins host time
+    int64_t replay_seconds_ = 0;
     int64_t fixed_ = 0;
     bool    trace_ = false;
 };

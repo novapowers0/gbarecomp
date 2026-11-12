@@ -8,6 +8,12 @@ PowerShell tooling for building and validating gbarecomp Android games
 Examples below use `EmeraldRecomp-android-touch` (applicationId
 `com.mstan.emeraldrecomp`).
 
+Games whose motion controls require turning the device upside down should
+set `gbaGame.orientation` to `"landscape-locked"`. This fixes both setup and
+gameplay to Android's landscape direction, including SDL window creation and
+resize requests, without disabling motion sensors. `"landscape"` continues to
+allow both landscape directions; `"portrait"` and `"any"` are unchanged.
+
 ## build-apk.ps1
 
 Builds a game's APK via its own `gradlew.bat`, at BelowNormal process

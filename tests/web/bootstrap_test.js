@@ -43,8 +43,7 @@ function page({search = '', hostname = 'games.example', build = {}, confirmAnswe
   const get = id => document.getElementById(id);
   const pick = async (id, bytes, name) => {
     get(id).files = [{name, arrayBuffer: async () => bytes.slice().buffer}];
-    get(id).onchange();
-    for (let i = 0; i < 40; ++i) await turn();
+    await get(id).onchange();
   };
   return {context, get, logs, listeners, requests, scripts, confirms, pick, reloads: () => reloads,
     fire: (type, event = {}) => (listeners[type] || []).forEach(fn => fn(event))};

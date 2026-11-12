@@ -62,11 +62,22 @@ public:
     // accumulator crosses the active SOUNDBIAS sample interval.
     void tick(uint32_t cycles);
     uint32_t cycles_until_next_sample() const;
+    // Hardware samples observe only audio-owned state. Timer/FIFO, MMIO and
+    // other device barriers can advance their entire elapsed window at once.
+    // The optional Shadow mixer reads guest RAM and retains sample barriers.
+    uint32_t cycles_until_next_shared_event() const;
 
     // Drain up to `max` samples from the ring into `out`. Returns
     // the number actually written. Used by the host audio backend
     // and by the TCP audio_samples command.
     std::size_t drain_samples(int16_t* out, std::size_t max);
+    // Interleaved signed S16 L,R frames. Capacity/return values are FRAMES;
+    // callers provide room for 2*max_frames scalar samples. Legacy drains
+    // above/below retain a diagnostic (L+R)/2 downmix.
+    static constexpr std::size_t kOutputChannels = 2;
+    std::size_t drain_stereo_samples(int16_t* out, std::size_t max_frames);
+    std::size_t drain_stereo_sample_block(int16_t* out, std::size_t max_frames,
+                                         uint32_t& rate);
     // Drop host playback only; preserve deterministic mixer/FIFO state.
     void discard_output() { ring_tail_ = ring_head_; }
 
@@ -158,6 +169,21 @@ public:
                           const uint8_t* iwram, std::size_t iwram_len,
                           bool enable_request);
     bool shadow_live() const { return shadow_enabled_ && shadow_.live(); }
+    // The ROM links MP2K, so the shadow can be switched on.
+    bool shadow_available() const { return shadow_.armed(); }
+    bool shadow_enabled() const { return shadow_enabled_; }
+    // Player toggle (in-game menu). Switching on starts from a fresh shadow
+    // that has to prove itself again; switching off returns to the canon
+    // mix at once. No effect when the ROM does not link MP2K.
+    void set_shadow_enabled(bool on);
+    // Entry PCs (Thumb bit clear) of the detected SoundMainRAM copies; the
+    // runtime calls shadow_driver_tick() when guest code dispatches to one.
+    std::size_t shadow_hook_pcs(uint32_t* out, std::size_t max) const;
+    // One MP2K driver tick: SoundMain has updated the channels and is about
+    // to mix. The shadow re-reads the channel state here.
+    void shadow_driver_tick(uint32_t pc, bool thumb);
+    // One log line: how long the shadow substituted, ticks seen, reverts.
+    void log_shadow_summary(const char* when) const;
 
     // Save-state serialization. Captures the full guest mixer state
     // (channels, FIFOs, master, soundbias, sample accumulator) plus the
@@ -295,9 +321,15 @@ private:
     // posts 2, 4, 8, or 16 samples depending on SOUNDBIAS resolution.
     uint32_t cycle_accumulator_ = 0;
 
-    // Output ring. Mono int16_t samples at kSampleRate. The host
-    // audio backend pulls from this in chunks.
-    std::vector<int16_t> ring_;
+    // Output ring of stereo frames, tagged with the production rate.
+    struct StereoFrame {
+        int16_t left=0, right=0;
+        int16_t mono() const {
+            return static_cast<int16_t>((static_cast<int32_t>(left)+right)/2);
+        }
+    };
+    static_assert(sizeof(StereoFrame)==2*sizeof(int16_t));
+    std::vector<StereoFrame> ring_;
     std::vector<uint8_t> ring_rate_;
     std::size_t ring_head_ = 0;
     std::size_t ring_tail_ = 0;
@@ -307,14 +339,25 @@ private:
     // by (absolute sample index % kCapRingSize). Allocated lazily on reset.
     std::vector<CapSample> cap_ring_;
     void cap_push(const CapSample& s);
-    int16_t current_samples_[kMaxSamplesPerEvent] = {};
+    StereoFrame current_samples_[kMaxSamplesPerEvent] = {};
     uint8_t current_sample_rates_[kMaxSamplesPerEvent] = {};
+    CapSample current_caps_[kMaxSamplesPerEvent] = {};
+    // 2nd-order Butterworth low-pass (8 kHz) on the PSG part while the MP2K
+    // shadow substitutes; see mix_slot().
+    struct PsgLowPass {
+        uint32_t rate = 0;
+        float b0 = 0, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+        float x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+        bool  primed = false;
+    } psg_lp_[2];
     uint32_t sample_index_ = 0;
     std::vector<FifoTrace> trace_;
     uint32_t trace_write_ = 0;
     uint32_t trace_count_ = 0;
 
-    void ring_push(int16_t s, uint8_t rate_tag);
+    void ring_push(StereoFrame s, uint8_t rate_tag);
+    std::size_t drain_output(int16_t* out, std::size_t max_frames,
+                              bool stereo, uint32_t* rate);
     void fifo_push_word(DirectFifo& fifo, uint32_t word);
     void fifo_clear_queue(DirectFifo& fifo);
     void fifo_reset(DirectFifo& fifo);
@@ -323,6 +366,11 @@ private:
     uint32_t samples_per_event() const;
     uint32_t cycles_until_next_sample_event() const;
     void sample_until_current_time();
+    // Mixes one output slot of the current event: canon, or PSG plus the
+    // MP2K shadow while it substitutes. The single place both the event and
+    // the mid-event catch-up (sample_until_current_time) produce samples.
+    void mix_slot(uint32_t slot);
+    int16_t psg_low_pass(int16_t in, PsgLowPass& filter);
     void run_sample_event();
     void ch1_trigger();
     void ch2_trigger();
@@ -337,16 +385,17 @@ private:
         int16_t direct_a = 0;
         int16_t direct_b = 0;
     };
-    int16_t mix_one_sample(uint32_t direct_slot, bool include_direct = true,
+    StereoFrame mix_one_sample(uint32_t direct_slot, bool include_direct = true,
                            ChannelTap* tap = nullptr);
 
     // ── MP2K HLE shadow (verified-enhancement; default off) ──────
     Mp2kShadow shadow_{};
+    std::vector<Mp2kSig> shadow_sigs_;  // kept to re-arm on a player toggle
     MemView    shadow_mem_{};
     bool       shadow_enabled_ = false;
     uint64_t   shadow_cursor_ = 0;          // running grid-sample count
-    uint32_t   shadow_samples_since_hook_ = 0;
-    uint32_t   shadow_hook_period_ = 1097;  // ≈ output samples per 59.7 Hz tick
+    uint64_t   shadow_enabled_samples_ = 0;  // samples rendered while enabled
+    uint64_t   shadow_live_samples_ = 0;     // ... of which substituted
 };
 
 }  // namespace gba

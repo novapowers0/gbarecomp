@@ -14,6 +14,9 @@
 #pragma once
 
 #include <stdint.h>
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
 
 // Shared POD types + bit/constant macros (ArmCpuState, CPSR_*_BIT,
 // RUNTIME_TRACE_*, RuntimeTraceEntry, RuntimeFpEntry). Split out so the
@@ -81,6 +84,16 @@ extern RuntimeBusWriteOverride g_runtime_bus_write_override;
 // dispatching a byte-verified target. nullptr preserves normal dispatch.
 typedef int (*RuntimeRamDispatchHook)(uint32_t pc, int thumb);
 extern RuntimeRamDispatchHook g_runtime_ram_dispatch_hook;
+
+// Optional read-only observer for a few exact dispatch entries (PCs without
+// the Thumb bit), called before the target runs. It must not change guest
+// state. The runtime uses it for the MP2K mixer's per-tick entry
+// (SoundMainRAM), which the audio shadow has to see at that exact point.
+typedef void (*RuntimeDispatchObserver)(uint32_t pc, int thumb);
+enum { RUNTIME_MAX_OBSERVED_PCS = 4 };
+extern RuntimeDispatchObserver g_runtime_dispatch_observer;
+extern uint32_t g_runtime_observed_pcs[RUNTIME_MAX_OBSERVED_PCS];
+extern unsigned g_runtime_observed_pc_count;
 
 // Optional game/runtime predicate for executable regions whose bytes can change
 // underneath a static dispatch entry (self-modifying RAM, banked cartridge
@@ -229,6 +242,44 @@ void runtime_dispatch_miss(uint32_t target_pc);
 #  define GBARECOMP_TAIL_ARG_TLS _Thread_local
 #endif
 extern GBARECOMP_TAIL_ARG_TLS uint32_t g_runtime_tail_arg;
+
+// AOT bodies for discovered instruction spans in mutable execution windows.
+// Fixed fields are guarded; explicitly supported immediate operands are data.
+// The byte view is observational: no bus read, open-bus update or cycle charge.
+typedef const uint8_t* (*RuntimeRamCodeView)(uint32_t address, uint32_t size);
+extern RuntimeRamCodeView g_runtime_ram_code_view;
+// A runtime owner may publish stable ordinary-RAM backing under its exact
+// observational callback. A generated activation borrows these pointers, but
+// checks the current binding and live instruction bytes on every use. Custom
+// views and cartridge mappings continue through RuntimeRamCodeView.
+typedef struct RuntimeNativeRamCodeSource {
+    RuntimeRamCodeView view;
+    const uint8_t* ewram;
+    const uint8_t* iwram;
+} RuntimeNativeRamCodeSource;
+extern RuntimeNativeRamCodeSource g_runtime_native_ram_code_source;
+typedef struct RuntimeNativeRamTemplate {
+    const uint8_t* bytes;
+    uint32_t size;
+    uint8_t thumb;
+    void (*fn)(void);
+    void (*cart_fn)(void); // optional body with live cartridge fetch/prefetch
+    const uint8_t* masks;  // null means every byte must match exactly
+} RuntimeNativeRamTemplate;
+typedef struct RuntimeNativeRamEntry {
+    uint64_t key;  // (guarded opcode bits << 1) | thumb, sorted ascending
+    uint32_t template_index;
+    uint32_t offset;
+} RuntimeNativeRamEntry;
+void runtime_register_native_ram_templates(
+    const RuntimeNativeRamTemplate* templates, uint32_t template_count,
+    const RuntimeNativeRamEntry* entries, uint32_t entry_count);
+extern GBARECOMP_TAIL_ARG_TLS uint32_t g_runtime_native_ram_base;
+int runtime_native_ram_instruction_matches(uint32_t pc, uint32_t opcode,
+                                           uint32_t size);
+int runtime_native_ram_instruction_matches_masked(uint32_t pc, uint32_t opcode,
+                                                  uint32_t size, uint32_t mask);
+uint32_t runtime_native_arm_immediate(uint32_t pc);
 void runtime_dispatch_tail(void);                // runtime_dispatch(g_runtime_tail_arg)
 void runtime_dispatch_with_exchange_tail(void);  // runtime_dispatch_with_exchange(g_runtime_tail_arg)
 void runtime_swi_tail(void);                     // runtime_swi(g_runtime_tail_arg)
@@ -261,8 +312,8 @@ void runtime_swi_tail(void);                     // runtime_swi(g_runtime_tail_a
 extern int g_force_interp;
 void runtime_force_interp_step(void);
 
-// True iff a STATIC (recompiled) dispatch-table entry exists for this guest PC
-// + instruction-set state. The on-miss bridge uses it to detect re-entry into
+// True iff a STATIC AOT entry (fixed table or byte-verified code template)
+// exists for this guest PC + instruction-set state. The bridge uses it to detect re-entry into
 // statically recompiled code and hand control back (heal-to-static) when it has
 // no reliable stop address (a top-level / exception-return miss).
 int runtime_has_static_entry(uint32_t pc, int thumb);
@@ -297,6 +348,8 @@ void runtime_call_cancel_return(uint32_t return_pc);
 // window. restore replaces the live stack wholesale (clamped to the
 // stack capacity). Returned pointer is valid until the next push/pop.
 uint32_t        runtime_call_stack_depth(void);
+// Lowest slot a guest return may match (the active IRQ floor).
+uint32_t        runtime_call_stack_floor(void);
 const uint32_t* runtime_call_stack_data(void);
 void            runtime_call_stack_restore(const uint32_t* entries,
                                            uint32_t depth);
@@ -548,4 +601,54 @@ void runtime_shutdown(void);
 
 #ifdef __cplusplus
 }  // extern "C"
+
+// This is an execution view, not a code cache. Keeping the bytes live retains
+// self-modifying stores, DMA, debugger writes and restored memory without write
+// tracking or a shadow execution. No pointer from a different binding is read.
+class RuntimeNativeRamCodeView {
+public:
+    RuntimeNativeRamCodeView() : source_(g_runtime_native_ram_code_source) {}
+
+    int matches(uint32_t pc, uint32_t opcode, uint32_t size,
+                uint32_t mask = 0xFFFFFFFFu) const {
+        const uint8_t* bytes = current_bytes(pc, size);
+        if (!bytes)
+            return runtime_native_ram_instruction_matches_masked(pc, opcode, size, mask);
+        return ((load(bytes, size) ^ opcode) & mask) == 0;
+    }
+
+    uint32_t arm_immediate(uint32_t pc) const {
+        const uint8_t* bytes = current_bytes(pc, 4u);
+        if (!bytes) return runtime_native_arm_immediate(pc);
+        const uint32_t encoded = uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8);
+        const uint32_t value = encoded & 0xFFu, rotate = ((encoded >> 8) & 15u) * 2u;
+        return rotate ? (value >> rotate) | (value << (32u - rotate)) : value;
+    }
+
+private:
+    const uint8_t* current_bytes(uint32_t pc, uint32_t size) const {
+        if ((size != 2u && size != 4u) || !source_.view ||
+            g_runtime_ram_code_view != source_.view ||
+            g_runtime_native_ram_code_source.view != source_.view) return nullptr;
+        const uint32_t region = pc >> 24;
+        const uint8_t* bytes;
+        uint32_t mask;
+        if (region == 2u) {
+            bytes = source_.ewram; mask = 0x3FFFFu;
+            if (bytes != g_runtime_native_ram_code_source.ewram) return nullptr;
+        } else if (region == 3u) {
+            bytes = source_.iwram; mask = 0x7FFFu;
+            if (bytes != g_runtime_native_ram_code_source.iwram) return nullptr;
+        } else return nullptr;
+        const uint32_t offset = pc & mask;
+        if (!bytes || offset > mask + 1u - size) return nullptr;
+        return bytes + offset;
+    }
+    static uint32_t load(const uint8_t* bytes, uint32_t size) {
+        uint32_t value = uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8);
+        if (size == 4u) value |= (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
+        return value;
+    }
+    RuntimeNativeRamCodeSource source_;
+};
 #endif

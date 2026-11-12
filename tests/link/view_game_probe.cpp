@@ -98,10 +98,17 @@ int main(int argc,char** argv) {
         }
         constexpr unsigned frames=72;
         std::vector<std::vector<std::uint8_t>> canonical;
-        for (const auto mode:{GbaNetplayView::Native,GbaNetplayView::Wide16x9,
-                GbaNetplayView::Wide21x9,GbaNetplayView::Wide32x9,GbaNetplayView::Adaptive}) {
+        struct Case { GbaNetplayView mode; unsigned scale; };
+        for (const auto [mode,scale]:{Case{GbaNetplayView::Native,1},
+                Case{GbaNetplayView::Wide16x9,1}, Case{GbaNetplayView::Wide21x9,1},
+                Case{GbaNetplayView::Wide32x9,1}, Case{GbaNetplayView::Adaptive,1},
+                Case{GbaNetplayView::Native,4}, Case{GbaNetplayView::Wide16x9,2},
+                Case{GbaNetplayView::Adaptive,4}, Case{GbaNetplayView::Wide16x9,8},
+                Case{GbaNetplayView::Adaptive,16}}) {
+            if (scale>1 && !game.view_policy.high_resolution_affine_provider) continue;
+            const bool reference=mode==GbaNetplayView::Native && scale==1;
             if (!session.load_state(initial,&error)) throw std::runtime_error(error);
-            GbaNetplayPresentation presentation(game.view_policy,true);
+            GbaNetplayPresentation presentation(game.view_policy,true,scale);
             session.machine(0).ppu.set_presentation_observer(&presentation);
             const auto width_at=[&](unsigned frame) {
                 return mode==GbaNetplayView::Adaptive ?
@@ -115,9 +122,9 @@ int main(int argc,char** argv) {
                 session.run_frame(input); session.discard_audio_output();
                 simulation_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
                 const auto state=session.save_state();
-                if (mode==GbaNetplayView::Native) canonical.push_back(state);
+                if (reference) canonical.push_back(state);
                 else if (state!=canonical[frame]) throw std::runtime_error("view changed canonical state");
-                if (mode!=GbaNetplayView::Native && frame==36) {
+                if (!reference && frame==36) {
                     // Restore twelve frames, resize again while replaying, and
                     // require the entire cable session to reach the same state.
                     if (!session.load_state(canonical[24],&error)) throw std::runtime_error(error);
@@ -130,13 +137,14 @@ int main(int argc,char** argv) {
             }
             const auto* pixels=presentation.pixels();
             const unsigned width=presentation.width();
+            const unsigned height=presentation.height();
             if (!pixels) throw std::runtime_error("no complete presentation frame");
-            std::ofstream ppm(std::string(argv[4])+"-"+std::to_string(static_cast<unsigned>(mode))+".ppm",std::ios::binary);
-            ppm<<"P6\n"<<width<<" 160\n255\n";
-            ppm.write(reinterpret_cast<const char*>(pixels),width*160*3);
+            std::ofstream ppm(std::string(argv[4])+"-"+std::to_string(static_cast<unsigned>(mode))+"-"+std::to_string(scale)+"x.ppm",std::ios::binary);
+            ppm<<"P6\n"<<width<<" "<<height<<"\n255\n";
+            ppm.write(reinterpret_cast<const char*>(pixels),width*height*3);
             if (!ppm) throw std::runtime_error("capture failed");
-            std::printf("view=%u width=%u canonical=identical frames=%u replay=%u render_work_fps=%.2f\n",
-                static_cast<unsigned>(mode),width,frames,replays,frames*1000.0/simulation_ms);
+            std::printf("view=%u scale=%u width=%u height=%u canonical=identical frames=%u replay=%u render_work_fps=%.2f\n",
+                static_cast<unsigned>(mode),scale,width,height,frames,replays,frames*1000.0/simulation_ms);
             std::fflush(stdout);
             session.machine(0).ppu.set_presentation_observer(nullptr);
         }
